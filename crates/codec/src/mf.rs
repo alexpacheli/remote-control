@@ -36,6 +36,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
 };
+use windows::Win32::Media::MediaFoundation::{
+    IMFMediaEvent, METransformDrainComplete, MFT_MESSAGE_COMMAND_DRAIN,
+};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::{
     VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,
@@ -48,6 +51,10 @@ use crate::{CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame};
 
 /// Longest wait for the encoder to ask for input or deliver output.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a still screen waits for frames left in the encoder before
+/// asking it to flush them.
+const DRAIN_WAIT: Duration = Duration::from_millis(30);
 
 /// Pause between event polls (high-resolution timers make this precise).
 const POLL_INTERVAL: Duration = Duration::from_micros(200);
@@ -86,9 +93,12 @@ struct Session {
     /// The transform allocates output samples itself.
     provides_samples: bool,
     output_size: u32,
+    /// Inputs given to the transform whose output has not come back yet.
+    in_flight: u32,
+    /// A drain was requested and `METransformDrainComplete` has not arrived.
+    draining: bool,
     /// SPS/PPS from the output type, for encoders that do not repeat them inline.
     sequence_header: Vec<u8>,
-    profile_checked: bool,
 }
 
 impl MfEncoder {
@@ -98,14 +108,20 @@ impl MfEncoder {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|e| hw("MFStartup", e))?;
         }
-        let name = match enumerate()?.first() {
-            Some(activate) => friendly_name(activate),
-            None => {
+        let name = match enumerate() {
+            Ok(encoders) => encoders.first().map(friendly_name),
+            Err(e) => {
                 unsafe {
                     let _ = MFShutdown();
                 }
-                return Err(CodecError::NoHardware);
+                return Err(e);
             }
+        };
+        let Some(name) = name else {
+            unsafe {
+                let _ = MFShutdown();
+            }
+            return Err(CodecError::NoHardware);
         };
         tracing::info!("codificador por hardware: {name}");
         Ok(Self {
@@ -204,8 +220,9 @@ impl MfEncoder {
             need_input: 0,
             provides_samples: info.dwFlags & provides != 0,
             output_size: info.cbSize.max(width * height * 3 / 2),
+            in_flight: 0,
+            draining: false,
             sequence_header: Vec::new(),
-            profile_checked: false,
         };
         session.refresh_sequence_header();
         Ok(session)
@@ -232,34 +249,41 @@ impl VideoEncoder for MfEncoder {
         let sample = memory_sample(&self.nv12, self.frame_index * duration, duration)?;
         self.frame_index += 1;
 
+        if std::mem::take(&mut self.force_keyframe) {
+            let session = self.session.as_ref().expect("session opened above");
+            let forced = session
+                .codec
+                .as_ref()
+                .is_some_and(|codec| set(codec, &CODECAPI_AVEncVideoForceKeyFrame, u32_variant(1)));
+            if !forced {
+                // The driver cannot force one; a new session starts with a keyframe.
+                self.session = None;
+                self.session = Some(self.open_session(width, height)?);
+            }
+        }
+
         let session = self.session.as_mut().expect("session opened above");
-        if std::mem::take(&mut self.force_keyframe)
-            && let Some(codec) = &session.codec
-        {
-            set(codec, &CODECAPI_AVEncVideoForceKeyFrame, u32_variant(1));
+        let result = session.encode(&sample);
+        if result.is_err() {
+            // Start over (with a keyframe) if the caller keeps using us.
+            self.session = None;
         }
+        result
+    }
 
-        // Wait until the transform accepts input; outputs of earlier frames
-        // that arrive meanwhile are kept (the newest one wins).
-        // Wait until the transform accepts input. Outputs of earlier frames
-        // that arrive meanwhile are kept: every one of them must be sent.
-        let deadline = Instant::now() + EVENT_TIMEOUT;
-        let mut ready = None;
-        while session.need_input == 0 {
-            merge(&mut ready, session.next_event(deadline)?);
-        }
-        unsafe { session.transform.ProcessInput(0, &sample, 0) }
-            .map_err(|e| hw("ProcessInput", e))?;
-        session.need_input -= 1;
+    fn pending(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.in_flight > 0)
+    }
 
-        // Usually the output for this frame comes next. If the transform asks
-        // for more input first, it keeps frames in flight: return what we have
-        // and let the caller come back.
-        let deadline = Instant::now() + EVENT_TIMEOUT;
-        while ready.is_none() && session.need_input == 0 {
-            merge(&mut ready, session.next_event(deadline)?);
+    fn drain(&mut self) -> Result<Option<Encoded>, CodecError> {
+        let Some(session) = &mut self.session else {
+            return Ok(None);
+        };
+        let result = session.drain();
+        if result.is_err() {
+            self.session = None;
         }
-        Ok(ready)
+        result
     }
 
     fn force_keyframe(&mut self) {
@@ -285,6 +309,62 @@ impl Drop for MfEncoder {
 }
 
 impl Session {
+    fn encode(&mut self, sample: &IMFSample) -> Result<Option<Encoded>, CodecError> {
+        // Wait until the transform accepts input. Outputs of earlier frames
+        // that arrive meanwhile are kept: every one of them must be sent.
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let mut ready = None;
+        while self.need_input == 0 {
+            merge(&mut ready, self.next_event(deadline)?);
+        }
+        unsafe { self.transform.ProcessInput(0, sample, 0) }.map_err(|e| hw("ProcessInput", e))?;
+        self.need_input -= 1;
+        self.in_flight += 1;
+
+        // Usually this frame's output comes next. If the transform asks for
+        // more input first, it keeps frames in flight; `pending()` then tells
+        // the caller to come back even if the screen stays still.
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        while self.in_flight > 0 && self.need_input == 0 {
+            merge(&mut ready, self.next_event(deadline)?);
+        }
+        Ok(ready)
+    }
+
+    fn drain(&mut self) -> Result<Option<Encoded>, CodecError> {
+        // Most encoders just need a moment.
+        let mut ready = None;
+        let soft_deadline = Instant::now() + DRAIN_WAIT;
+        while self.in_flight > 0 && Instant::now() < soft_deadline {
+            merge(&mut ready, self.poll_event()?);
+        }
+        if self.in_flight == 0 {
+            return Ok(ready);
+        }
+        // Others hold frames until told to flush.
+        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
+            .map_err(|e| hw("drain", e))?;
+        self.draining = true;
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        while self.draining {
+            merge(&mut ready, self.next_event(deadline)?);
+        }
+        self.in_flight = 0;
+        Ok(ready)
+    }
+
+    /// Like [`Session::next_event`], but returns right away when there is none.
+    fn poll_event(&mut self) -> Result<Option<Encoded>, CodecError> {
+        match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => self.handle(&event),
+            Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                std::thread::sleep(POLL_INTERVAL);
+                Ok(None)
+            }
+            Err(e) => Err(hw("GetEvent", e)),
+        }
+    }
+
     /// Waits for the next transform event and handles it; returns an encoded
     /// frame if the event delivered one.
     ///
@@ -303,8 +383,15 @@ impl Session {
                 Err(e) => return Err(hw("GetEvent", e)),
             }
         };
+        self.handle(&event)
+    }
+
+    fn handle(&mut self, event: &IMFMediaEvent) -> Result<Option<Encoded>, CodecError> {
         let kind = unsafe { event.GetType() }.map_err(|e| hw("event type", e))?;
-        if kind == METransformNeedInput.0 as u32 {
+        if kind == METransformDrainComplete.0 as u32 {
+            self.draining = false;
+            Ok(None)
+        } else if kind == METransformNeedInput.0 as u32 {
             self.need_input += 1;
             Ok(None)
         } else if kind == METransformHaveOutput.0 as u32 {
@@ -315,32 +402,37 @@ impl Session {
     }
 
     fn take_output(&mut self) -> Result<Option<Encoded>, CodecError> {
-        let sample = if self.provides_samples {
-            None
-        } else {
-            Some(memory_sample(&vec![0; self.output_size as usize], 0, 0)?)
-        };
-        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: 0,
-            pSample: ManuallyDrop::new(sample),
-            dwStatus: 0,
-            pEvents: ManuallyDrop::new(None),
-        };
-        let mut status = 0;
-        let result = unsafe {
-            self.transform
-                .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
-        };
-        // Take back ownership so the COM references are released.
-        let sample = ManuallyDrop::into_inner(buffer.pSample);
-        drop(ManuallyDrop::into_inner(buffer.pEvents));
+        let mut sample = None;
+        // A format change is answered by accepting the new type and asking for
+        // the same output again; it is not announced a second time.
+        for _ in 0..3 {
+            let provided = if self.provides_samples {
+                None
+            } else {
+                Some(empty_sample(self.output_size)?)
+            };
+            let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: ManuallyDrop::new(provided),
+                dwStatus: 0,
+                pEvents: ManuallyDrop::new(None),
+            };
+            let mut status = 0;
+            let result = unsafe {
+                self.transform
+                    .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
+            };
+            // Take back ownership so the COM references are released.
+            let output = ManuallyDrop::into_inner(buffer.pSample);
+            drop(ManuallyDrop::into_inner(buffer.pEvents));
 
-        match result {
-            Ok(()) => {}
-            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
-            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                // The encoder changed its output format: accept the new one.
-                unsafe {
+            match result {
+                Ok(()) => {
+                    sample = output;
+                    break;
+                }
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => unsafe {
                     let new_type = self
                         .transform
                         .GetOutputAvailableType(0, 0)
@@ -348,35 +440,33 @@ impl Session {
                     self.transform
                         .SetOutputType(0, &new_type, 0)
                         .map_err(|e| hw("SetOutputType after change", e))?;
-                }
-                self.refresh_sequence_header();
-                return Ok(None);
+                    self.refresh_sequence_header();
+                },
+                Err(e) => return Err(hw("ProcessOutput", e)),
             }
-            Err(e) => return Err(hw("ProcessOutput", e)),
         }
         let Some(sample) = sample else {
-            return Ok(None);
+            return Err(CodecError::Hardware("output format kept changing".into()));
         };
+        self.in_flight = self.in_flight.saturating_sub(1);
 
         let mut data = read_sample(&sample)?;
-        let keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
-        if keyframe {
-            if !h264::has_sps(&data) && !self.sequence_header.is_empty() {
-                let mut with_header = self.sequence_header.clone();
-                with_header.extend_from_slice(&data);
-                data = with_header;
-            }
-            if !self.profile_checked {
-                match h264::sps_profile(&data) {
-                    Some(PROFILE_BASELINE) | None => {}
-                    Some(profile) => {
-                        return Err(CodecError::Hardware(format!(
-                            "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({PROFILE_BASELINE})"
-                        )));
-                    }
-                }
-                self.profile_checked = true;
-            }
+        // Not every driver sets the clean-point attribute: look at the NALs too.
+        let clean_point =
+            unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
+        let keyframe = clean_point || h264::has_idr(&data);
+        if keyframe && !h264::has_sps(&data) && !self.sequence_header.is_empty() {
+            let mut with_header = self.sequence_header.clone();
+            with_header.extend_from_slice(&data);
+            data = with_header;
+        }
+        // Checked on every SPS, so a profile switch later on is caught too.
+        if let Some(profile) = h264::sps_profile(&data)
+            && profile != PROFILE_BASELINE
+        {
+            return Err(CodecError::Hardware(format!(
+                "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({PROFILE_BASELINE})"
+            )));
         }
         Ok(Some(Encoded { data, keyframe }))
     }
@@ -401,16 +491,16 @@ impl Drop for Session {
     }
 }
 
-/// Appends `next` to `ready`: several access units in one payload decode in
-/// order, so no output is ever dropped.
+/// Adds `next` to the outputs collected in `ready`. Several access units in
+/// one payload decode in order, so none is dropped, except that a keyframe
+/// makes everything before it unnecessary: the payload then starts with it,
+/// and its keyframe flag stays truthful.
 fn merge(ready: &mut Option<Encoded>, next: Option<Encoded>) {
     match (ready.as_mut(), next) {
         (_, None) => {}
         (None, Some(next)) => *ready = Some(next),
-        (Some(ready), Some(next)) => {
-            ready.data.extend_from_slice(&next.data);
-            ready.keyframe |= next.keyframe;
-        }
+        (Some(_), Some(next)) if next.keyframe => *ready = Some(next),
+        (Some(ready), Some(next)) => ready.data.extend_from_slice(&next.data),
     }
 }
 
@@ -505,6 +595,17 @@ fn video_type(
     }
 }
 
+/// An empty sample with room for `size` bytes, for transforms that want the
+/// caller to provide output samples.
+fn empty_sample(size: u32) -> Result<IMFSample, CodecError> {
+    unsafe {
+        let buffer = MFCreateMemoryBuffer(size).map_err(|e| hw("MFCreateMemoryBuffer", e))?;
+        let sample = MFCreateSample().map_err(|e| hw("MFCreateSample", e))?;
+        sample.AddBuffer(&buffer).map_err(|e| hw("AddBuffer", e))?;
+        Ok(sample)
+    }
+}
+
 /// A sample holding a copy of `data` in system memory.
 fn memory_sample(data: &[u8], time: i64, duration: i64) -> Result<IMFSample, CodecError> {
     unsafe {
@@ -558,9 +659,14 @@ fn blob(media_type: &IMFMediaType, key: &GUID) -> Option<Vec<u8>> {
     }
 }
 
-fn set(codec: &ICodecAPI, api: &GUID, value: VARIANT) {
-    if let Err(e) = unsafe { codec.SetValue(api, &value) } {
-        tracing::debug!("ICodecAPI {api:?} não suportado: {e}");
+/// Applies an encoder setting; returns whether the driver accepted it.
+fn set(codec: &ICodecAPI, api: &GUID, value: VARIANT) -> bool {
+    match unsafe { codec.SetValue(api, &value) } {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("ICodecAPI {api:?} não suportado: {e}");
+            false
+        }
     }
 }
 

@@ -97,6 +97,20 @@ pub trait VideoEncoder {
     /// The next encoded frame will be a keyframe.
     fn force_keyframe(&mut self);
 
+    /// Frames went in whose output has not come out yet. The caller must
+    /// encode again (the latest image) even if the screen does not change,
+    /// or the last update stays inside the encoder.
+    fn pending(&self) -> bool {
+        false
+    }
+
+    /// Collects output for frames already given, without new input, waiting
+    /// briefly for it. Call when [`VideoEncoder::pending`] and the screen
+    /// has not changed.
+    fn drain(&mut self) -> Result<Option<Encoded>, CodecError> {
+        Ok(None)
+    }
+
     /// Human-readable description, e.g. "GPU (NVIDIA H.264 Encoder MFT)".
     fn name(&self) -> String;
 
@@ -161,6 +175,20 @@ impl VideoEncoder for AutoEncoder {
             Some(hardware) => hardware.force_keyframe(),
             None => self.software.force_keyframe(),
         }
+    }
+
+    fn pending(&self) -> bool {
+        self.hardware.as_ref().is_some_and(|h| h.pending())
+    }
+
+    fn drain(&mut self) -> Result<Option<Encoded>, CodecError> {
+        let Some(hardware) = &mut self.hardware else {
+            return Ok(None);
+        };
+        hardware.drain().inspect_err(|e| {
+            tracing::warn!("codificação por hardware falhou ({e}); usando software");
+            self.hardware = None;
+        })
     }
 
     fn name(&self) -> String {

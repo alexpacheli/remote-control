@@ -3,6 +3,7 @@
 /// `profile_idc` of the Baseline profile, the only one the decoder supports.
 pub const PROFILE_BASELINE: u8 = 66;
 
+const NAL_IDR: u8 = 5;
 const NAL_SPS: u8 = 7;
 
 /// NAL units of an Annex-B stream (start codes removed).
@@ -38,6 +39,11 @@ fn nal_type(nal: &[u8]) -> Option<u8> {
     nal.first().map(|b| b & 0x1F)
 }
 
+/// Whether the access unit contains an IDR (keyframe) slice.
+pub fn has_idr(data: &[u8]) -> bool {
+    nal_units(data).any(|nal| nal_type(nal) == Some(NAL_IDR))
+}
+
 /// Whether the access unit carries a sequence parameter set.
 pub fn has_sps(data: &[u8]) -> bool {
     nal_units(data).any(|nal| nal_type(nal) == Some(NAL_SPS))
@@ -71,6 +77,7 @@ mod tests {
             ]
         );
         assert!(has_sps(&data));
+        assert!(has_idr(&data));
         assert_eq!(sps_profile(&data), Some(PROFILE_BASELINE));
     }
 
@@ -78,6 +85,7 @@ mod tests {
     fn slice_without_sps() {
         let data = [0, 0, 0, 1, 0x41, 0x9A, 0x00];
         assert!(!has_sps(&data));
+        assert!(!has_idr(&data));
         assert_eq!(sps_profile(&data), None);
         assert_eq!(nal_units(&[]).count(), 0);
     }

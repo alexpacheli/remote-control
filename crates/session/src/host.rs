@@ -190,6 +190,36 @@ fn capture_loop(
         // A still screen costs nothing, unless the viewer needs a keyframe
         // or the latest image was skipped.
         if !changed && !forced && !skipped {
+            if encoder.pending() {
+                // The last images are still inside the encoder: collect them
+                // without feeding it new input.
+                let started = Instant::now();
+                match encoder.drain() {
+                    Ok(Some(encoded)) => {
+                        let Some(frame) = capturer.frame() else {
+                            continue;
+                        };
+                        let sent = send_frame(
+                            frames,
+                            &mut seq,
+                            frame,
+                            encoded,
+                            capturer.copy_time(),
+                            started.elapsed(),
+                            hardware,
+                        );
+                        if !sent {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("encode: {e}");
+                        // Encode the latest image again (with the fallback encoder).
+                        skipped = true;
+                    }
+                }
+            }
             continue;
         }
         let Some(frame) = capturer.frame() else {
@@ -217,22 +247,43 @@ fn capture_loop(
             warn!("codificador agora: {}", encoder.name());
         }
 
-        let msg = VideoFrame {
-            seq,
-            width: frame.width,
-            height: frame.height,
-            keyframe: encoded.keyframe,
-            capture_micros: micros(capturer.copy_time()),
-            encode_micros: micros(encode_time),
+        let sent = send_frame(
+            frames,
+            &mut seq,
+            frame,
+            encoded,
+            capturer.copy_time(),
+            encode_time,
             hardware,
-            data: encoded.data,
-        };
-        seq += 1;
-        // Fails only when the session is over.
-        if frames.blocking_send(msg).is_err() {
+        );
+        if !sent {
             break;
         }
     }
+}
+
+/// Hands an encoded frame to the network task; `false` once the session is over.
+fn send_frame(
+    frames: &mpsc::Sender<VideoFrame>,
+    seq: &mut u64,
+    frame: &hext_capture::Frame,
+    encoded: hext_codec::Encoded,
+    capture_time: Duration,
+    encode_time: Duration,
+    hardware: bool,
+) -> bool {
+    let msg = VideoFrame {
+        seq: *seq,
+        width: frame.width,
+        height: frame.height,
+        keyframe: encoded.keyframe,
+        capture_micros: micros(capture_time),
+        encode_micros: micros(encode_time),
+        hardware,
+        data: encoded.data,
+    };
+    *seq += 1;
+    frames.blocking_send(msg).is_ok()
 }
 
 /// How a video or input task ending affects the session: a peer that left
