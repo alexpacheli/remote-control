@@ -1,0 +1,19 @@
+[package]
+name = "hext-render"
+description = "Hext Remote video renderer (wgpu, YUV to RGB on the GPU)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+hext-codec.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

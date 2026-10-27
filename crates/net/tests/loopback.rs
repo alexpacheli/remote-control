@@ -4,7 +4,27 @@ use hext_net::{
     Endpoint, Identity, NetError, client_endpoint, client_handshake, connect, host_endpoint,
     host_handshake, recv_datagram, send_datagram,
 };
-use hext_proto::{Control, Datagram, PROTOCOL_VERSION, PeerInfo, decode_preamble, encode_preamble};
+use hext_proto::{
+    Control, Datagram, Hello, PROTOCOL_VERSION, PeerInfo, RejectReason, decode_preamble,
+    encode_preamble,
+};
+
+const CODE: &str = "123456789";
+
+fn hello(code: &str) -> Hello {
+    Hello {
+        peer: PeerInfo::local("test", "client"),
+        access_code: code.to_owned(),
+    }
+}
+
+fn check_code(hello: &Hello) -> Result<(), RejectReason> {
+    if hello.access_code == CODE {
+        Ok(())
+    } else {
+        Err(RejectReason::WrongCode)
+    }
+}
 
 fn local_host() -> (Endpoint, SocketAddr, Identity) {
     let identity = Identity::generate().unwrap();
@@ -16,13 +36,14 @@ fn local_host() -> (Endpoint, SocketAddr, Identity) {
 /// Accepts one session and echoes pings until the client says bye.
 async fn serve_one(endpoint: Endpoint) -> Result<PeerInfo, NetError> {
     let conn = endpoint.accept().await.expect("endpoint open").await?;
-    let (mut control, client) = host_handshake(&conn, PeerInfo::local("test", "host")).await?;
+    let (mut control, hello) =
+        host_handshake(&conn, PeerInfo::local("test", "host"), check_code).await?;
     loop {
         tokio::select! {
             msg = control.recv() => {
                 assert_eq!(msg?, Control::Bye);
                 conn.close(0u32.into(), b"bye");
-                return Ok(client);
+                return Ok(hello.peer);
             }
             dg = recv_datagram(&conn) => {
                 if let Datagram::Ping { seq, sent_micros } = dg? {
@@ -42,9 +63,7 @@ async fn handshake_ping_and_bye() {
     let conn = connect(&client, addr, Some(identity.fingerprint()))
         .await
         .unwrap();
-    let (control, host_info) = client_handshake(&conn, PeerInfo::local("test", "client"))
-        .await
-        .unwrap();
+    let (control, host_info) = client_handshake(&conn, hello(CODE)).await.unwrap();
     assert_eq!(host_info.device_name, "host");
 
     // Many pings while the host also waits on the control stream exercise
@@ -109,5 +128,26 @@ async fn incompatible_version_is_reported() {
     assert!(matches!(
         server.await.unwrap(),
         Err(NetError::IncompatibleVersion { remote: 999, .. })
+    ));
+}
+
+#[tokio::test]
+async fn wrong_access_code_is_rejected() {
+    let (host, addr, identity) = local_host();
+    let server = tokio::spawn(serve_one(host));
+
+    let client = client_endpoint(addr).unwrap();
+    let conn = connect(&client, addr, Some(identity.fingerprint()))
+        .await
+        .unwrap();
+    let result = client_handshake(&conn, hello("000000000")).await;
+    assert!(
+        matches!(result, Err(NetError::Rejected(RejectReason::WrongCode))),
+        "{:?}",
+        result.err()
+    );
+    assert!(matches!(
+        server.await.unwrap(),
+        Err(NetError::Rejected(RejectReason::WrongCode))
     ));
 }

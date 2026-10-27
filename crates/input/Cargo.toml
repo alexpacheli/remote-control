@@ -1,0 +1,18 @@
+[package]
+name = "hext-input"
+description = "Hext Remote input injection (SendInput on Windows) and key mapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hext-proto.workspace = true
+tracing.workspace = true
+winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[lints]
+workspace = true

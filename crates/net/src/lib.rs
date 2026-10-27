@@ -12,7 +12,10 @@ mod verify;
 
 pub use endpoint::{client_endpoint, connect, host_endpoint};
 pub use identity::{Fingerprint, Identity};
-pub use session::{ControlStream, client_handshake, host_handshake, recv_datagram, send_datagram};
+pub use session::{
+    ControlStream, FramedRecv, FramedSend, accept_uni, client_handshake, host_handshake, open_uni,
+    recv_datagram, send_datagram,
+};
 
 pub use quinn::{Connection, Endpoint, Incoming};
 

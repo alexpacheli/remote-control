@@ -4,10 +4,12 @@
 //! - a reliable, bidirectional **control stream** that starts with a
 //!   [preamble](encode_preamble) from each side and then carries [`Control`]
 //!   messages as length-prefixed frames (see [`frame`]);
-//! - unreliable **QUIC datagrams** carrying [`Datagram`] messages for
-//!   latency-sensitive traffic (video, cursor, input; ping for now).
+//! - **unidirectional streams**, each starting with a [`StreamKind`] byte:
+//!   video frames (host → client) and input events (client → host);
+//! - unreliable **QUIC datagrams** carrying [`Datagram`] messages (ping).
 //!
-//! All messages are serialized with `postcard`.
+//! All messages are serialized with `postcard`. In F1 video travels on a
+//! reliable stream; datagrams with FEC replace it once tuned over the internet.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +45,37 @@ pub fn decode_preamble(bytes: [u8; PREAMBLE_LEN]) -> Result<u16, CodecError> {
 
 /// Default UDP port a host listens on for direct (LAN) connections.
 pub const DEFAULT_PORT: u16 = 7420;
+
+/// Upper bound for one encoded video frame on the video stream.
+pub const MAX_VIDEO_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// First byte of every unidirectional stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamKind {
+    /// Host → client, carries [`VideoFrame`]s.
+    Video = 1,
+    /// Client → host, carries [`InputEvent`]s.
+    Input = 2,
+}
+
+impl StreamKind {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Video),
+            2 => Some(Self::Input),
+            _ => None,
+        }
+    }
+
+    /// Largest frame accepted on a stream of this kind.
+    pub const fn max_frame_len(self) -> usize {
+        match self {
+            Self::Video => MAX_VIDEO_FRAME_LEN,
+            Self::Input => frame::MAX_FRAME_LEN,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -84,21 +117,33 @@ impl PeerInfo {
     }
 }
 
+/// The client's introduction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    pub peer: PeerInfo,
+    /// Code shown by the host; it must match before anything is shared.
+    pub access_code: String,
+}
+
 /// Messages on the reliable control stream.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Control {
     /// First message after the preamble, sent by the client.
-    Hello(PeerInfo),
+    Hello(Hello),
     /// Host's answer to an acceptable [`Control::Hello`].
     HelloAck(PeerInfo),
     /// Host refuses the session; the connection is closed afterwards.
     Reject(RejectReason),
+    /// Client asks for a fresh keyframe (start of stream, decode error).
+    RequestKeyframe,
     /// Orderly end of session.
     Bye,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
+    /// Wrong access code.
+    WrongCode,
     Denied,
     Busy,
 }
@@ -115,6 +160,56 @@ pub enum Datagram {
         seq: u32,
         sent_micros: u64,
     },
+}
+
+/// One encoded H.264 access unit on the video stream.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VideoFrame {
+    pub seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub keyframe: bool,
+    /// Time spent capturing (copying) this frame on the host.
+    pub capture_micros: u32,
+    /// Time spent encoding this frame on the host.
+    pub encode_micros: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+/// Input from the viewer, injected on the host.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    /// Absolute position, normalized to `0.0..=1.0` over the shared display.
+    MouseMove {
+        x: f32,
+        y: f32,
+    },
+    MouseButton {
+        button: MouseButton,
+        pressed: bool,
+    },
+    /// Scroll in notches (lines). Positive `dy` scrolls up, positive `dx` right.
+    Wheel {
+        dx: f32,
+        dy: f32,
+    },
+    /// PC set-1 scancode; `0xE0xx` marks extended keys.
+    Key {
+        scancode: u16,
+        pressed: bool,
+    },
+    /// Release every key and button still held (viewer lost focus).
+    ReleaseAll,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,7 +237,11 @@ mod tests {
     #[test]
     fn control_roundtrip() {
         let msgs = [
-            Control::Hello(PeerInfo::local("0.1.0", "desk")),
+            Control::Hello(Hello {
+                peer: PeerInfo::local("0.1.0", "desk"),
+                access_code: "123456789".into(),
+            }),
+            Control::RequestKeyframe,
             Control::HelloAck(PeerInfo::local("0.1.0", "laptop")),
             Control::Reject(RejectReason::Busy),
             Control::Bye,
@@ -161,6 +260,40 @@ mod tests {
         };
         let bytes = encode(&msg).unwrap();
         assert_eq!(decode::<Datagram>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn video_and_input_roundtrip() {
+        let frame = VideoFrame {
+            seq: 7,
+            width: 1920,
+            height: 1080,
+            keyframe: true,
+            capture_micros: 1200,
+            encode_micros: 4800,
+            data: vec![0, 0, 0, 1, 0x67, 0xff],
+        };
+        assert_eq!(
+            decode::<VideoFrame>(&encode(&frame).unwrap()).unwrap(),
+            frame
+        );
+
+        let input = InputEvent::Key {
+            scancode: 0xE04B,
+            pressed: true,
+        };
+        assert_eq!(
+            decode::<InputEvent>(&encode(&input).unwrap()).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn stream_kinds() {
+        for kind in [StreamKind::Video, StreamKind::Input] {
+            assert_eq!(StreamKind::from_byte(kind as u8), Some(kind));
+        }
+        assert_eq!(StreamKind::from_byte(0), None);
     }
 
     #[test]

@@ -1,0 +1,21 @@
+[package]
+name = "hext-session"
+description = "Hext Remote session pipelines: host (capture, encode, inject) and client (decode)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hext-capture.workspace = true
+hext-codec.workspace = true
+hext-input.workspace = true
+hext-metrics.workspace = true
+hext-net.workspace = true
+hext-proto.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
