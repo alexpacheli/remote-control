@@ -1,7 +1,7 @@
-# Ponte — Plano de Arquitetura
+# Hext Remote — Plano de Arquitetura
 
-> **"Ponte" é um codinome provisório.** Trocar o nome depois é um localizar e substituir.
-> Candidatos e critérios estão na seção [14](#14-nome).
+> **Nome do produto: Hext Remote.** Executável: `HextRemote.exe` (Windows) e `Hext Remote.app` (macOS). Prefixo dos binários e crates: `hext`.
+> Verificações de marca e domínio e nomes reserva estão na seção [14](#14-nome).
 
 ## 0. Visão
 
@@ -42,7 +42,7 @@ O Linux como host é viável, mas no Wayland cada sessão abre um pedido de perm
                           │ apresenta    │                │ fallback
                           │ os peers     │                │ (~10–15%)
    ┌──────────────┐       ▼              ▼                ▼       ┌──────────────┐
-   │  Ponte       │ ◄════════ P2P direto (QUIC sobre UDP) ══════► │  Ponte       │
+   │ Hext Remote  │ ◄════════ P2P direto (QUIC sobre UDP) ══════► │ Hext Remote  │
    │  (cliente)   │           criptografado ponta a ponta         │  (host)      │
    └──────────────┘                                               └──────────────┘
 ```
@@ -60,8 +60,8 @@ O Rust compila para **executável nativo**, sem runtime, sem .NET e sem Java:
 
 | SO | Saída | Distribuição |
 |---|---|---|
-| Windows | `Ponte.exe` (~10–20 MB) | `.exe` portátil e instalador `.msi` |
-| macOS | `Ponte.app` (binário universal x86_64 + arm64) | `.dmg` assinado e notarizado |
+| Windows | `HextRemote.exe` (~10–20 MB) | `.exe` portátil e instalador `.msi` |
+| macOS | `Hext Remote.app` (binário universal x86_64 + arm64) | `.dmg` assinado e notarizado |
 | Linux | binário ELF | `.AppImage`, `.deb` e `.rpm` |
 
 ### 3.2 Modos de execução
@@ -71,19 +71,49 @@ O Rust compila para **executável nativo**, sem runtime, sem .NET e sem Java:
    - Roda como serviço.
    - Inicia junto com o sistema e funciona na tela de login e nos prompts de UAC.
    - Permite **acesso não assistido** com senha fixa ou pela conta.
-   - Reconecta sozinho depois de um reboot.
+   - Reconecta sozinho depois de um reboot (seção [3.3](#33-inicialização-automática-e-reconexão)).
 
-### 3.3 Processos
+### 3.3 Inicialização automática e reconexão
+
+**Configurações do app** (aba "Segurança / Inicialização"):
+
+| Opção | Padrão quando instalado | Efeito |
+|---|---|---|
+| **Iniciar com o sistema** | ligado | O serviço sobe junto com o SO, **antes do login**, e a máquina fica online com o seu ID |
+| **Reconectar após reinício** | ligado | Depois de um reboot pedido na sessão, o técnico volta sozinho, sem novo pedido de aceite |
+| **Acesso não assistido** | desligado | Libera a entrada com senha fixa ou pela conta, sem ninguém do outro lado |
+
+No **modo portátil** não há inicialização automática. A tela mostra um botão "Instalar Hext Remote" que liga essas opções.
+
+**Como cada SO inicia o Hext Remote**
+
+| SO | Mecanismo |
+|---|---|
+| Windows | Serviço `hext-service` com inicialização **Automática** (não atrasada, para estar pronto já na tela de login) e reinício automático em caso de falha. Registrado também em `SafeBoot\Network`, para funcionar em **Modo Seguro com rede**. O ícone na bandeja inicia por usuário via `HKCU\...\Run`. |
+| macOS | **LaunchDaemon** (`RunAtLoad` + `KeepAlive`) e **LaunchAgent** para as sessões `Aqua` e `LoginWindow`, registrados via `SMAppService` (macOS 13+). Aparecem em Ajustes → Itens de Início. |
+| Linux | Unidade **systemd** de sistema e autostart XDG para a interface. |
+
+**Fluxo de reinício com reconexão**
+
+1. O técnico clica em **Reiniciar** (ou "Reiniciar em Modo Seguro"). É preciso ter a permissão "reiniciar" concedida na sessão.
+2. O host recebe um **token de reconexão**: uso único, válido por cerca de 10 minutos, amarrado àquele técnico e àquela sessão. O token fica guardado protegido pelo SO.
+3. O cliente do técnico mostra *"Aguardando a máquina voltar…"*.
+4. No boot, o serviço sobe, conecta na sinalização e fica online.
+5. O cliente reconecta sozinho apresentando o token, sem novo pedido de aceite, e o token é descartado.
+
+Quedas de rede no meio da sessão também reconectam sozinhas, com backoff exponencial, sem perder o estado da sessão.
+
+### 3.4 Processos
 
 **Windows**
 
 ```
-ponte-service (SYSTEM, sessão 0)
+hext-service (SYSTEM, sessão 0)
    ├─ fala com a sinalização, mantém a presença e aceita conexões
-   └─ lança ──► ponte-agent (na sessão do usuário ativo, ou na tela Winlogon/UAC)
+   └─ lança ──► hext-agent (na sessão do usuário ativo, ou na tela Winlogon/UAC)
                    └─ captura, encode e injeção de input
-ponte (UI)   ──► interface do usuário: ID, lista de máquinas, configurações
-ponte --view ──► janela(s) da sessão remota (render nativo)
+hext (UI)    ──► interface do usuário: ID, lista de máquinas, configurações
+hext --view  ──► janela(s) da sessão remota (render nativo)
 ```
 
 - Um serviço na sessão 0 **não consegue capturar a tela**. Por isso ele lança um *agent* na sessão ativa usando `WTSGetActiveConsoleSessionId` e `CreateProcessAsUser`.
@@ -96,10 +126,10 @@ ponte --view ──► janela(s) da sessão remota (render nativo)
 - Um **LaunchAgent** na sessão do usuário faz captura e input.
 - A captura da tela de login exige um agent no contexto `LoginWindow`. Fica para a fase F4.
 
-### 3.4 Interface
+### 3.5 Interface
 
 - **Casca da UI** (ID, lista de máquinas, login, configurações, chat): **Tauri 2**, que é rápido de desenvolver e tem visual moderno.
-- **Visualizador da sessão:** janela **nativa** (`winit` + `wgpu`) num processo separado, iniciado com `ponte --view`. O vídeo nunca passa por um webview.
+- **Visualizador da sessão:** janela **nativa** (`winit` + `wgpu`) num processo separado, iniciado com `hext --view`. O vídeo nunca passa por um webview.
   - Se o visualizador travar, a UI principal continua de pé.
   - Cada monitor remoto pode virar uma janela separada.
 
@@ -256,9 +286,9 @@ A latência é **medida desde a F1**: um overlay de estatísticas mostra captura
 
 | Serviço | Função | Tecnologia |
 |---|---|---|
-| `ponte-server` | API HTTPS (contas, dispositivos, IDs) e sinalização WSS | Rust (`axum` + `tokio`) |
-| STUN | Descoberta do IP público | embutido no `ponte-server` |
-| `ponte-relay` | Repasse UDP e TCP/443 de bytes cifrados, pareados por token de sessão | Rust, binário separado para escalar por região |
+| `hext-server` | API HTTPS (contas, dispositivos, IDs) e sinalização WSS | Rust (`axum` + `tokio`) |
+| STUN | Descoberta do IP público | embutido no `hext-server` |
+| `hext-relay` | Repasse UDP e TCP/443 de bytes cifrados, pareados por token de sessão | Rust, binário separado para escalar por região |
 | Banco | Contas, dispositivos, auditoria | PostgreSQL |
 | Presença | Quem está online | em memória no início, Redis ao escalar |
 | TLS | Certificados | Let's Encrypt (Caddy na frente ou `rustls-acme`) |
@@ -302,9 +332,9 @@ crates/
   platform-windows/        # serviço, agent, secure desktop, SendSAS
   platform-macos/          # LaunchDaemon/Agent, TCC
 apps/
-  ponte/                   # app desktop (Tauri) → Ponte.exe / Ponte.app
-  ponte-server/            # API + sinalização + STUN
-  ponte-relay/             # relay UDP/TCP
+  hext/                    # app desktop (Tauri) → HextRemote.exe / Hext Remote.app
+  hext-server/             # API + sinalização + STUN
+  hext-relay/              # relay UDP/TCP
 docs/
 .github/workflows/         # CI: build e testes em windows-latest, macos-latest, ubuntu-latest
 ```
@@ -333,7 +363,7 @@ docs/
 | **F1 — MVP LAN Windows** | Captura DXGI → MF H.264 → QUIC por IP direto → decode → render. Mouse, teclado e cursor local. | Controlar um PC Windows na LAN com **< 30 ms** e fluidez visível |
 | **F2 — macOS** | Host e cliente macOS (ScreenCaptureKit, VideoToolbox, CGEvent, TCC) | Windows ↔ macOS nos dois sentidos, na LAN |
 | **F3 — Internet** | VPS, ID numérico, sinalização, STUN, hole punching, relay UDP + TCP/443, pedido de aceite, ponta a ponta | Conectar pela internet só com o ID, inclusive atrás de NAT/firewall |
-| **F4 — Essenciais de suporte** | Serviço Windows (login/UAC/Ctrl+Alt+Del), senha não assistida (PAKE), clipboard, arquivos, chat, multi-monitor completo, reiniciar e reconectar, tela de login no macOS | Um técnico consegue fazer um atendimento real de ponta a ponta |
+| **F4 — Essenciais de suporte** | Serviço Windows (login/UAC/Ctrl+Alt+Del), inicialização automática nos 3 SOs, senha não assistida (PAKE), clipboard, arquivos, chat, multi-monitor completo, reiniciar e reconectar, tela de login no macOS | Um técnico consegue fazer um atendimento real de ponta a ponta |
 | **F5 — Contas** | Login, 2FA, catálogo de endereços, vínculo de dispositivos, compartilhamento, auditoria | Acessar as próprias máquinas sem aceite e gerenciar técnicos |
 | **F6 — Distribuição** | Instaladores, assinatura, notarização, auto-update, `.exe` portátil | Usuário final instala sem avisos de segurança |
 | **F7 — Extras** | Cliente e host Linux, áudio, privacidade (tela preta), gravação de sessão, HEVC/AV1, Wake-on-LAN, mobile e web | — |
@@ -368,20 +398,31 @@ Referências para estudo, **sem copiar código** por causa das licenças: RustDe
 | Wayland como host | Os prompts do portal impedem o acesso não assistido puro. Por isso ele vem depois do X11. |
 | Licença do projeto | Proprietária ou open source? Afeta quais bibliotecas e referências podem ser usadas. |
 | Modelo de negócio | Grátis para uso pessoal com plano pago para técnicos e empresas? Afeta limites de relay e contas. |
-| Nome | Ver abaixo. |
 
 ---
 
 ## 14. Nome
 
-**Critérios:** curto, fácil de falar em português e inglês, com domínio disponível e sem conflito de marca. Verificar no **INPI** e no USPTO antes de decidir.
+**Nome definido: Hext Remote.**
+
+| Uso | Forma |
+|---|---|
+| Produto | Hext Remote |
+| Executáveis | `HextRemote.exe`, `Hext Remote.app`, `hext-remote` (Linux) |
+| Prefixo técnico | `hext` (crates, serviço, binários do servidor) |
+
+**Antes de lançar, verificar:**
+
+- Marca no **INPI** (classes 9 e 42) e no USPTO.
+- Domínio, por exemplo `hextremote.com`, `hext.app` ou `hext.com.br`.
+- Nomes de usuário iguais no GitHub e nas redes sociais.
+
+**Nomes reserva**, caso "Hext" esteja ocupado (também precisam de verificação):
 
 | Nome | Ideia |
 |---|---|
-| **Ponte** | "Ponte" entre técnico e cliente. Simples e brasileiro. |
-| **Perto** / **Pertto** | "Estar perto" mesmo de longe. A grafia "Pertto" facilita registrar domínio e marca. |
-| **Alcance** | Alcançar qualquer máquina. |
+| **Reachly** | Alcançar qualquer máquina |
+| **Tethr** | Um "cabo" entre técnico e cliente |
+| **Overpass** | Passar por cima de firewall e NAT |
+| **Pertto** | Estar perto mesmo de longe (PT) |
 | **Vizo** | De "visão". Curto e funciona em qualquer idioma. |
-| **Junto** | Suporte lado a lado. |
-
-Evitar: "Elo" (bandeira de cartão), "Tandem", "Lumo" e "Kiro" (nomes de produtos já existentes).
