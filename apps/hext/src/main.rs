@@ -100,10 +100,13 @@ enum CmdKey {
 }
 
 fn main() -> Result<()> {
+    // quinn_udp warns on every MTU probe that a link (e.g. Tailscale, MTU
+    // 1280) cannot carry; quinn just keeps the smaller size, so hide them.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,quinn_udp=error".into()
+            }),
         )
         .init();
 
