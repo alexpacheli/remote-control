@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,9 +39,14 @@ pub fn host_endpoint(bind: SocketAddr, identity: &Identity) -> Result<Endpoint> 
     Ok(Endpoint::server(config, bind)?)
 }
 
-/// Endpoint for outgoing sessions on an ephemeral port.
-pub fn client_endpoint() -> Result<Endpoint> {
-    Ok(Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?)
+/// Endpoint for outgoing sessions to `remote`, on an ephemeral port of the
+/// same address family (dual-stack sockets are not the default everywhere).
+pub fn client_endpoint(remote: SocketAddr) -> Result<Endpoint> {
+    let bind: SocketAddr = match remote {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    Ok(Endpoint::client(bind)?)
 }
 
 /// Connects to a host, accepting it only if its certificate matches `pin`.

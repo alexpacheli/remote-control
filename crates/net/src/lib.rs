@@ -33,13 +33,19 @@ pub enum NetError {
     #[error("write: {0}")]
     Write(#[from] quinn::WriteError),
     #[error("read: {0}")]
-    Read(#[from] quinn::ReadExactError),
+    Read(#[from] quinn::ReadError),
     #[error("datagram: {0}")]
     Datagram(#[from] quinn::SendDatagramError),
     #[error("protocol: {0}")]
     Codec(#[from] CodecError),
     #[error("session rejected by host: {0:?}")]
     Rejected(RejectReason),
+    #[error("incompatible protocol version: ours is {local}, the peer's is {remote}")]
+    IncompatibleVersion { local: u16, remote: u16 },
+    #[error("control stream closed by peer")]
+    StreamClosed,
+    #[error("handshake timed out")]
+    Timeout,
     #[error("unexpected message: {0}")]
     Unexpected(String),
 }

@@ -4,6 +4,7 @@
 //! on the LAN (QUIC handshake + datagram RTT). The desktop UI and the remote
 //! view replace these commands in the next phases.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,9 +12,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hext_metrics::Rolling;
-use hext_net::{Connection, Fingerprint, Identity, Incoming};
+use hext_net::{Connection, Fingerprint, Identity, Incoming, NetError};
 use hext_proto::{Control, DEFAULT_PORT, Datagram, PeerInfo};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,10 +45,10 @@ enum Command {
         #[arg(long)]
         fingerprint: Option<Fingerprint>,
         /// Quantidade de pings.
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..))]
         count: u32,
         /// Intervalo entre pings, em milissegundos.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
         interval_ms: u64,
     },
 }
@@ -83,6 +84,14 @@ fn device_name() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
+/// Name of this executable as the user runs it (`HextRemote.exe`, `hext`…).
+fn exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "hext".to_owned())
+}
+
 fn parse_addr(addr: &str) -> Result<SocketAddr> {
     if let Ok(sock) = addr.parse::<SocketAddr>() {
         return Ok(sock);
@@ -102,7 +111,8 @@ async fn host(listen: SocketAddr) -> Result<()> {
         identity.fingerprint()
     );
     println!(
-        "No outro computador:\n  hext connect <IP-deste-PC> --fingerprint {}\n",
+        "No outro computador:\n  {} connect <IP-deste-PC> --fingerprint {}\n",
+        exe_name(),
         identity.fingerprint()
     );
 
@@ -139,15 +149,24 @@ async fn serve(incoming: Incoming) -> Result<()> {
     loop {
         tokio::select! {
             msg = control.recv() => match msg {
-                Ok(Control::Bye) | Err(_) => break,
+                Ok(Control::Bye) => {
+                    // Closing here is what lets the client's `bye()` return.
+                    conn.close(0u32.into(), b"bye");
+                    break;
+                }
                 Ok(other) => warn!("mensagem inesperada: {other:?}"),
+                Err(_) => break,
             },
             dg = hext_net::recv_datagram(&conn) => match dg {
                 Ok(Datagram::Ping { seq, sent_micros }) => {
-                    hext_net::send_datagram(&conn, &Datagram::Pong { seq, sent_micros })?;
+                    let pong = Datagram::Pong { seq, sent_micros };
+                    if hext_net::send_datagram(&conn, &pong).is_err() {
+                        break;
+                    }
                 }
                 Ok(_) => {}
-                // The client closed the connection (possibly before its Bye arrived).
+                Err(NetError::Codec(e)) => debug!("datagrama ignorado: {e}"),
+                // The client went away without a Bye.
                 Err(_) => break,
             },
         }
@@ -166,7 +185,7 @@ async fn connect(
     if pin.is_none() {
         warn!("sem --fingerprint: a conexão é cifrada, mas a identidade do host NÃO é verificada");
     }
-    let endpoint = hext_net::client_endpoint()?;
+    let endpoint = hext_net::client_endpoint(addr)?;
     let started = Instant::now();
     let conn = hext_net::connect(&endpoint, addr, pin)
         .await
@@ -181,9 +200,9 @@ async fn connect(
         started.elapsed().as_secs_f64() * 1000.0
     );
 
-    let rtt = Arc::new(Mutex::new(Rolling::new(count.max(1) as usize)));
+    let pongs = Arc::new(Mutex::new(Pongs::new(count)));
     let clock = Instant::now();
-    let receiver = tokio::spawn(collect_pongs(conn.clone(), clock, rtt.clone()));
+    let receiver = tokio::spawn(collect_pongs(conn.clone(), clock, pongs.clone()));
 
     let mut ticker = tokio::time::interval(interval);
     for seq in 0..count {
@@ -195,10 +214,13 @@ async fn connect(
     tokio::time::sleep(Duration::from_millis(500)).await;
     receiver.abort();
 
-    let summary = rtt.lock().expect("lock").summary();
+    let (summary, answered) = {
+        let pongs = pongs.lock().expect("lock");
+        (pongs.rtt.summary(), pongs.answered.len())
+    };
     match summary {
         Some(summary) => {
-            let lost = count as usize - summary.count;
+            let lost = (count as usize).saturating_sub(answered);
             println!("RTT: {summary}");
             println!("Perdidos: {lost} de {count}");
         }
@@ -208,19 +230,47 @@ async fn connect(
         ),
     }
 
-    control.bye().await?;
+    control.bye(&conn).await?;
     conn.close(0u32.into(), b"fim");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-async fn collect_pongs(conn: Connection, clock: Instant, rtt: Arc<Mutex<Rolling>>) {
-    while let Ok(dg) = hext_net::recv_datagram(&conn).await {
-        if let Datagram::Pong { sent_micros, .. } = dg {
-            let now = clock.elapsed().as_micros() as u64;
-            rtt.lock()
-                .expect("lock")
-                .push(Duration::from_micros(now.saturating_sub(sent_micros)));
+/// Answers received so far, counting each ping we sent at most once.
+struct Pongs {
+    count: u32,
+    answered: HashSet<u32>,
+    rtt: Rolling,
+}
+
+impl Pongs {
+    fn new(count: u32) -> Self {
+        Self {
+            count,
+            answered: HashSet::new(),
+            rtt: Rolling::new(count as usize),
+        }
+    }
+
+    fn record(&mut self, seq: u32, rtt: Duration) {
+        // Ignore duplicates and pongs for pings we never sent.
+        if seq < self.count && self.answered.insert(seq) {
+            self.rtt.push(rtt);
+        }
+    }
+}
+
+async fn collect_pongs(conn: Connection, clock: Instant, pongs: Arc<Mutex<Pongs>>) {
+    loop {
+        match hext_net::recv_datagram(&conn).await {
+            Ok(Datagram::Pong { seq, sent_micros }) => {
+                let now = clock.elapsed().as_micros() as u64;
+                let rtt = Duration::from_micros(now.saturating_sub(sent_micros));
+                pongs.lock().expect("lock").record(seq, rtt);
+            }
+            Ok(_) => {}
+            Err(NetError::Codec(e)) => debug!("datagrama ignorado: {e}"),
+            Err(_) => break,
         }
     }
 }

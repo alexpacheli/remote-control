@@ -4,7 +4,7 @@ use hext_net::{
     Endpoint, Identity, NetError, client_endpoint, client_handshake, connect, host_endpoint,
     host_handshake, recv_datagram, send_datagram,
 };
-use hext_proto::{Control, Datagram, PeerInfo, RejectReason};
+use hext_proto::{Control, Datagram, PROTOCOL_VERSION, PeerInfo, decode_preamble, encode_preamble};
 
 fn local_host() -> (Endpoint, SocketAddr, Identity) {
     let identity = Identity::generate().unwrap();
@@ -21,6 +21,7 @@ async fn serve_one(endpoint: Endpoint) -> Result<PeerInfo, NetError> {
         tokio::select! {
             msg = control.recv() => {
                 assert_eq!(msg?, Control::Bye);
+                conn.close(0u32.into(), b"bye");
                 return Ok(client);
             }
             dg = recv_datagram(&conn) => {
@@ -33,11 +34,11 @@ async fn serve_one(endpoint: Endpoint) -> Result<PeerInfo, NetError> {
 }
 
 #[tokio::test]
-async fn handshake_and_ping() {
+async fn handshake_ping_and_bye() {
     let (host, addr, identity) = local_host();
     let server = tokio::spawn(serve_one(host));
 
-    let client = client_endpoint().unwrap();
+    let client = client_endpoint(addr).unwrap();
     let conn = connect(&client, addr, Some(identity.fingerprint()))
         .await
         .unwrap();
@@ -46,21 +47,29 @@ async fn handshake_and_ping() {
         .unwrap();
     assert_eq!(host_info.device_name, "host");
 
-    let ping = Datagram::Ping {
-        seq: 1,
-        sent_micros: 99,
-    };
-    send_datagram(&conn, &ping).unwrap();
-    let pong = recv_datagram(&conn).await.unwrap();
-    assert_eq!(
-        pong,
-        Datagram::Pong {
-            seq: 1,
-            sent_micros: 99
-        }
-    );
+    // Many pings while the host also waits on the control stream exercise
+    // the cancel-safety of `ControlStream::recv` inside `select!`.
+    for seq in 0..50 {
+        send_datagram(
+            &conn,
+            &Datagram::Ping {
+                seq,
+                sent_micros: 99,
+            },
+        )
+        .unwrap();
+        let pong = recv_datagram(&conn).await.unwrap();
+        assert_eq!(
+            pong,
+            Datagram::Pong {
+                seq,
+                sent_micros: 99
+            }
+        );
+    }
 
-    control.bye().await.unwrap();
+    // The Bye must reach the host before the connection closes.
+    control.bye(&conn).await.unwrap();
     let client_info = server.await.unwrap().unwrap();
     assert_eq!(client_info.device_name, "client");
 }
@@ -75,30 +84,30 @@ async fn wrong_fingerprint_is_refused() {
     });
 
     let other = Identity::generate().unwrap().fingerprint();
-    let client = client_endpoint().unwrap();
+    let client = client_endpoint(addr).unwrap();
     let result = connect(&client, addr, Some(other)).await;
     assert!(matches!(result, Err(NetError::Connection(_))), "{result:?}");
 }
 
 #[tokio::test]
-async fn incompatible_version_is_rejected() {
+async fn incompatible_version_is_reported() {
     let (host, addr, identity) = local_host();
     let server = tokio::spawn(serve_one(host));
 
-    let client = client_endpoint().unwrap();
+    let client = client_endpoint(addr).unwrap();
     let conn = connect(&client, addr, Some(identity.fingerprint()))
         .await
         .unwrap();
-    let mut hello = PeerInfo::local("test", "client");
-    hello.protocol_version = 999;
-    let result = client_handshake(&conn, hello).await;
-    assert!(
-        matches!(
-            result,
-            Err(NetError::Rejected(RejectReason::IncompatibleVersion { .. }))
-        ),
-        "{:?}",
-        result.err()
-    );
-    assert!(matches!(server.await.unwrap(), Err(NetError::Rejected(_))));
+    // Speak as a future client: only the preamble layout is shared.
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&encode_preamble(999)).await.unwrap();
+    let mut reply = [0; 4];
+    recv.read_exact(&mut reply).await.unwrap();
+    assert_eq!(decode_preamble(reply).unwrap(), PROTOCOL_VERSION);
+    conn.close(0u32.into(), b"incompatible version");
+
+    assert!(matches!(
+        server.await.unwrap(),
+        Err(NetError::IncompatibleVersion { remote: 999, .. })
+    ));
 }
