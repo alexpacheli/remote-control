@@ -12,7 +12,7 @@ Acesso e suporte remoto para Windows, macOS e Linux, focado em fluidez.
 | `crates/proto` | Mensagens do protocolo: handshake, vídeo, input |
 | `crates/net` | QUIC, verificação do host por impressão digital, streams |
 | `crates/capture` | Captura de tela (DXGI no Windows, ScreenCaptureKit no macOS) e imagem de teste |
-| `crates/codec` | H.264: placa de vídeo no Windows (Media Foundation) ou OpenH264 em software |
+| `crates/codec` | H.264: placa de vídeo (Media Foundation no Windows, VideoToolbox no Mac) ou OpenH264 em software |
 | `crates/input` | Mapa de teclas e injeção de mouse/teclado (SendInput no Windows, CGEvent no macOS) |
 | `crates/render` | Renderização na GPU (wgpu), YUV → RGB no shader |
 | `crates/session` | Pipelines do host e do cliente |
@@ -86,12 +86,14 @@ Os binários ainda não são assinados (isso entra na F6):
 
 - **Teclado:** no Windows, **Ctrl funciona como Command** (Ctrl+C copia no Mac) e a tecla Windows vira Control.
   Para manter o Ctrl normal: `view ... --ctrl-key ctrl`.
+- **Codificador:** o Mac usa o próprio chip de vídeo (VideoToolbox) e volta para o processador se ele
+  falhar; `host --encoder software` força o processador, para comparar. O título da janela no Windows
+  mostra `(GPU)` ou `(CPU)` ao lado do tempo de encode.
 - A imagem é capturada no tamanho "lógico" da tela (ex.: 1920×1080 num monitor 4K Retina), o que deixa
   tudo mais leve.
 
 ### Limitações atuais
 
 - No Linux o host ainda transmite só uma imagem de teste (`--test-pattern`).
-- No Mac a codificação ainda é em software (OpenH264); a da placa de vídeo (VideoToolbox) vem depois.
-- Codificação por hardware ainda copia a imagem pela memória do sistema; o caminho direto na GPU (zero-copy) vem depois.
+- Codificação por hardware ainda copia a imagem pela memória do sistema (Windows e Mac); o caminho direto na GPU (zero-copy) vem depois.
 - Janelas abertas como administrador, a tela de UAC e a tela de bloqueio não recebem controle (precisam do serviço, na F4).

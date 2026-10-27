@@ -3,7 +3,8 @@
 //! Encoders sit behind [`VideoEncoder`]:
 //! - [`SoftwareEncoder`]: OpenH264, identical on every OS;
 //! - a hardware encoder on Windows (a Media Foundation transform from the
-//!   GPU vendor: NVIDIA, AMD or Intel).
+//!   GPU vendor: NVIDIA, AMD or Intel);
+//! - a hardware encoder on macOS (VideoToolbox, on the Mac's media engine).
 //!
 //! [`open_encoder`] picks one; in `Auto` mode a failing hardware encoder is
 //! replaced by the software one on the fly. Decoding is OpenH264 everywhere,
@@ -18,6 +19,8 @@ pub mod h264;
 mod mf;
 mod nv12;
 mod software;
+#[cfg(target_os = "macos")]
+mod vt;
 
 pub use nv12::bgra_to_nv12;
 pub use software::SoftwareEncoder;
@@ -137,7 +140,11 @@ fn hardware(settings: EncoderSettings) -> Result<Box<dyn VideoEncoder>, CodecErr
     {
         Ok(Box::new(mf::MfEncoder::new(settings)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(vt::VtEncoder::new(settings)?))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = settings;
         Err(CodecError::NoHardware)
@@ -200,6 +207,20 @@ impl VideoEncoder for AutoEncoder {
 
     fn is_hardware(&self) -> bool {
         self.hardware.is_some()
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// Adds `next` to the outputs collected in `ready`. Several access units in
+/// one payload decode in order, so none is dropped, except that a keyframe
+/// makes everything before it unnecessary: the payload then starts with it,
+/// and its keyframe flag stays truthful.
+pub(crate) fn merge(ready: &mut Option<Encoded>, next: Option<Encoded>) {
+    match (ready.as_mut(), next) {
+        (_, None) => {}
+        (None, Some(next)) => *ready = Some(next),
+        (Some(_), Some(next)) if next.keyframe => *ready = Some(next),
+        (Some(ready), Some(next)) => ready.data.extend_from_slice(&next.data),
     }
 }
 
@@ -298,7 +319,7 @@ pub(crate) mod tests {
     #[test]
     fn auto_without_hardware_is_software() {
         let encoder = open_encoder(EncoderSettings::default()).unwrap();
-        if !cfg!(windows) {
+        if !cfg!(any(windows, target_os = "macos")) {
             assert!(!encoder.is_hardware());
             assert!(encoder.name().contains("OpenH264"));
         }
@@ -306,7 +327,7 @@ pub(crate) mod tests {
 
     #[test]
     fn forced_hardware_fails_without_it() {
-        if !cfg!(windows) {
+        if !cfg!(any(windows, target_os = "macos")) {
             let settings = EncoderSettings {
                 preference: EncoderPreference::Hardware,
                 ..Default::default()

@@ -23,7 +23,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.6", features = ["derive"] }
 gethostname = "1.1"
 hex = "0.4"
-# Software H.264 (Cisco OpenH264, built from source). Hardware encoders come later.
+# Software H.264 (Cisco OpenH264, built from source), also the decoder everywhere.
 openh264 = "0.9"
 pollster = "1.0"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
@@ -46,6 +46,7 @@ objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-foundation = "0.3"
 objc2-screen-capture-kit = "0.3"
+objc2-video-toolbox = "0.3"
 wgpu = "30"
 winit = "0.30"
 windows-core = "0.62"

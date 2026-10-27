@@ -50,7 +50,7 @@ use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 
 use crate::h264::{self, PROFILE_BASELINE};
 use crate::nv12::bgra_to_nv12;
-use crate::{CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame};
+use crate::{CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge};
 
 /// Longest wait for the encoder to ask for input or deliver output.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -552,19 +552,6 @@ impl IMFAsyncCallback_Impl for EventSink_Impl {
         // The receiver is gone once the session ended; nothing to do then.
         let _ = self.tx.send(kind);
         Ok(())
-    }
-}
-
-/// Adds `next` to the outputs collected in `ready`. Several access units in
-/// one payload decode in order, so none is dropped, except that a keyframe
-/// makes everything before it unnecessary: the payload then starts with it,
-/// and its keyframe flag stays truthful.
-fn merge(ready: &mut Option<Encoded>, next: Option<Encoded>) {
-    match (ready.as_mut(), next) {
-        (_, None) => {}
-        (None, Some(next)) => *ready = Some(next),
-        (Some(_), Some(next)) if next.keyframe => *ready = Some(next),
-        (Some(ready), Some(next)) => ready.data.extend_from_slice(&next.data),
     }
 }
 
