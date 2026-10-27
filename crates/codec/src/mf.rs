@@ -14,36 +14,39 @@
 #![allow(unsafe_code)]
 
 use std::mem::ManuallyDrop;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use openh264::formats::YUVBuffer;
+use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown, IMFTransform,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
-    MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    METransformHaveOutput, METransformNeedInput, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFMediaEvent, METransformDrainComplete, MFT_MESSAGE_COMMAND_DRAIN,
+    IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, METransformDrainComplete,
+    MFT_MESSAGE_COMMAND_DRAIN,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::{
     VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,
 };
-use windows::core::{GUID, Interface, PWSTR};
+use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 
 use crate::h264::{self, PROFILE_BASELINE};
 use crate::nv12::bgra_to_nv12;
@@ -55,9 +58,6 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a still screen waits for frames left in the encoder before
 /// asking it to flush them.
 const DRAIN_WAIT: Duration = Duration::from_millis(30);
-
-/// Pause between event polls (high-resolution timers make this precise).
-const POLL_INTERVAL: Duration = Duration::from_micros(200);
 
 /// Hundreds of nanoseconds per second (Media Foundation time unit).
 const HNS_PER_SEC: i64 = 10_000_000;
@@ -87,6 +87,9 @@ struct Session {
     activate: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
+    /// Receives the type of each event, delivered by [`EventSink`].
+    event_rx: mpsc::Receiver<windows::core::Result<u32>>,
+    callback: IMFAsyncCallback,
     codec: Option<ICodecAPI>,
     /// `METransformNeedInput` events not yet answered with an input.
     need_input: u32,
@@ -210,12 +213,20 @@ impl MfEncoder {
             (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32;
         let events: IMFMediaEventGenerator =
             transform.cast().map_err(|e| hw("event generator", e))?;
+        let (event_tx, event_rx) = mpsc::channel();
+        let callback: IMFAsyncCallback = EventSink {
+            generator: events.clone(),
+            tx: event_tx,
+        }
+        .into();
         let mut session = Session {
             width,
             height,
             activate,
             transform,
             events,
+            event_rx,
+            callback,
             codec,
             need_input: 0,
             provides_samples: info.dwFlags & provides != 0,
@@ -225,6 +236,7 @@ impl MfEncoder {
             sequence_header: Vec::new(),
         };
         session.refresh_sequence_header();
+        session.request_event()?;
         Ok(session)
     }
 }
@@ -336,7 +348,7 @@ impl Session {
         let mut ready = None;
         let soft_deadline = Instant::now() + DRAIN_WAIT;
         while self.in_flight > 0 && Instant::now() < soft_deadline {
-            merge(&mut ready, self.poll_event()?);
+            merge(&mut ready, self.poll_event(soft_deadline)?);
         }
         if self.in_flight == 0 {
             return Ok(ready);
@@ -353,41 +365,52 @@ impl Session {
         Ok(ready)
     }
 
-    /// Like [`Session::next_event`], but returns right away when there is none.
-    fn poll_event(&mut self) -> Result<Option<Encoded>, CodecError> {
-        match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-            Ok(event) => self.handle(&event),
-            Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                std::thread::sleep(POLL_INTERVAL);
-                Ok(None)
+    /// Asks Media Foundation for the next event; [`EventSink`] receives it.
+    /// Only one request may be outstanding, so this follows each delivery.
+    fn request_event(&self) -> Result<(), CodecError> {
+        unsafe { self.events.BeginGetEvent(&self.callback, None) }
+            .map_err(|e| hw("BeginGetEvent", e))
+    }
+
+    /// The type of the next event, or `None` if none arrives by `deadline`.
+    ///
+    /// The callback wakes this thread as soon as the event exists (no polling
+    /// sleeps, whose ~15 ms granularity on Windows would add latency), and the
+    /// deadline keeps a stuck driver from hanging the host.
+    fn wait_event(&mut self, deadline: Instant) -> Result<Option<u32>, CodecError> {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        match self.event_rx.recv_timeout(timeout) {
+            Ok(Ok(kind)) => {
+                self.request_event()?;
+                Ok(Some(kind))
             }
-            Err(e) => Err(hw("GetEvent", e)),
+            Ok(Err(e)) => Err(hw("GetEvent", e)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(CodecError::Hardware("event callback gone".into()))
+            }
+        }
+    }
+
+    /// Like [`Session::next_event`], but a timeout just means "nothing yet".
+    fn poll_event(&mut self, deadline: Instant) -> Result<Option<Encoded>, CodecError> {
+        match self.wait_event(deadline)? {
+            Some(kind) => self.handle(kind),
+            None => Ok(None),
         }
     }
 
     /// Waits for the next transform event and handles it; returns an encoded
-    /// frame if the event delivered one.
-    ///
-    /// Polls instead of blocking, so a driver that stops answering fails the
-    /// encoder (and `Auto` falls back to software) instead of hanging the host.
+    /// frame if the event delivered one. Fails if the encoder stays silent
+    /// past `deadline`, so `Auto` falls back to software.
     fn next_event(&mut self, deadline: Instant) -> Result<Option<Encoded>, CodecError> {
-        let event = loop {
-            match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => break event,
-                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    if Instant::now() > deadline {
-                        return Err(CodecError::Hardware("o encoder parou de responder".into()));
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(e) => return Err(hw("GetEvent", e)),
-            }
-        };
-        self.handle(&event)
+        match self.wait_event(deadline)? {
+            Some(kind) => self.handle(kind),
+            None => Err(CodecError::Hardware("o encoder parou de responder".into())),
+        }
     }
 
-    fn handle(&mut self, event: &IMFMediaEvent) -> Result<Option<Encoded>, CodecError> {
-        let kind = unsafe { event.GetType() }.map_err(|e| hw("event type", e))?;
+    fn handle(&mut self, kind: u32) -> Result<Option<Encoded>, CodecError> {
         if kind == METransformDrainComplete.0 as u32 {
             self.draining = false;
             Ok(None)
@@ -488,6 +511,29 @@ impl Drop for Session {
             }
             let _ = self.activate.ShutdownObject();
         }
+    }
+}
+
+/// Receives Media Foundation's asynchronous event deliveries (on an MF work
+/// thread) and forwards each event's type to the encoding thread.
+#[implement(IMFAsyncCallback)]
+struct EventSink {
+    generator: IMFMediaEventGenerator,
+    tx: mpsc::Sender<windows::core::Result<u32>>,
+}
+
+impl IMFAsyncCallback_Impl for EventSink_Impl {
+    fn GetParameters(&self, _flags: *mut u32, _queue: *mut u32) -> windows::core::Result<()> {
+        // Default work queue and behavior.
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Invoke(&self, result: Ref<IMFAsyncResult>) -> windows::core::Result<()> {
+        let kind = unsafe { self.generator.EndGetEvent(result.ok()?) }
+            .and_then(|event| unsafe { event.GetType() });
+        // The receiver is gone once the session ended; nothing to do then.
+        let _ = self.tx.send(kind);
+        Ok(())
     }
 }
 
