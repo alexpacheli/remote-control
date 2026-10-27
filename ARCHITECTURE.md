@@ -276,6 +276,21 @@ A latência é **medida desde a F1**: um overlay de estatísticas mostra captura
 - **Auditoria:** registro de quem conectou, quando, por quanto tempo e com quais permissões.
 - **Indicador visível no host:** uma barra mostra que há uma sessão ativa e tem um botão para encerrá-la.
 
+### 7.4 Consentimento e transparência (princípio do produto)
+
+O Hext Remote é uma ferramenta de **acesso e suporte com consentimento**, não de vigilância secreta.
+Esta é uma decisão de projeto, não só uma configuração:
+
+- **O dono do computador sempre pode saber que o acesso existe.** O acesso não assistido (F5) é
+  configurado uma vez, com consentimento, e mantém o **indicador visível de sessão ativa** e o
+  **registro de auditoria**. Não haverá um modo "oculto" que esconda do usuário que há alguém
+  conectado, nem instalação ou captura sem autorização.
+- **Uso corporativo** é suportado de forma transparente: ícone visível, política que o funcionário
+  conhece e logs de auditoria.
+- Recursos que sirvam para **espionar alguém sem o seu conhecimento** (ocultar a presença, dispensar
+  o consentimento, instalar escondido) estão **fora do escopo** e não serão implementados — é
+  stalkerware, ilegal em muitos casos e removido por lojas de apps e antivírus.
+
 ---
 
 ## 8. Servidor (VPS)
@@ -364,7 +379,7 @@ docs/
 | **F2 — macOS** ✅ | Host e cliente macOS: ScreenCaptureKit (no tamanho lógico da tela), CGEvent (arrastar, duplo clique, modificadores), mapa scancode → tecla do Mac, Ctrl↔Cmd conforme o sistema do host, checagem de Gravação de Tela e Acessibilidade. Pendente: VideoToolbox. | Windows ↔ macOS nos dois sentidos, na LAN |
 | **F3 — Internet** | VPS, ID numérico, sinalização, STUN, hole punching, relay UDP + TCP/443, pedido de aceite, ponta a ponta | Conectar pela internet só com o ID, inclusive atrás de NAT/firewall |
 | **F4 — Essenciais de suporte** | Serviço Windows (login/UAC/Ctrl+Alt+Del), inicialização automática nos 3 SOs, senha não assistida (PAKE), clipboard, arquivos, chat, multi-monitor completo, reiniciar e reconectar, tela de login no macOS | Um técnico consegue fazer um atendimento real de ponta a ponta |
-| **F5 — Contas** | Login, 2FA, catálogo de endereços, vínculo de dispositivos, compartilhamento, auditoria | Acessar as próprias máquinas sem aceite e gerenciar técnicos |
+| **F5 — Contas** | Login, 2FA, catálogo de endereços, vínculo de dispositivos, compartilhamento, auditoria. **Acesso não assistido sempre com consentimento prévio, indicador visível de sessão ativa e log de auditoria** (ver [7.4](#74-consentimento-e-transparência-princípio-do-produto)); sem modo oculto. | Acessar as próprias máquinas sem aceite e gerenciar técnicos |
 | **F6 — Distribuição** | Instaladores, assinatura, notarização, auto-update, `.exe` portátil | Usuário final instala sem avisos de segurança |
 | **F7 — Extras** | Cliente e host Linux, áudio, privacidade (tela preta), gravação de sessão, HEVC/AV1, Wake-on-LAN, mobile e web | — |
 

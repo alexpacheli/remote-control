@@ -123,10 +123,12 @@ impl Viewer {
     /// frame events can find a single frame, and presenting the same picture
     /// again could block on vsync and back up the event queue.
     fn draw(&mut self, only_if_new: bool) {
-        let frame = self.latest.lock().expect("lock").take();
+        // Check the renderer first: taking the frame before the window exists
+        // would discard it, and a still host screen sends no replacement.
         let Some(renderer) = &mut self.renderer else {
             return;
         };
+        let frame = self.latest.lock().expect("lock").take();
         match frame {
             Some(frame) => renderer.upload(&frame),
             None if only_if_new => return,

@@ -24,6 +24,10 @@ pub async fn run(args: HostArgs) -> Result<()> {
         Some(code) => code,
         None => random_code()?,
     };
+    // An all-whitespace code would normalize to empty and admit anyone.
+    if code.chars().filter(|c| c.is_ascii_digit()).count() < 4 {
+        anyhow::bail!("o código de acesso precisa de ao menos 4 dígitos");
+    }
     if args.test_pattern {
         warn!("transmitindo a imagem de teste, não a tela (--test-pattern)");
     } else {

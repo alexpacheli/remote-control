@@ -67,6 +67,9 @@ impl Injector for SendInputInjector {
                 send_button(id, pressed);
             }
             InputEvent::Wheel { dx, dy } => {
+                if !dx.is_finite() || !dy.is_finite() {
+                    return;
+                }
                 let delta = WHEEL_DELTA as f32;
                 self.wheel_rest.0 += dx * delta;
                 self.wheel_rest.1 += dy * delta;

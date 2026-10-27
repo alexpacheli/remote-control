@@ -70,6 +70,12 @@ fn hw(context: &str, e: windows::core::Error) -> CodecError {
     CodecError::Hardware(format!("{context}: {e}"))
 }
 
+fn profile_error(profile: u8) -> CodecError {
+    CodecError::Hardware(format!(
+        "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({PROFILE_BASELINE})"
+    ))
+}
+
 pub struct MfEncoder {
     settings: EncoderSettings,
     name: String,
@@ -362,6 +368,14 @@ impl Session {
             merge(&mut ready, self.next_event(deadline)?);
         }
         self.in_flight = 0;
+        // A drained transform must be restarted; the NeedInput events it sent
+        // before the drain are stale, so discard them and ask for fresh ones.
+        self.need_input = 0;
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+        }
+        .map_err(|e| hw("restart after drain", e))?;
         Ok(ready)
     }
 
@@ -474,22 +488,26 @@ impl Session {
         self.in_flight = self.in_flight.saturating_sub(1);
 
         let mut data = read_sample(&sample)?;
+        // One pass over the NALs instead of three.
+        let scan = h264::scan(&data);
         // Not every driver sets the clean-point attribute: look at the NALs too.
         let clean_point =
             unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
-        let keyframe = clean_point || h264::has_idr(&data);
-        if keyframe && !h264::has_sps(&data) && !self.sequence_header.is_empty() {
+        let keyframe = clean_point || scan.has_idr;
+        if keyframe && !scan.has_sps && !self.sequence_header.is_empty() {
             let mut with_header = self.sequence_header.clone();
             with_header.extend_from_slice(&data);
             data = with_header;
-        }
-        // Checked on every SPS, so a profile switch later on is caught too.
-        if let Some(profile) = h264::sps_profile(&data)
+            // Checked on every SPS, so a profile switch later on is caught too.
+            if let Some(profile) = h264::sps_profile(&data)
+                && profile != PROFILE_BASELINE
+            {
+                return Err(profile_error(profile));
+            }
+        } else if let Some(profile) = scan.profile
             && profile != PROFILE_BASELINE
         {
-            return Err(CodecError::Hardware(format!(
-                "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({PROFILE_BASELINE})"
-            )));
+            return Err(profile_error(profile));
         }
         Ok(Some(Encoded { data, keyframe }))
     }

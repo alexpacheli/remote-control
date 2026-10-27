@@ -157,6 +157,14 @@ pub fn scancode(code: KeyCode, command: CommandKey) -> Option<u16> {
     Some(sc)
 }
 
+// Note: in `CommandKey::Ctrl` (a Mac viewer controlling a non-Mac host),
+// `scancode()` maps both the Command and the physical Control keys to the
+// Control scancodes. Four physical keys (two Control, two Command) cannot map
+// to two Control scancodes without collision, so holding Control and Command
+// at the same time is tracked as one key on the host. This is rare in practice
+// (Cmd is remapped precisely so the user presses *it* for shortcuts); the
+// `ReleaseAll` on focus loss clears any key left stuck by such a collision.
+
 /// macOS virtual key code (`kVK_*`) for a PC set-1 scancode, for hosts
 /// that inject with CGEvent. `None` for keys a Mac keyboard does not have.
 pub fn mac_keycode(scancode: u16) -> Option<u16> {

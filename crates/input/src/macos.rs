@@ -216,6 +216,9 @@ impl Injector for CgEventInjector {
                 self.button(button_number(button), pressed);
             }
             InputEvent::Wheel { dx, dy } => {
+                if !dx.is_finite() || !dy.is_finite() {
+                    return;
+                }
                 // Whole pixels; the remainder carries over.
                 self.wheel_rest.0 += dx * PIXELS_PER_NOTCH;
                 self.wheel_rest.1 += dy * PIXELS_PER_NOTCH;

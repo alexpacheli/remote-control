@@ -79,7 +79,15 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         return Err(e);
     }
 
-    let mut video = hext_net::open_uni(&conn, StreamKind::Video).await?;
+    let mut video = match hext_net::open_uni(&conn, StreamKind::Video).await {
+        Ok(video) => video,
+        Err(e) => {
+            // Stop the detached capture thread, which holds the capturer/encoder.
+            shared.stop.store(true, Ordering::Relaxed);
+            let _ = tokio::task::spawn_blocking(move || capture.join()).await;
+            return Err(e.into());
+        }
+    };
     let mut writer = tokio::spawn(async move {
         while let Some(frame) = frames_rx.recv().await {
             video.send(&frame).await?;
@@ -98,8 +106,9 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
                     break Ok(());
                 }
                 Ok(other) => debug!("mensagem inesperada: {other:?}"),
-                // The client went away without a Bye.
-                Err(_) => break Ok(()),
+                // A peer that left is a clean end; anything else is an error.
+                Err(e) if e.is_peer_closed() => break Ok(()),
+                Err(e) => break Err(e.into()),
             },
             _ = conn.closed() => break Ok(()),
             // Without video or input the session is useless: end it.
@@ -227,6 +236,10 @@ fn capture_loop(
             continue;
         }
         let Some(frame) = capturer.frame() else {
+            // Nothing captured yet: keep a pending keyframe request alive.
+            if forced {
+                shared.keyframe.store(true, Ordering::Relaxed);
+            }
             continue;
         };
 
@@ -240,6 +253,11 @@ fn capture_loop(
             }
             Err(e) => {
                 warn!("encode: {e}");
+                // Don't drop a keyframe request: retry on the next loop
+                // (owed = true keeps the timeout at zero).
+                if forced {
+                    shared.keyframe.store(true, Ordering::Relaxed);
+                }
                 continue;
             }
         };
