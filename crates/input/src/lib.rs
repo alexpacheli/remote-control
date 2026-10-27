@@ -2,12 +2,14 @@
 //!
 //! - The viewer turns window events into [`InputEvent`]s; [`keymap`] maps
 //!   physical keys to PC set-1 scancodes, the wire format for keys.
-//! - The host replays them with an [`Injector`]: `SendInput` on Windows, a
-//!   logger elsewhere (macOS injection arrives in F2).
+//! - The host replays them with an [`Injector`]: `SendInput` on Windows,
+//!   CGEvent on macOS, a logger elsewhere.
 
 use hext_proto::InputEvent;
 
 pub mod keymap;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -38,13 +40,30 @@ pub trait Injector: Send {
     fn release_all(&mut self);
 }
 
+/// Whether injected input will be accepted. On macOS this needs the
+/// "Accessibility" permission; when missing, the settings page is opened.
+pub fn preflight() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::preflight()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 /// The injector for this OS.
 pub fn injector() -> Box<dyn Injector> {
     #[cfg(windows)]
     {
         Box::new(windows::SendInputInjector::default())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::CgEventInjector::default())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Box::new(LogInjector)
     }

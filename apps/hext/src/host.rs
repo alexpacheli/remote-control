@@ -26,6 +26,12 @@ pub async fn run(args: HostArgs) -> Result<()> {
     };
     if args.test_pattern {
         warn!("transmitindo a imagem de teste, não a tela (--test-pattern)");
+    } else {
+        // Keep running either way: the permissions may be granted meanwhile.
+        if let Err(e) = hext_capture::preflight() {
+            warn!("{e}");
+        }
+        hext_input::preflight();
     }
 
     let port = endpoint.local_addr()?.port();

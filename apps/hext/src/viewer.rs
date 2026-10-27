@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use hext_codec::YuvFrame;
 use hext_input::keymap::{self, CommandKey};
+use hext_proto::Os;
 use hext_proto::{Hello, InputEvent, MouseButton, PeerInfo};
 use hext_render::Renderer;
 use hext_session::client::{self, ClientHandle};
@@ -21,7 +22,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-use crate::{APP_VERSION, CmdKey, ViewArgs, device_name, parse_addr};
+use crate::{APP_VERSION, CmdKey, CtrlKey, ViewArgs, device_name, parse_addr};
 
 /// Trackpad scrolling arrives in pixels; this many make one wheel notch.
 const PIXELS_PER_NOTCH: f64 = 50.0;
@@ -75,6 +76,7 @@ pub fn run(args: ViewArgs) -> Result<()> {
         session.host.device_name, session.host.os, session.host.app_version
     );
 
+    let host_is_mac = session.host.os == Os::MacOs;
     let mut app = Viewer {
         runtime,
         session: Some(session),
@@ -82,9 +84,14 @@ pub fn run(args: ViewArgs) -> Result<()> {
         window: None,
         renderer: None,
         command_key: match args.cmd_key {
+            // A Mac host understands Command itself.
+            _ if host_is_mac => CommandKey::Win,
             CmdKey::Ctrl => CommandKey::Ctrl,
             CmdKey::Win => CommandKey::Win,
         },
+        swap_ctrl_and_super: host_is_mac
+            && !cfg!(target_os = "macos")
+            && args.ctrl_key == CtrlKey::Cmd,
         last_title: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
@@ -98,6 +105,8 @@ struct Viewer {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     command_key: CommandKey,
+    /// Windows/Linux keyboard on a Mac host: Ctrl acts as Command.
+    swap_ctrl_and_super: bool,
     last_title: Instant,
 }
 
@@ -243,7 +252,10 @@ impl ApplicationHandler<UserEvent> for Viewer {
                     return;
                 };
                 // Repeats are forwarded too: injected keys do not auto-repeat.
-                if let Some(scancode) = keymap::scancode(code, self.command_key) {
+                if let Some(mut scancode) = keymap::scancode(code, self.command_key) {
+                    if self.swap_ctrl_and_super {
+                        scancode = keymap::swap_ctrl_and_super(scancode);
+                    }
                     self.send(InputEvent::Key {
                         scancode,
                         pressed: event.state == ElementState::Pressed,

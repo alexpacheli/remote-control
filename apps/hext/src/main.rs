@@ -46,8 +46,8 @@ struct HostArgs {
     /// Monitor a compartilhar (0 = principal).
     #[arg(long, default_value_t = 0)]
     display: usize,
-    /// Transmite uma imagem de teste em vez da tela (padrão fora do Windows por enquanto).
-    #[arg(long, default_value_t = !cfg!(windows))]
+    /// Transmite uma imagem de teste em vez da tela (padrão no Linux por enquanto).
+    #[arg(long, default_value_t = !cfg!(any(windows, target_os = "macos")))]
     test_pattern: bool,
     /// Taxa de bits do vídeo, em Mbps.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=200))]
@@ -80,15 +80,26 @@ struct ViewArgs {
     /// Impressão digital mostrada pelo host. Sem ela a conexão é cifrada mas não autenticada.
     #[arg(long)]
     fingerprint: Option<Fingerprint>,
-    /// O que a tecla Command do Mac envia ao host.
+    /// Visualizador no Mac, host Windows/Linux: o que a tecla Command envia.
     #[arg(long, value_enum, default_value_t = CmdKey::Ctrl)]
     cmd_key: CmdKey,
+    /// Visualizador Windows/Linux, host Mac: o que a tecla Ctrl envia.
+    #[arg(long, value_enum, default_value_t = CtrlKey::Cmd)]
+    ctrl_key: CtrlKey,
     /// Sem janela: só recebe, decodifica e mostra estatísticas (para testes).
     #[arg(long)]
     headless: bool,
     /// No modo --headless, por quantos segundos receber.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     seconds: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CtrlKey {
+    /// Ctrl funciona como Command (Ctrl+C copia no Mac); a tecla Windows vira Control.
+    Cmd,
+    /// Ctrl continua Control.
+    Ctrl,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

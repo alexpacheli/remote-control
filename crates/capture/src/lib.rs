@@ -1,11 +1,13 @@
 //! Screen capture.
 //!
 //! [`open`] returns a [`Capturer`] for one display: DXGI Desktop Duplication
-//! on Windows, or a synthetic [`TestPattern`] (any OS) for development and
-//! tests. macOS capture (ScreenCaptureKit) arrives in F2.
+//! on Windows, ScreenCaptureKit on macOS, or a synthetic [`TestPattern`] (any
+//! OS) for development and tests.
 
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+mod macos;
 mod test_pattern;
 #[cfg(windows)]
 mod windows;
@@ -37,6 +39,8 @@ pub enum CaptureError {
     NoSuchDisplay(usize),
     #[error("screen capture is not available on this OS yet; use the test pattern")]
     Unsupported,
+    #[error("sem permissão para capturar a tela: {0}")]
+    PermissionDenied(String),
     #[error("capture failed: {0}")]
     Platform(String),
 }
@@ -58,6 +62,19 @@ pub trait Capturer {
     fn copy_time(&self) -> Duration;
 }
 
+/// Checks (and on macOS requests) the permission to capture the screen, so
+/// a host can report a missing one at startup rather than on first connection.
+pub fn preflight() -> Result<(), CaptureError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::preflight()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 /// Opens display `index` (0 = primary), or the test pattern.
 pub fn open(index: usize, test_pattern: bool) -> Result<Box<dyn Capturer>, CaptureError> {
     if test_pattern {
@@ -67,7 +84,11 @@ pub fn open(index: usize, test_pattern: bool) -> Result<Box<dyn Capturer>, Captu
     {
         Ok(Box::new(windows::DxgiCapturer::new(index)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::ScreenCaptureKitCapturer::new(index)?))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = index;
         Err(CaptureError::Unsupported)

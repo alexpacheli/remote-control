@@ -1,0 +1,341 @@
+//! ScreenCaptureKit capture (macOS 12.3+).
+//!
+//! An `SCStream` delivers a sample buffer whenever the screen changes; the
+//! stream-output delegate copies the pixels into a [`Frame`] and wakes
+//! [`Capturer::next_frame`]. The display is captured at its size in points
+//! (e.g. 1920x1080 for a 4K "looks like 1080p" display): the GPU does the
+//! downscale for free and the encoder gets a quarter of the pixels.
+//! The cursor is not drawn into the image; the viewer shows its own.
+
+// Objective-C / CoreVideo calls are unsafe by nature; each block below is a plain API call.
+#![allow(unsafe_code)]
+
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
+use objc2_core_foundation::CFArray;
+use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
+use objc2_core_media::{CMSampleBuffer, CMTime};
+use objc2_core_video::{
+    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
+};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
+};
+
+use crate::{CaptureError, Capturer, Frame, Rect, even};
+
+/// How long to wait for ScreenCaptureKit to answer a request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Widest image captured; bigger logical resolutions are scaled down.
+const MAX_WIDTH: u32 = 2560;
+
+fn platform(context: &str, error: &NSError) -> CaptureError {
+    CaptureError::Platform(format!("{context}: {}", error.localizedDescription()))
+}
+
+/// The newest frame from the delegate, picked up by `next_frame`.
+#[derive(Default)]
+struct Latest {
+    frame: Option<Frame>,
+    copy_time: Duration,
+    /// Increases with every delivered frame.
+    seq: u64,
+}
+
+#[derive(Default)]
+struct Shared {
+    latest: Mutex<Latest>,
+    ready: Condvar,
+}
+
+impl Shared {
+    /// Copies a delivered sample (on ScreenCaptureKit's queue).
+    fn store(&self, sample: &CMSampleBuffer) {
+        if !is_complete(sample) {
+            return; // idle frame: nothing changed
+        }
+        let started = Instant::now();
+        let Some(pixels) = (unsafe { sample.image_buffer() }) else {
+            return;
+        };
+        if CVPixelBufferGetPixelFormatType(&pixels) != kCVPixelFormatType_32BGRA {
+            return;
+        }
+        if unsafe { CVPixelBufferLockBaseAddress(&pixels, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+            return;
+        }
+        let (width, height) = (
+            even(CVPixelBufferGetWidth(&pixels) as u32),
+            even(CVPixelBufferGetHeight(&pixels) as u32),
+        );
+        let stride = CVPixelBufferGetBytesPerRow(&pixels);
+        let base = CVPixelBufferGetBaseAddress(&pixels) as *const u8;
+        let row_len = width as usize * 4;
+        let mut data = Vec::with_capacity(row_len * height as usize);
+        if !base.is_null() {
+            for y in 0..height as usize {
+                // SAFETY: the buffer is locked and holds at least `height` rows
+                // of `stride` bytes, each with `width` BGRA pixels.
+                let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), row_len) };
+                data.extend_from_slice(row);
+            }
+        }
+        unsafe { CVPixelBufferUnlockBaseAddress(&pixels, CVPixelBufferLockFlags::ReadOnly) };
+        if data.is_empty() {
+            return;
+        }
+
+        let mut latest = self.latest.lock().expect("lock");
+        latest.frame = Some(Frame {
+            width,
+            height,
+            data,
+        });
+        latest.copy_time = started.elapsed();
+        latest.seq += 1;
+        self.ready.notify_all();
+    }
+}
+
+/// Whether ScreenCaptureKit marked the sample as a new, complete frame.
+fn is_complete(sample: &CMSampleBuffer) -> bool {
+    let Some(attachments) = (unsafe { sample.sample_attachments_array(false) }) else {
+        return true;
+    };
+    // CFArray of CFDictionary, toll-free bridged to NSArray of NSDictionary.
+    let attachments: &CFArray = &attachments;
+    let attachments = unsafe {
+        &*(attachments as *const CFArray).cast::<NSArray<NSDictionary<NSString, AnyObject>>>()
+    };
+    let Some(info) = attachments.firstObject() else {
+        return true;
+    };
+    let Some(status) = info.objectForKey(unsafe { SCStreamFrameInfoStatus }) else {
+        return true;
+    };
+    match status.downcast::<NSNumber>() {
+        Ok(number) => number.integerValue() == SCFrameStatus::Complete.0,
+        Err(_) => true,
+    }
+}
+
+struct OutputIvars {
+    shared: Arc<Shared>,
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements; the class adds no
+    // Drop-sensitive state beyond its ivars.
+    #[unsafe(super(NSObject))]
+    #[name = "HextScreenStreamOutput"]
+    #[ivars = OutputIvars]
+    struct StreamOutput;
+
+    unsafe impl NSObjectProtocol for StreamOutput {}
+
+    unsafe impl SCStreamOutput for StreamOutput {
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        fn did_output(
+            &self,
+            _stream: &SCStream,
+            sample: &CMSampleBuffer,
+            kind: SCStreamOutputType,
+        ) {
+            if kind == SCStreamOutputType::Screen {
+                self.ivars().shared.store(sample);
+            }
+        }
+    }
+);
+
+impl StreamOutput {
+    fn new(shared: Arc<Shared>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(OutputIvars { shared });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+pub struct ScreenCaptureKitCapturer {
+    stream: Retained<SCStream>,
+    _output: Retained<StreamOutput>,
+    shared: Arc<Shared>,
+    frame: Option<Frame>,
+    rect: Rect,
+    copy_time: Duration,
+    seen: u64,
+}
+
+/// Fails, after asking macOS to show its permission prompt, if this process
+/// may not record the screen.
+pub fn preflight() -> Result<(), CaptureError> {
+    if CGPreflightScreenCaptureAccess() {
+        return Ok(());
+    }
+    // Shows the system prompt / adds the app to the settings list.
+    CGRequestScreenCaptureAccess();
+    Err(CaptureError::PermissionDenied(
+        "libere \"Gravação de Tela\" para o Terminal (ou o app que abriu o Hext Remote) \
+         em Ajustes do Sistema → Privacidade e Segurança, depois reabra o Terminal"
+            .into(),
+    ))
+}
+
+impl ScreenCaptureKitCapturer {
+    pub fn new(index: usize) -> Result<Self, CaptureError> {
+        preflight()?;
+
+        let content = shareable_content()?;
+        let displays = unsafe { content.displays() };
+        if index >= displays.count() {
+            return Err(CaptureError::NoSuchDisplay(index));
+        }
+        let display = displays.objectAtIndex(index);
+
+        let bounds = unsafe { display.frame() };
+        let rect = Rect {
+            x: bounds.origin.x.round() as i32,
+            y: bounds.origin.y.round() as i32,
+            width: bounds.size.width.round() as u32,
+            height: bounds.size.height.round() as u32,
+        };
+        // Size in points, scaled down further if very wide.
+        let (mut width, mut height) =
+            (
+                unsafe { display.width() } as u32,
+                unsafe { display.height() } as u32,
+            );
+        if width > MAX_WIDTH {
+            height = height * MAX_WIDTH / width;
+            width = MAX_WIDTH;
+        }
+        let (width, height) = (even(width.max(2)), even(height.max(2)));
+
+        let shared = Arc::new(Shared::default());
+        let output = StreamOutput::new(shared.clone());
+        let stream = unsafe {
+            let filter = SCContentFilter::initWithDisplay_excludingWindows(
+                SCContentFilter::alloc(),
+                &display,
+                &NSArray::new(),
+            );
+            let config = SCStreamConfiguration::new();
+            config.setWidth(width as usize);
+            config.setHeight(height as usize);
+            config.setPixelFormat(kCVPixelFormatType_32BGRA);
+            config.setShowsCursor(false);
+            config.setQueueDepth(3);
+            config.setMinimumFrameInterval(CMTime::new(1, 60));
+            let stream = SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                &filter,
+                &config,
+                None,
+            );
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(
+                    ProtocolObject::from_ref(&*output),
+                    SCStreamOutputType::Screen,
+                    None,
+                )
+                .map_err(|e| platform("addStreamOutput", &e))?;
+            stream
+        };
+        start(&stream)?;
+        tracing::info!(
+            "capturando o monitor {index}: {}x{} pontos, imagem {width}x{height}",
+            rect.width,
+            rect.height
+        );
+
+        Ok(Self {
+            stream,
+            _output: output,
+            shared,
+            frame: None,
+            rect,
+            copy_time: Duration::ZERO,
+            seen: 0,
+        })
+    }
+}
+
+impl Capturer for ScreenCaptureKitCapturer {
+    fn next_frame(&mut self, timeout: Duration) -> Result<bool, CaptureError> {
+        let latest = self.shared.latest.lock().expect("lock");
+        let (mut latest, _) = self
+            .shared
+            .ready
+            .wait_timeout_while(latest, timeout, |l| l.seq == self.seen)
+            .expect("lock");
+        if latest.seq == self.seen {
+            return Ok(false);
+        }
+        self.seen = latest.seq;
+        self.copy_time = latest.copy_time;
+        self.frame = latest.frame.take();
+        Ok(self.frame.is_some())
+    }
+
+    fn frame(&self) -> Option<&Frame> {
+        self.frame.as_ref()
+    }
+
+    fn rect(&self) -> Rect {
+        self.rect
+    }
+
+    fn copy_time(&self) -> Duration {
+        self.copy_time
+    }
+}
+
+impl Drop for ScreenCaptureKitCapturer {
+    fn drop(&mut self) {
+        unsafe { self.stream.stopCaptureWithCompletionHandler(None) };
+    }
+}
+
+/// Asks ScreenCaptureKit for the displays, waiting for its answer.
+fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            let result = match unsafe { Retained::retain(content) } {
+                Some(content) => Ok(content),
+                None => Err(match unsafe { error.as_ref() } {
+                    Some(error) => platform("SCShareableContent", error),
+                    None => CaptureError::Platform("SCShareableContent: sem resposta".into()),
+                }),
+            };
+            let _ = tx.send(result);
+        },
+    );
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+    rx.recv_timeout(REQUEST_TIMEOUT)
+        .map_err(|_| CaptureError::Platform("SCShareableContent: tempo esgotado".into()))?
+}
+
+/// Starts the stream, waiting for ScreenCaptureKit to confirm.
+fn start(stream: &SCStream) -> Result<(), CaptureError> {
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(move |error: *mut NSError| {
+        let result = match unsafe { error.as_ref() } {
+            Some(error) => Err(platform("startCapture", error)),
+            None => Ok(()),
+        };
+        let _ = tx.send(result);
+    });
+    unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
+    rx.recv_timeout(REQUEST_TIMEOUT)
+        .map_err(|_| CaptureError::Platform("startCapture: tempo esgotado".into()))?
+}
