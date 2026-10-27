@@ -16,7 +16,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
+    DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
@@ -95,8 +98,17 @@ impl DxgiCapturer {
             width: (r.right - r.left) as u32,
             height: (r.bottom - r.top) as u32,
         };
-        self.duplication =
-            Some(unsafe { self.output.DuplicateOutput(&self.device) }.map_err(platform)?);
+        let duplication = unsafe { self.output.DuplicateOutput(&self.device) }.map_err(platform)?;
+        let rotation = unsafe { duplication.GetDesc() }.Rotation;
+        if !matches!(
+            rotation,
+            DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED
+        ) {
+            // TODO: rotate the image; until then the view is sideways and the
+            // mouse mapping is off on portrait monitors.
+            tracing::warn!("monitor girado ({rotation:?}): ainda não suportado");
+        }
+        self.duplication = Some(duplication);
         Ok(())
     }
 

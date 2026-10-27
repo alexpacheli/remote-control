@@ -6,7 +6,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{CodecError, decode, encode};
+use crate::{CodecError, decode};
 
 /// Size of the length prefix.
 pub const HEADER_LEN: usize = 4;
@@ -16,11 +16,12 @@ pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
 /// Encodes `msg` as a complete frame (header + payload) of at most `max` payload bytes.
 pub fn encode_frame<T: Serialize>(msg: &T, max: usize) -> Result<Vec<u8>, CodecError> {
-    let payload = encode(msg)?;
-    check_len(payload.len(), max)?;
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&payload);
+    // Serialize after a placeholder header, so large (video) payloads are
+    // written once instead of being copied behind the header.
+    let mut out = postcard::to_extend(msg, vec![0; HEADER_LEN])?;
+    let len = out.len() - HEADER_LEN;
+    check_len(len, max)?;
+    out[..HEADER_LEN].copy_from_slice(&(len as u32).to_le_bytes());
     Ok(out)
 }
 

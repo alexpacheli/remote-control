@@ -53,4 +53,21 @@ pub enum NetError {
     Unexpected(String),
 }
 
+impl NetError {
+    /// The peer ended the session on purpose (closed the connection or its
+    /// streams), as opposed to a failure.
+    pub fn is_peer_closed(&self) -> bool {
+        use quinn::{ConnectionError, ReadError, SendDatagramError, WriteError};
+        let closed = |e: &ConnectionError| matches!(e, ConnectionError::ApplicationClosed(_));
+        match self {
+            NetError::StreamClosed => true,
+            NetError::Connection(e) => closed(e),
+            NetError::Read(ReadError::ConnectionLost(e)) => closed(e),
+            NetError::Write(WriteError::ConnectionLost(e)) => closed(e),
+            NetError::Datagram(SendDatagramError::ConnectionLost(e)) => closed(e),
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T, E = NetError> = std::result::Result<T, E>;

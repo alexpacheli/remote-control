@@ -81,3 +81,52 @@ async fn streams_and_decodes_video() {
     let client = server.await.unwrap().unwrap();
     assert_eq!(client.device_name, "client");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_ending_the_session_is_not_an_error() {
+    let identity = Identity::generate().unwrap();
+    let endpoint =
+        hext_net::host_endpoint(SocketAddr::from(([127, 0, 0, 1], 0)), &identity).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let config = Arc::new(HostConfig {
+        peer: PeerInfo::local("test", "host"),
+        access_code: CODE.into(),
+        display: 0,
+        test_pattern: true,
+        encoder: EncoderSettings::default(),
+    });
+    let host_side = tokio::spawn(async move {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let session = tokio::spawn(host::serve(conn.clone(), config));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // What the host does on Ctrl+C.
+        conn.close(0u32.into(), b"host encerrado");
+        let _ = session.await;
+    });
+
+    let endpoint = hext_net::client_endpoint(addr).unwrap();
+    let conn = hext_net::connect(&endpoint, addr, Some(identity.fingerprint()))
+        .await
+        .unwrap();
+    let session = client::start(
+        conn,
+        Hello {
+            peer: PeerInfo::local("test", "client"),
+            access_code: CODE.into(),
+        },
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !session.is_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    session.close().await.unwrap();
+    host_side.await.unwrap();
+}

@@ -34,11 +34,6 @@ impl ClientHandle {
         let _ = self.input.send(event);
     }
 
-    /// A cloneable sender for input events.
-    pub fn input_sender(&self) -> mpsc::UnboundedSender<InputEvent> {
-        self.input.clone()
-    }
-
     /// Current round-trip time estimate of the connection.
     pub fn rtt(&self) -> Duration {
         self.conn.rtt()
@@ -110,39 +105,46 @@ async fn run(
     stats: Arc<Mutex<Stats>>,
     on_frame: impl FnMut(DecodedFrame) + Send + 'static,
 ) -> Result<()> {
-    // Decoding is CPU-bound, so it gets its own thread.
-    let (frames_tx, frames_rx) = std::sync::mpsc::channel::<VideoFrame>();
+    // Decoding is CPU-bound, so it gets its own thread. The short queue makes
+    // a slow decoder stop the reads, and QUIC flow control then slows the
+    // host down, instead of a backlog (and delay) building up here.
+    let (frames_tx, mut frames_rx) = mpsc::channel::<VideoFrame>(2);
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<()>();
     let decoder = std::thread::Builder::new()
         .name("hext-decode".into())
-        .spawn(move || decode_loop(&frames_rx, &keyframe_tx, &stats, on_frame))
+        .spawn(move || decode_loop(&mut frames_rx, &keyframe_tx, &stats, on_frame))
         .map_err(|e| SessionError::Protocol(format!("decoder thread: {e}")))?;
+    let mut receiver = tokio::spawn(async move {
+        loop {
+            let frame: VideoFrame = video.recv().await?;
+            if frames_tx.send(frame).await.is_err() {
+                return Ok(()); // decoder gone: the session is ending
+            }
+        }
+    });
 
     let mut say_bye = false;
     let result = loop {
         tokio::select! {
-            frame = video.recv::<VideoFrame>() => match frame {
-                Ok(frame) => {
-                    if frames_tx.send(frame).is_err() {
-                        break Err(SessionError::Protocol("decoder stopped".into()));
-                    }
-                }
-                Err(e) => break Err(e.into()),
+            done = &mut receiver => break match done {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => peer_closed_is_ok(e),
+                Err(e) => Err(SessionError::Protocol(format!("video: {e}"))),
             },
             Some(event) = input_rx.recv() => {
                 if let Err(e) = send_input(&mut input_stream, &mut input_rx, event).await {
-                    break Err(e.into());
+                    break peer_closed_is_ok(e);
                 }
             }
             Some(()) = keyframe_rx.recv() => {
                 if let Err(e) = control.send(&Control::RequestKeyframe).await {
-                    break Err(e.into());
+                    break peer_closed_is_ok(e);
                 }
             }
             msg = control.recv() => match msg {
                 Ok(Control::Bye) => break Ok(()),
                 Ok(other) => debug!("mensagem inesperada: {other:?}"),
-                Err(e) => break Err(e.into()),
+                Err(e) => break peer_closed_is_ok(e),
             },
             _ = &mut shutdown => {
                 say_bye = true;
@@ -155,9 +157,19 @@ async fn run(
         let _ = control.bye(&conn).await;
     }
     conn.close(0u32.into(), b"fim");
-    drop(frames_tx);
+    // Stopping the receiver drops the queue's sender, which ends the decoder.
+    receiver.abort();
     let _ = tokio::task::spawn_blocking(move || decoder.join()).await;
     result
+}
+
+/// The host leaving is a normal end of session, not an error.
+fn peer_closed_is_ok(e: hext_net::NetError) -> Result<()> {
+    if e.is_peer_closed() {
+        Ok(())
+    } else {
+        Err(e.into())
+    }
 }
 
 /// Sends `first` plus whatever else is queued, keeping only the latest of
@@ -183,7 +195,7 @@ async fn send_input(
 }
 
 fn decode_loop(
-    frames: &std::sync::mpsc::Receiver<VideoFrame>,
+    frames: &mut mpsc::Receiver<VideoFrame>,
     keyframe: &mpsc::UnboundedSender<()>,
     stats: &Mutex<Stats>,
     mut on_frame: impl FnMut(DecodedFrame),
@@ -197,7 +209,7 @@ fn decode_loop(
     };
     // After an error, ignore frames until a keyframe resynchronizes the stream.
     let mut waiting_for_keyframe = false;
-    while let Ok(frame) = frames.recv() {
+    while let Some(frame) = frames.blocking_recv() {
         if waiting_for_keyframe && !frame.keyframe {
             continue;
         }

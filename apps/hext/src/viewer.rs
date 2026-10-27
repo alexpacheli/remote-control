@@ -86,7 +86,6 @@ pub fn run(args: ViewArgs) -> Result<()> {
             CmdKey::Win => CommandKey::Win,
         },
         last_title: Instant::now(),
-        scroll_rest: (0.0, 0.0),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -100,8 +99,6 @@ struct Viewer {
     renderer: Option<Renderer>,
     command_key: CommandKey,
     last_title: Instant,
-    /// Sub-notch trackpad scroll not yet sent.
-    scroll_rest: (f64, f64),
 }
 
 impl Viewer {
@@ -111,13 +108,20 @@ impl Viewer {
         }
     }
 
-    fn draw_latest(&mut self) {
+    /// Uploads the newest decoded frame, if any, and redraws.
+    ///
+    /// With `only_if_new`, does nothing when no new frame arrived: several
+    /// frame events can find a single frame, and presenting the same picture
+    /// again could block on vsync and back up the event queue.
+    fn draw(&mut self, only_if_new: bool) {
         let frame = self.latest.lock().expect("lock").take();
         let Some(renderer) = &mut self.renderer else {
             return;
         };
-        if let Some(frame) = frame {
-            renderer.upload(&frame);
+        match frame {
+            Some(frame) => renderer.upload(&frame),
+            None if only_if_new => return,
+            None => {}
         }
         if let Err(e) = renderer.render() {
             warn!("render: {e}");
@@ -180,7 +184,7 @@ impl ApplicationHandler<UserEvent> for Viewer {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             // Draw right away instead of waiting for a redraw request: lower latency.
-            UserEvent::Frame => self.draw_latest(),
+            UserEvent::Frame => self.draw(true),
             UserEvent::SessionEnded => {
                 info!("sessão encerrada pelo host");
                 event_loop.exit();
@@ -195,9 +199,9 @@ impl ApplicationHandler<UserEvent> for Viewer {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
-                self.draw_latest();
+                self.draw(false);
             }
-            WindowEvent::RedrawRequested => self.draw_latest(),
+            WindowEvent::RedrawRequested => self.draw(false),
             WindowEvent::Focused(false) => self.send(InputEvent::ReleaseAll),
             WindowEvent::CursorMoved { position, .. } => {
                 let rect = self.renderer.as_ref().and_then(Renderer::video_rect);
@@ -220,16 +224,16 @@ impl ApplicationHandler<UserEvent> for Viewer {
                 });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
+                let (x, y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    MouseScrollDelta::PixelDelta(p) => {
-                        self.scroll_rest.0 += p.x / PIXELS_PER_NOTCH;
-                        self.scroll_rest.1 += p.y / PIXELS_PER_NOTCH;
-                        let delta = (self.scroll_rest.0 as f32, self.scroll_rest.1 as f32);
-                        self.scroll_rest = (0.0, 0.0);
-                        delta
-                    }
+                    MouseScrollDelta::PixelDelta(p) => (
+                        (p.x / PIXELS_PER_NOTCH) as f32,
+                        (p.y / PIXELS_PER_NOTCH) as f32,
+                    ),
                 };
+                // winit: positive x moves the content right, i.e. scrolls left.
+                // The protocol (like Windows) uses positive dx = scroll right.
+                let (dx, dy) = (-x, y);
                 if dx != 0.0 || dy != 0.0 {
                     self.send(InputEvent::Wheel { dx, dy });
                 }

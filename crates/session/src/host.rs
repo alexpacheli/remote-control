@@ -80,13 +80,13 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
     }
 
     let mut video = hext_net::open_uni(&conn, StreamKind::Video).await?;
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(frame) = frames_rx.recv().await {
             video.send(&frame).await?;
         }
         Ok::<_, NetError>(())
     });
-    let input = tokio::spawn(receive_input(conn.clone(), shared.clone()));
+    let mut input = tokio::spawn(receive_input(conn.clone(), shared.clone()));
 
     let result = loop {
         tokio::select! {
@@ -102,14 +102,20 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
                 Err(_) => break Ok(()),
             },
             _ = conn.closed() => break Ok(()),
+            // Without video or input the session is useless: end it.
+            done = &mut writer => break task_end("vídeo", done.map(|r| r.map_err(SessionError::from))),
+            done = &mut input => break task_end("input", done),
         }
     };
 
     shared.stop.store(true, Ordering::Relaxed);
     writer.abort();
-    // Dropping the input task releases any keys still held.
-    input.abort();
-    let _ = input.await;
+    // Dropping the input task releases any keys still held. (A finished task
+    // was already awaited by the loop and must not be polled again.)
+    if !input.is_finished() {
+        input.abort();
+        let _ = (&mut input).await;
+    }
     conn.close(0u32.into(), b"session ended");
     let _ = tokio::task::spawn_blocking(move || capture.join()).await;
     info!("desconectado: {}", client.device_name);
@@ -150,7 +156,14 @@ fn capture_loop(
 
         // The frame-rate cap counts from the start of each frame's work.
         let tick = Instant::now();
-        let changed = match capturer.next_frame(Duration::from_millis(100)) {
+        // Owed work (a skipped image, a keyframe) must not wait for a change.
+        let owed = skipped || shared.keyframe.load(Ordering::Relaxed);
+        let timeout = if owed {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(100)
+        };
+        let changed = match capturer.next_frame(timeout) {
             Ok(changed) => changed,
             Err(e) => {
                 warn!("captura: {e}");
@@ -210,6 +223,20 @@ fn capture_loop(
         if frames.blocking_send(msg).is_err() {
             break;
         }
+    }
+}
+
+/// How a video or input task ending affects the session: a peer that left
+/// is a normal end, anything else is an error.
+fn task_end(
+    what: &str,
+    done: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match done {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(SessionError::Net(e))) if e.is_peer_closed() => Ok(()),
+        Ok(Err(e)) => Err(SessionError::Protocol(format!("{what}: {e}"))),
+        Err(e) => Err(SessionError::Protocol(format!("{what}: {e}"))),
     }
 }
 
