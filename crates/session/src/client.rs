@@ -226,6 +226,7 @@ fn decode_loop(
                         Duration::from_micros(frame.capture_micros.into()),
                         Duration::from_micros(frame.encode_micros.into()),
                         started.elapsed(),
+                        frame.hardware,
                     );
                 }
                 on_frame(DecodedFrame {

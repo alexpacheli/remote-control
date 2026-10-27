@@ -12,6 +12,7 @@ pub struct Stats {
     decode: Rolling,
     /// Last completed one-second window.
     last: Option<Snapshot>,
+    hardware: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -24,6 +25,8 @@ pub struct Snapshot {
     pub capture_ms: f64,
     pub encode_ms: f64,
     pub decode_ms: f64,
+    /// The host encodes on the GPU.
+    pub hardware: bool,
 }
 
 impl Default for Stats {
@@ -36,6 +39,7 @@ impl Default for Stats {
             encode: Rolling::new(120),
             decode: Rolling::new(120),
             last: None,
+            hardware: false,
             width: 0,
             height: 0,
         }
@@ -43,8 +47,16 @@ impl Default for Stats {
 }
 
 impl Stats {
-    pub fn record(&mut self, bytes: usize, capture: Duration, encode: Duration, decode: Duration) {
+    pub fn record(
+        &mut self,
+        bytes: usize,
+        capture: Duration,
+        encode: Duration,
+        decode: Duration,
+        hardware: bool,
+    ) {
         self.roll_window();
+        self.hardware = hardware;
         self.frames += 1;
         self.bytes += bytes as u64;
         self.capture.push(capture);
@@ -71,6 +83,7 @@ impl Stats {
             capture_ms: avg_ms(&self.capture),
             encode_ms: avg_ms(&self.encode),
             decode_ms: avg_ms(&self.decode),
+            hardware: self.hardware,
         });
         self.window_start = Instant::now();
         self.frames = 0;
@@ -82,8 +95,13 @@ impl std::fmt::Display for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:.0} fps | {:.1} Mbps | captura {:.1} ms | encode {:.1} ms | decode {:.1} ms",
-            self.fps, self.mbps, self.capture_ms, self.encode_ms, self.decode_ms
+            "{:.0} fps | {:.1} Mbps | captura {:.1} ms | encode {:.1} ms ({}) | decode {:.1} ms",
+            self.fps,
+            self.mbps,
+            self.capture_ms,
+            self.encode_ms,
+            if self.hardware { "GPU" } else { "CPU" },
+            self.decode_ms
         )
     }
 }

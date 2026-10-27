@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use hext_codec::EncoderSettings;
+use hext_codec::{EncoderPreference, EncoderSettings};
 use hext_net::{Identity, NetError};
 use hext_proto::{PeerInfo, RejectReason};
 use hext_session::SessionError;
@@ -12,7 +12,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::{APP_VERSION, HostArgs, device_name, exe_name};
+use crate::{APP_VERSION, EncoderChoice, HostArgs, device_name, exe_name};
 
 /// Delay after a wrong access code, so guessing is limited to one try per second.
 const WRONG_CODE_PENALTY: Duration = Duration::from_secs(1);
@@ -52,6 +52,11 @@ pub async fn run(args: HostArgs) -> Result<()> {
         encoder: EncoderSettings {
             bitrate_bps: args.bitrate_mbps * 1_000_000,
             max_fps: args.fps as f32,
+            preference: match args.encoder {
+                EncoderChoice::Auto => EncoderPreference::Auto,
+                EncoderChoice::Software => EncoderPreference::Software,
+                EncoderChoice::Hardware => EncoderPreference::Hardware,
+            },
         },
     });
     // One session at a time, handshake included: attempts are serialized,

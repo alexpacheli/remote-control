@@ -69,9 +69,12 @@ Os binários ainda não são assinados (isso entra na F6):
 - **Fora de casa:** sem servidor (F3), os dois precisam estar na mesma rede, ou use o [Tailscale](https://tailscale.com) nos dois e o IP `100.x.y.z` dele.
 - **Outros monitores:** `host --display 1` compartilha o segundo monitor.
 - **Ajustes:** `host --bitrate-mbps 15 --fps 60`.
+- **Codificador:** por padrão usa a placa de vídeo (NVIDIA, AMD ou Intel, via Media Foundation) e volta
+  para o processador se ela não existir ou falhar. O título da janela mostra `(GPU)` ou `(CPU)` ao lado
+  do tempo de encode. Para forçar: `host --encoder software` ou `host --encoder hardware`.
 
 ### Limitações da F1
 
 - O host real é só Windows; em macOS e Linux o host transmite uma imagem de teste (`--test-pattern`).
-- Codificação em software (OpenH264). A codificação por hardware da placa de vídeo é o próximo passo.
+- Codificação por hardware ainda copia a imagem pela memória do sistema; o caminho direto na GPU (zero-copy) vem depois.
 - Janelas abertas como administrador, a tela de UAC e a tela de bloqueio não recebem controle (precisam do serviço, na F4).

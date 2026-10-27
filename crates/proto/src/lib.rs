@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub mod frame;
 
 /// Bumped on any incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// TLS ALPN identifier. It carries no version: versions are compared through
 /// the preamble, so mismatched peers still connect and can report why they fail.
@@ -173,6 +173,8 @@ pub struct VideoFrame {
     pub capture_micros: u32,
     /// Time spent encoding this frame on the host.
     pub encode_micros: u32,
+    /// Encoded by the GPU (shown in the viewer's stats).
+    pub hardware: bool,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
@@ -271,6 +273,7 @@ mod tests {
             keyframe: true,
             capture_micros: 1200,
             encode_micros: 4800,
+            hardware: true,
             data: vec![0, 0, 0, 1, 0x67, 0xff],
         };
         assert_eq!(

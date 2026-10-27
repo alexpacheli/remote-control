@@ -55,6 +55,19 @@ struct HostArgs {
     /// Limite de quadros por segundo.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
+    /// Codificador de vídeo.
+    #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
+    encoder: EncoderChoice,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum EncoderChoice {
+    /// Placa de vídeo se houver; senão, ou se ela falhar, o processador.
+    Auto,
+    /// Sempre o processador (OpenH264).
+    Software,
+    /// Só a placa de vídeo; falha se não houver.
+    Hardware,
 }
 
 #[derive(clap::Args)]

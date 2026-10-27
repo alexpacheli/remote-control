@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hext_codec::{EncoderSettings, H264Encoder};
+use hext_codec::EncoderSettings;
 use hext_input::Area;
 use hext_net::{Connection, NetError};
 use hext_proto::{Control, Hello, InputEvent, PeerInfo, RejectReason, StreamKind, VideoFrame};
@@ -76,7 +76,7 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         .map_err(|_| SessionError::Protocol("capture thread died".into()))?;
     if let Err(e) = started {
         conn.close(1u32.into(), b"capture unavailable");
-        return Err(e.into());
+        return Err(e);
     }
 
     let mut video = hext_net::open_uni(&conn, StreamKind::Video).await?;
@@ -126,19 +126,23 @@ fn capture_loop(
     config: &HostConfig,
     shared: &Shared,
     frames: &mpsc::Sender<VideoFrame>,
-    started: oneshot::Sender<std::result::Result<(), hext_capture::CaptureError>>,
+    started: oneshot::Sender<Result<()>>,
 ) {
-    let mut capturer = match hext_capture::open(config.display, config.test_pattern) {
-        Ok(capturer) => {
+    let opened = hext_capture::open(config.display, config.test_pattern)
+        .map_err(SessionError::from)
+        .and_then(|capturer| Ok((capturer, hext_codec::open_encoder(config.encoder)?)));
+    let (mut capturer, mut encoder) = match opened {
+        Ok(opened) => {
             let _ = started.send(Ok(()));
-            capturer
+            opened
         }
         Err(e) => {
             let _ = started.send(Err(e));
             return;
         }
     };
-    let mut encoder = H264Encoder::new(config.encoder);
+    info!("codificador: {}", encoder.name());
+    let mut hardware = encoder.is_hardware();
     let min_interval = Duration::from_secs_f32(1.0 / config.encoder.max_fps.max(1.0));
     let mut last_encode: Option<Instant> = None;
     let mut seq = 0u64;
@@ -208,6 +212,10 @@ fn capture_loop(
         let encode_time = started.elapsed();
         last_encode = Some(tick);
         skipped = false;
+        if hardware != encoder.is_hardware() {
+            hardware = encoder.is_hardware();
+            warn!("codificador agora: {}", encoder.name());
+        }
 
         let msg = VideoFrame {
             seq,
@@ -216,6 +224,7 @@ fn capture_loop(
             keyframe: encoded.keyframe,
             capture_micros: micros(capturer.copy_time()),
             encode_micros: micros(encode_time),
+            hardware,
             data: encoded.data,
         };
         seq += 1;
