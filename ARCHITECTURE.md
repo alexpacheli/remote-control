@@ -359,7 +359,7 @@ docs/
 
 | Fase | Entrega | Pronto quando |
 |---|---|---|
-| **F0 — Fundação** | Workspace, CI nos 3 SOs, esqueleto do protocolo, overlay de métricas | CI verde gerando binários de Windows e macOS |
+| **F0 — Fundação** ✅ | Workspace, CI nos 3 SOs, esqueleto do protocolo (handshake QUIC, pinagem por impressão digital, ping por datagrama) e estatísticas de latência. O app é uma linha de comando; a UI Tauri e o overlay visual entram com o visualizador na F1. | CI verde gerando binários de Windows e macOS |
 | **F1 — MVP LAN Windows** | Captura DXGI → MF H.264 → QUIC por IP direto → decode → render. Mouse, teclado e cursor local. | Controlar um PC Windows na LAN com **< 30 ms** e fluidez visível |
 | **F2 — macOS** | Host e cliente macOS (ScreenCaptureKit, VideoToolbox, CGEvent, TCC) | Windows ↔ macOS nos dois sentidos, na LAN |
 | **F3 — Internet** | VPS, ID numérico, sinalização, STUN, hole punching, relay UDP + TCP/443, pedido de aceite, ponta a ponta | Conectar pela internet só com o ID, inclusive atrás de NAT/firewall |

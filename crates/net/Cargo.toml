@@ -1,0 +1,21 @@
+[package]
+name = "hext-net"
+description = "Hext Remote transport: QUIC endpoints, certificate pinning and handshake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+hext-proto.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
