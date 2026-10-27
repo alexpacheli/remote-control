@@ -50,7 +50,9 @@ use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 
 use crate::h264::{self, PROFILE_BASELINE};
 use crate::nv12::bgra_to_nv12;
-use crate::{CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge};
+use crate::{
+    CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge, profile_error,
+};
 
 /// Longest wait for the encoder to ask for input or deliver output.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -68,12 +70,6 @@ const GOP_FRAMES: u32 = 60 * 60;
 
 fn hw(context: &str, e: windows::core::Error) -> CodecError {
     CodecError::Hardware(format!("{context}: {e}"))
-}
-
-fn profile_error(profile: u8) -> CodecError {
-    CodecError::Hardware(format!(
-        "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({PROFILE_BASELINE})"
-    ))
 }
 
 pub struct MfEncoder {

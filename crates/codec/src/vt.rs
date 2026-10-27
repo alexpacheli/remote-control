@@ -44,42 +44,39 @@ use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
-    kVTCompressionPropertyKey_MaxFrameDelayCount, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
-    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Baseline_AutoLevel,
-    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
+    kVTCompressionPropertyKey_MaxFrameDelayCount,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
+    kVTCompressionPropertyKey_YCbCrMatrix, kVTEncodeFrameOptionKey_ForceKeyFrame,
+    kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
 use crate::h264::{self, PROFILE_BASELINE};
-use crate::{CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge};
+use crate::{
+    CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge, profile_error,
+};
 
-/// A keyframe at least every minute, so a lost one can never stall the
-/// picture for long even if the viewer's request goes missing.
-const GOP_FRAMES: i32 = 60 * 60;
+/// A keyframe at least every minute (frames are only encoded when the screen
+/// changes, so this is a duration, not a frame count), so a lost one can
+/// never stall the picture for long even if the viewer's request goes missing.
+const KEYFRAME_INTERVAL_SECS: f64 = 60.0;
 
 /// Presentation timestamps are in microseconds.
 const TIMESCALE: i32 = 1_000_000;
 
 /// Size of the session opened at startup to find out whether there is a
-/// hardware encoder at all.
+/// hardware encoder at all (kept for the first frame if the size matches).
 const PROBE_SIZE: (u32, u32) = (640, 480);
 
 fn status_error(context: &str, status: i32) -> CodecError {
     CodecError::Hardware(format!("{context}: OSStatus {status}"))
 }
 
-fn profile_error(profile: u8) -> CodecError {
-    CodecError::Hardware(format!(
-        "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({PROFILE_BASELINE})"
-    ))
-}
-
 pub struct VtEncoder {
     settings: EncoderSettings,
-    /// Whether the media engine accepted low-latency rate control.
+    /// Whether the last session opened got low-latency rate control.
     low_latency: bool,
     /// Recreated whenever the input size changes.
     session: Option<Session>,
@@ -108,18 +105,11 @@ impl VtEncoder {
         // Fails right away (so `Auto` picks software) if there is no
         // hardware encoder or it refuses the settings.
         let (width, height) = PROBE_SIZE;
-        let low_latency = match Session::open(&settings, width, height, true) {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::debug!("VideoToolbox sem baixa latência: {e}");
-                Session::open(&settings, width, height, false)?;
-                false
-            }
-        };
+        let (session, low_latency) = Session::open_best(&settings, width, height)?;
         let encoder = Self {
             settings,
             low_latency,
-            session: None,
+            session: Some(session),
             force_keyframe: false,
         };
         tracing::info!("codificador por hardware: {}", encoder.description());
@@ -147,20 +137,22 @@ impl VideoEncoder for VtEncoder {
             self.session = None;
             // A new session starts with a keyframe anyway.
             self.force_keyframe = false;
-            self.session = Some(Session::open(
-                &self.settings,
-                width,
-                height,
-                self.low_latency,
-            )?);
+            let (session, low_latency) = Session::open_best(&self.settings, width, height)?;
+            self.session = Some(session);
+            self.low_latency = low_latency;
         }
 
         let keyframe = std::mem::take(&mut self.force_keyframe);
         let session = self.session.as_mut().expect("session opened above");
         let result = session.encode(bgra, keyframe);
-        if result.is_err() {
+        match &result {
             // Start over (with a keyframe) if the caller keeps using us.
-            self.session = None;
+            Err(_) => self.session = None,
+            // Rate control dropped the frame: the keyframe is still owed.
+            Ok(encoded) if keyframe && !encoded.as_ref().is_some_and(|e| e.keyframe) => {
+                self.force_keyframe = true;
+            }
+            Ok(_) => {}
         }
         result
     }
@@ -179,6 +171,23 @@ impl VideoEncoder for VtEncoder {
 }
 
 impl Session {
+    /// Opens a session with low-latency rate control, or without it if the
+    /// media engine refuses (some Macs, or sizes beyond its limits).
+    /// Returns whether low latency is on.
+    fn open_best(
+        settings: &EncoderSettings,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, bool), CodecError> {
+        match Self::open(settings, width, height, true) {
+            Ok(session) => Ok((session, true)),
+            Err(e) => {
+                tracing::debug!("VideoToolbox sem baixa latência em {width}x{height}: {e}");
+                Ok((Self::open(settings, width, height, false)?, false))
+            }
+        }
+    }
+
     fn open(
         settings: &EncoderSettings,
         width: u32,
@@ -291,8 +300,8 @@ impl Session {
                 &CFNumber::new_i32(fps),
             );
             self.set(
-                kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                &CFNumber::new_i32(GOP_FRAMES),
+                kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                &CFNumber::new_f64(KEYFRAME_INTERVAL_SECS),
             );
             // Each frame's output before the next input.
             self.set(

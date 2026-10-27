@@ -210,6 +210,15 @@ impl VideoEncoder for AutoEncoder {
     }
 }
 
+/// Error for a hardware encoder whose output the viewer cannot decode.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn profile_error(profile: u8) -> CodecError {
+    CodecError::Hardware(format!(
+        "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({})",
+        h264::PROFILE_BASELINE
+    ))
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 /// Adds `next` to the outputs collected in `ready`. Several access units in
 /// one payload decode in order, so none is dropped, except that a keyframe
@@ -321,21 +330,33 @@ pub(crate) mod tests {
         let encoder = open_encoder(EncoderSettings::default()).unwrap();
         if !cfg!(any(windows, target_os = "macos")) {
             assert!(!encoder.is_hardware());
+        }
+        // Without a hardware encoder (or on a machine whose one failed to
+        // open), Auto must have fallen back to OpenH264.
+        if !encoder.is_hardware() {
             assert!(encoder.name().contains("OpenH264"));
         }
     }
 
     #[test]
     fn forced_hardware_fails_without_it() {
-        if !cfg!(any(windows, target_os = "macos")) {
-            let settings = EncoderSettings {
-                preference: EncoderPreference::Hardware,
-                ..Default::default()
-            };
-            assert!(matches!(
-                open_encoder(settings),
-                Err(CodecError::NoHardware)
-            ));
+        let settings = EncoderSettings {
+            preference: EncoderPreference::Hardware,
+            ..Default::default()
+        };
+        match open_encoder(settings) {
+            // Only where a hardware encoder can exist, and then it is one.
+            Ok(encoder) => assert!(
+                cfg!(any(windows, target_os = "macos")) && encoder.is_hardware(),
+                "{}",
+                encoder.name()
+            ),
+            Err(CodecError::NoHardware) => {}
+            // Platforms with hardware encoders may also report why it failed.
+            Err(e) => assert!(
+                cfg!(any(windows, target_os = "macos")) && matches!(e, CodecError::Hardware(_)),
+                "{e}"
+            ),
         }
     }
 }
