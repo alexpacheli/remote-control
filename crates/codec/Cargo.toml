@@ -1,0 +1,20 @@
+[package]
+name = "hext-codec"
+description = "Hext Remote H.264 encode/decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+openh264.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+# Required by the `#[implement]` macro for COM callbacks.
+windows-core.workspace = true
+
+[lints]
+workspace = true

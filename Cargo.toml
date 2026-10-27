@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+hext-proto = { path = "crates/proto" }
+hext-net = { path = "crates/net" }
+hext-metrics = { path = "crates/metrics" }
+hext-capture = { path = "crates/capture" }
+hext-codec = { path = "crates/codec" }
+hext-input = { path = "crates/input" }
+hext-render = { path = "crates/render" }
+hext-session = { path = "crates/session" }
+
+anyhow = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+gethostname = "1.1"
+hex = "0.4"
+# Software H.264 (Cisco OpenH264, built from source). Hardware encoders come later.
+openh264 = "0.9"
+pollster = "1.0"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Only the ring crypto backend: aws-lc would need cmake/nasm on Windows runners.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+block2 = "0.6"
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+wgpu = "30"
+winit = "0.30"
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
