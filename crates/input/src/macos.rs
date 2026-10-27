@@ -30,6 +30,12 @@ unsafe extern "C" {
 const MULTI_CLICK_TIME: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DISTANCE: f64 = 4.0;
 
+/// Scroll distance of one wheel notch, sent in pixels so trackpad scrolling
+/// stays smooth (about three lines, like Windows).
+const PIXELS_PER_NOTCH: f32 = 40.0;
+
+const CAPS_LOCK: u16 = 0x3A;
+
 pub struct CgEventInjector {
     keys_down: HashSet<u16>,
     buttons_down: HashSet<u32>,
@@ -37,6 +43,9 @@ pub struct CgEventInjector {
     /// Last press: button, when, where, and the click count it reached.
     last_press: Option<(u32, Instant, CGPoint, i64)>,
     click_count: i64,
+    /// Caps Lock is a toggle: its state lives here, not in `keys_down`.
+    caps_lock: bool,
+    /// Sub-pixel scroll not yet sent.
     wheel_rest: (f32, f32),
 }
 
@@ -59,13 +68,17 @@ pub fn preflight() -> bool {
 
 impl Default for CgEventInjector {
     fn default() -> Self {
-        preflight();
+        // The host already asked at startup; here only a reminder per session.
+        if !unsafe { AXIsProcessTrusted() } {
+            tracing::warn!("sem permissão de \"Acessibilidade\": o input remoto será ignorado");
+        }
         Self {
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
             position: CGPoint { x: 0.0, y: 0.0 },
             last_press: None,
             click_count: 1,
+            caps_lock: false,
             wheel_rest: (0.0, 0.0),
         }
     }
@@ -86,7 +99,11 @@ impl CgEventInjector {
     /// Modifier flags implied by the keys currently held, so shortcuts
     /// (Cmd+C, Shift+click) reach applications intact.
     fn flags(&self) -> CGEventFlags {
-        let mut flags = CGEventFlags::empty();
+        let mut flags = if self.caps_lock {
+            CGEventFlags::MaskAlphaShift
+        } else {
+            CGEventFlags::empty()
+        };
         for &sc in &self.keys_down {
             flags |= match sc {
                 0x2A | 0x36 => CGEventFlags::MaskShift,
@@ -100,7 +117,11 @@ impl CgEventInjector {
     }
 
     fn post(&self, event: Option<&CGEvent>) {
-        CGEvent::set_flags(event, self.flags());
+        // Keep the flags macOS set for the key itself (arrows, Home/End and
+        // friends carry NumericPad/SecondaryFn on a real keyboard).
+        let own =
+            CGEvent::flags(event) & (CGEventFlags::MaskNumericPad | CGEventFlags::MaskSecondaryFn);
+        CGEvent::set_flags(event, own | self.flags());
         CGEvent::post(CGEventTapLocation::HIDEventTap, event);
     }
 
@@ -160,7 +181,11 @@ impl CgEventInjector {
         let Some(keycode) = mac_keycode(scancode) else {
             return;
         };
-        if pressed {
+        if scancode == CAPS_LOCK {
+            if pressed {
+                self.caps_lock = !self.caps_lock;
+            }
+        } else if pressed {
             self.keys_down.insert(scancode);
         } else {
             self.keys_down.remove(&scancode);
@@ -191,9 +216,9 @@ impl Injector for CgEventInjector {
                 self.button(button_number(button), pressed);
             }
             InputEvent::Wheel { dx, dy } => {
-                // Whole lines only; the remainder carries over (trackpads).
-                self.wheel_rest.0 += dx;
-                self.wheel_rest.1 += dy;
+                // Whole pixels; the remainder carries over.
+                self.wheel_rest.0 += dx * PIXELS_PER_NOTCH;
+                self.wheel_rest.1 += dy * PIXELS_PER_NOTCH;
                 let (h, v) = (self.wheel_rest.0.trunc(), self.wheel_rest.1.trunc());
                 self.wheel_rest.0 -= h;
                 self.wheel_rest.1 -= v;
@@ -201,7 +226,7 @@ impl Injector for CgEventInjector {
                     // wheel1: positive scrolls up; wheel2: positive scrolls left.
                     let event = CGEvent::new_scroll_wheel_event2(
                         None,
-                        CGScrollEventUnit::Line,
+                        CGScrollEventUnit::Pixel,
                         2,
                         v as i32,
                         -(h as i32),

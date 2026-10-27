@@ -27,7 +27,8 @@ pub async fn run(args: HostArgs) -> Result<()> {
     if args.test_pattern {
         warn!("transmitindo a imagem de teste, não a tela (--test-pattern)");
     } else {
-        // Keep running either way: the permissions may be granted meanwhile.
+        // Keep running either way: Accessibility takes effect for the next
+        // session; Screen Recording (macOS) only after restarting the host.
         if let Err(e) = hext_capture::preflight() {
             warn!("{e}");
         }

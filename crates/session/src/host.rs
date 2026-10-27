@@ -128,9 +128,13 @@ fn capture_loop(
     frames: &mpsc::Sender<VideoFrame>,
     started: oneshot::Sender<Result<()>>,
 ) {
-    let opened = hext_capture::open(config.display, config.test_pattern)
-        .map_err(SessionError::from)
-        .and_then(|capturer| Ok((capturer, hext_codec::open_encoder(config.encoder)?)));
+    let opened = hext_capture::open(
+        config.display,
+        config.test_pattern,
+        config.encoder.max_fps.round() as u32,
+    )
+    .map_err(SessionError::from)
+    .and_then(|capturer| Ok((capturer, hext_codec::open_encoder(config.encoder)?)));
     let (mut capturer, mut encoder) = match opened {
         Ok(opened) => {
             let _ = started.send(Ok(()));

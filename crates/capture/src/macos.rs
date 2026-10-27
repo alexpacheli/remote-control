@@ -18,7 +18,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::CFArray;
-use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
+use objc2_core_graphics::{
+    CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
+};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
@@ -50,6 +52,8 @@ struct Latest {
     copy_time: Duration,
     /// Increases with every delivered frame.
     seq: u64,
+    /// A buffer the consumer is done with, reused for the next copy.
+    spare: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -81,7 +85,15 @@ impl Shared {
         let stride = CVPixelBufferGetBytesPerRow(&pixels);
         let base = CVPixelBufferGetBaseAddress(&pixels) as *const u8;
         let row_len = width as usize * 4;
-        let mut data = Vec::with_capacity(row_len * height as usize);
+        let mut data = self
+            .latest
+            .lock()
+            .expect("lock")
+            .spare
+            .take()
+            .unwrap_or_default();
+        data.clear();
+        data.reserve(row_len * height as usize);
         if !base.is_null() {
             for y in 0..height as usize {
                 // SAFETY: the buffer is locked and holds at least `height` rows
@@ -175,31 +187,46 @@ pub struct ScreenCaptureKitCapturer {
     seen: u64,
 }
 
+/// macOS only re-reads the permission when the process starts, so a grant
+/// made while the host runs needs a restart.
+fn permission_error() -> CaptureError {
+    CaptureError::PermissionDenied(
+        "libere \"Gravação de Tela\" para o Terminal (ou o app que abriu o Hext Remote) \
+         em Ajustes do Sistema → Privacidade e Segurança, feche o Terminal (Cmd+Q), \
+         abra de novo e reinicie o host"
+            .into(),
+    )
+}
+
 /// Fails, after asking macOS to show its permission prompt, if this process
-/// may not record the screen.
+/// may not record the screen. Meant to run once, at startup.
 pub fn preflight() -> Result<(), CaptureError> {
     if CGPreflightScreenCaptureAccess() {
         return Ok(());
     }
     // Shows the system prompt / adds the app to the settings list.
     CGRequestScreenCaptureAccess();
-    Err(CaptureError::PermissionDenied(
-        "libere \"Gravação de Tela\" para o Terminal (ou o app que abriu o Hext Remote) \
-         em Ajustes do Sistema → Privacidade e Segurança, depois reabra o Terminal"
-            .into(),
-    ))
+    Err(permission_error())
 }
 
 impl ScreenCaptureKitCapturer {
-    pub fn new(index: usize) -> Result<Self, CaptureError> {
-        preflight()?;
+    pub fn new(index: usize, max_fps: u32) -> Result<Self, CaptureError> {
+        if !CGPreflightScreenCaptureAccess() {
+            return Err(permission_error());
+        }
 
         let content = shareable_content()?;
         let displays = unsafe { content.displays() };
-        if index >= displays.count() {
+        // The list order is not documented: put the main display first so
+        // index 0 means "main", as on the other platforms.
+        let main = CGMainDisplayID();
+        let mut ordered: Vec<_> = (0..displays.count())
+            .map(|i| displays.objectAtIndex(i))
+            .collect();
+        ordered.sort_by_key(|d| unsafe { d.displayID() } != main);
+        let Some(display) = ordered.into_iter().nth(index) else {
             return Err(CaptureError::NoSuchDisplay(index));
-        }
-        let display = displays.objectAtIndex(index);
+        };
 
         let bounds = unsafe { display.frame() };
         let rect = Rect {
@@ -234,7 +261,7 @@ impl ScreenCaptureKitCapturer {
             config.setPixelFormat(kCVPixelFormatType_32BGRA);
             config.setShowsCursor(false);
             config.setQueueDepth(3);
-            config.setMinimumFrameInterval(CMTime::new(1, 60));
+            config.setMinimumFrameInterval(CMTime::new(1, max_fps.clamp(1, 240) as i32));
             let stream = SCStream::initWithFilter_configuration_delegate(
                 SCStream::alloc(),
                 &filter,
@@ -250,7 +277,11 @@ impl ScreenCaptureKitCapturer {
                 .map_err(|e| platform("addStreamOutput", &e))?;
             stream
         };
-        start(&stream)?;
+        if let Err(e) = start(&stream) {
+            // It may still start after the timeout: never leave it running.
+            stop(&stream, &output);
+            return Err(e);
+        }
         tracing::info!(
             "capturando o monitor {index}: {}x{} pontos, imagem {width}x{height}",
             rect.width,
@@ -282,6 +313,10 @@ impl Capturer for ScreenCaptureKitCapturer {
         }
         self.seen = latest.seq;
         self.copy_time = latest.copy_time;
+        // Hand the previous buffer back for reuse.
+        if let Some(old) = self.frame.take() {
+            latest.spare = Some(old.data);
+        }
         self.frame = latest.frame.take();
         Ok(self.frame.is_some())
     }
@@ -301,8 +336,25 @@ impl Capturer for ScreenCaptureKitCapturer {
 
 impl Drop for ScreenCaptureKitCapturer {
     fn drop(&mut self) {
-        unsafe { self.stream.stopCaptureWithCompletionHandler(None) };
+        stop(&self.stream, &self._output);
     }
+}
+
+/// Stops the stream and detaches the delegate, waiting (bounded) for
+/// ScreenCaptureKit to confirm, so a quick reconnect never overlaps streams.
+fn stop(stream: &SCStream, output: &StreamOutput) {
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(move |_error: *mut NSError| {
+        let _ = tx.send(());
+    });
+    unsafe { stream.stopCaptureWithCompletionHandler(Some(&handler)) };
+    let _ = rx.recv_timeout(REQUEST_TIMEOUT);
+    let _ = unsafe {
+        stream.removeStreamOutput_type_error(
+            ProtocolObject::from_ref(output),
+            SCStreamOutputType::Screen,
+        )
+    };
 }
 
 /// Asks ScreenCaptureKit for the displays, waiting for its answer.

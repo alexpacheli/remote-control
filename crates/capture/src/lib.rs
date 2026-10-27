@@ -75,10 +75,15 @@ pub fn preflight() -> Result<(), CaptureError> {
     }
 }
 
-/// Opens display `index` (0 = primary), or the test pattern.
-pub fn open(index: usize, test_pattern: bool) -> Result<Box<dyn Capturer>, CaptureError> {
+/// Opens display `index` (0 = primary), or the test pattern, delivering at
+/// most `max_fps` frames per second where the platform can throttle.
+pub fn open(
+    index: usize,
+    test_pattern: bool,
+    max_fps: u32,
+) -> Result<Box<dyn Capturer>, CaptureError> {
     if test_pattern {
-        return Ok(Box::new(TestPattern::new(1280, 720, 60)));
+        return Ok(Box::new(TestPattern::new(1280, 720, max_fps)));
     }
     #[cfg(windows)]
     {
@@ -86,11 +91,13 @@ pub fn open(index: usize, test_pattern: bool) -> Result<Box<dyn Capturer>, Captu
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(macos::ScreenCaptureKitCapturer::new(index)?))
+        Ok(Box::new(macos::ScreenCaptureKitCapturer::new(
+            index, max_fps,
+        )?))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = index;
+        let _ = (index, max_fps);
         Err(CaptureError::Unsupported)
     }
 }
