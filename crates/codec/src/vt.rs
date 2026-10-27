@@ -24,7 +24,7 @@
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
@@ -83,8 +83,64 @@ pub struct VtEncoder {
     force_keyframe: bool,
 }
 
-/// Results delivered by [`on_output`], collected after each frame.
-type Outputs = Mutex<Vec<Result<Option<Encoded>, CodecError>>>;
+/// What [`on_output`] delivered since the last frame was collected.
+#[derive(Default)]
+struct Delivered {
+    results: Vec<Result<Option<Encoded>, CodecError>>,
+    /// When the callback last ran (for the timing breakdown).
+    at: Option<Instant>,
+}
+
+type Outputs = Mutex<Delivered>;
+
+/// How often the per-stage timing breakdown is logged (at debug level).
+const TIMING_PERIOD: Duration = Duration::from_secs(2);
+
+/// Per-stage encode times, summed over [`TIMING_PERIOD`], to find where a
+/// frame's time goes (`RUST_LOG=hext_codec=debug`).
+#[derive(Default)]
+struct Timings {
+    frames: u32,
+    /// Getting a pixel buffer from the pool.
+    buffer: Duration,
+    /// Lock, copy of the BGRA rows, unlock.
+    copy: Duration,
+    /// `EncodeFrame` call.
+    submit: Duration,
+    /// `CompleteFrames` call.
+    wait: Duration,
+    /// From the start of `EncodeFrame` to the output callback.
+    output: Duration,
+    since: Option<Instant>,
+}
+
+impl Timings {
+    fn record(&mut self, stages: [Duration; 5]) {
+        let [buffer, copy, submit, wait, output] = stages;
+        self.frames += 1;
+        self.buffer += buffer;
+        self.copy += copy;
+        self.submit += submit;
+        self.wait += wait;
+        self.output += output;
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() < TIMING_PERIOD {
+            return;
+        }
+        let avg = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(self.frames);
+        tracing::debug!(
+            "VideoToolbox, média de {} quadros: buffer {:.2} ms | cópia {:.2} ms | \
+             EncodeFrame {:.2} ms | CompleteFrames {:.2} ms | saída após {:.2} ms",
+            self.frames,
+            avg(self.buffer),
+            avg(self.copy),
+            avg(self.submit),
+            avg(self.wait),
+            avg(self.output),
+        );
+        *self = Self::default();
+    }
+}
 
 struct Session {
     width: u32,
@@ -98,6 +154,7 @@ struct Session {
     last_pts: Option<i64>,
     /// Minimum timestamp step: one frame at the configured frame rate.
     frame_step: i64,
+    timings: Timings,
 }
 
 impl VtEncoder {
@@ -261,6 +318,7 @@ impl Session {
             started: Instant::now(),
             last_pts: None,
             frame_step: i64::from(TIMESCALE / fps),
+            timings: Timings::default(),
         };
         this.configure(settings, fps)?;
         let status = unsafe { this.session.prepare_to_encode_frames() };
@@ -336,8 +394,11 @@ impl Session {
     }
 
     fn encode(&mut self, bgra: &[u8], keyframe: bool) -> Result<Option<Encoded>, CodecError> {
+        let started = Instant::now();
         let pixels = self.pixel_buffer()?;
+        let buffered = Instant::now();
         copy_into(&pixels, self.width, self.height, bgra)?;
+        let copied = Instant::now();
 
         let pts = unsafe { CMTime::new(self.next_pts(), TIMESCALE) };
         let yes: &CFType = CFBoolean::new(true);
@@ -361,15 +422,25 @@ impl Session {
         if status != 0 {
             return Err(status_error("EncodeFrame", status));
         }
+        let submitted = Instant::now();
         // Returns once the callback has run for every frame up to this one.
         let status = unsafe { self.session.complete_frames(pts) };
         if status != 0 {
             return Err(status_error("CompleteFrames", status));
         }
+        let completed = Instant::now();
 
-        let outputs = std::mem::take(&mut *self.outputs.lock().expect("lock"));
+        let delivered = std::mem::take(&mut *self.outputs.lock().expect("lock"));
+        let output_at = delivered.at.unwrap_or(completed);
+        self.timings.record([
+            buffered - started,
+            copied - buffered,
+            submitted - copied,
+            completed - submitted,
+            output_at.saturating_duration_since(copied),
+        ]);
         let mut ready = None;
-        for output in outputs {
+        for output in delivered.results {
             merge(&mut ready, output?);
         }
         Ok(ready)
@@ -474,7 +545,8 @@ unsafe extern "C-unwind" fn on_output(
     };
     // Never unwind into VideoToolbox: a poisoned lock just loses the frame.
     if let Ok(mut outputs) = outputs.lock() {
-        outputs.push(result);
+        outputs.results.push(result);
+        outputs.at = Some(Instant::now());
     }
 }
 
