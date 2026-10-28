@@ -79,6 +79,35 @@ O `netcheck` mostrou NAT favorável (não simétrico) e UDP liberado nos dois la
    keyframes periódicos, envio espaçado (pacing) e controle de banda adaptativo (seções 4.2 e 6.2 do
    ARCHITECTURE).
 
+### Tarde do mesmo dia: o caminho direto parou de abrir
+
+Com o pacing pronto (PR #7), o teste de validação ficou sempre no relay. Isso aconteceu com o executável novo e
+com o antigo, com o firewall do Windows desligado nos três perfis, e com o nosso relay ou com os da n0. O
+`netcheck` continuou igual ao da manhã: UDP liberado, NAT não simétrico e os mesmos IPs públicos.
+
+Os logs do `iroh` (`RUST_LOG=iroh=debug`) mostram a mecânica funcionando. Os dois lados descobrem o próprio
+endereço público pelo relay (porta UDP 7842). O visualizador recebe os candidatos do host e tenta a conexão
+direta para o endereço público certo do escritório, mas nenhum pacote chega ao host. Algo entre os dois passou a
+descartar UDP de entrada ao longo do dia: o firewall ou o roteador do escritório, um antivírus corporativo ou o
+roteador de casa. Uma vez, pelos relays da n0, a conexão chegou a ficar direta, mas só depois de 60 s.
+
+Pelo relay próprio, o pacing não piorou nada: 60 fps, ~24 ms e nenhuma perda. O custo foi o previsto, 2
+quadros pulados a cada keyframe. A validação da perda no caminho direto fica para uma rede em que ele abra (o
+spike tem `--no-pacing` para comparar).
+
+Lições para o app:
+
+1. **A conexão direta depende da rede e pode deixar de abrir sem aviso**, inclusive em PCs de domínio. O relay
+   próprio e perto do usuário é o caminho que precisa ser sempre bom, não um plano B raro.
+2. **As mensagens que combinam a conexão direta passam pelo relay.** Com o relay congestionado pelo vídeo (os
+   da n0, com RTT de segundos), a conexão direta levou 60 s para abrir. O vídeo não pode lotar o caminho pelo
+   relay, ou seja, o controle de banda adaptativo é necessário também para isso.
+3. **Paradas de ~4 s sem nenhum pacote** aconteceram tanto no caminho direto quanto pelo relay, e o vídeo
+   voltou sozinho. Parecem quedas curtas da rede do escritório. O app deve mostrar "reconectando" em vez de
+   congelar sem explicação.
+4. **O diagnóstico precisa vir no produto:** um modo de log do caminho (relay ou direto, e por que não ficou
+   direto) e o `netcheck` dentro do app economizam horas de suporte.
+
 ### Decisão
 
 **Adotar o `iroh` (opção B do plano).** O `hext-net` migra para ele, e os marcos 4 e 5 da F3 viram
