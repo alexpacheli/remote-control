@@ -62,11 +62,6 @@ pub fn run(args: ViewArgs) -> Result<()> {
             watch.closed().await;
             let _ = closed_proxy.send_event(UserEvent::SessionEnded);
         });
-        // Keep the endpoint alive as long as the runtime.
-        tokio::spawn(async move {
-            let _endpoint = endpoint;
-            std::future::pending::<()>().await
-        });
         anyhow::Ok(session)
     })?;
     info!(
@@ -78,6 +73,7 @@ pub fn run(args: ViewArgs) -> Result<()> {
     let mut app = Viewer {
         runtime,
         session: Some(session),
+        endpoint: Some(endpoint),
         latest,
         window: None,
         renderer: None,
@@ -99,6 +95,8 @@ pub fn run(args: ViewArgs) -> Result<()> {
 struct Viewer {
     runtime: tokio::runtime::Runtime,
     session: Option<ClientHandle>,
+    /// Closed (gracefully, relay included) when the window closes.
+    endpoint: Option<Endpoint>,
     latest: Arc<Mutex<Option<YuvFrame>>>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -281,6 +279,9 @@ impl ApplicationHandler<UserEvent> for Viewer {
         {
             warn!("encerrando: {e}");
         }
+        if let Some(endpoint) = self.endpoint.take() {
+            self.runtime.block_on(endpoint.close());
+        }
     }
 }
 
@@ -288,15 +289,55 @@ impl ApplicationHandler<UserEvent> for Viewer {
 /// with the access code and the host's key. Returns the code to present to
 /// the host.
 async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
+    // The arguments first, before any network.
+    let target = target(args)?;
+    let relay = crate::relay(&args.relay)?;
+
     let key = crate::device_key(args.device_key.as_deref())?;
     let endpoint = hext_net::bind(
         &key,
         &EndpointConfig {
-            relay: crate::relay(&args.relay)?,
+            relay,
             ..Default::default()
         },
     )
     .await?;
+    let connected = match target {
+        Target::Id { id, server } => {
+            // Next to the key, so each key (profile) has its own.
+            let known = match &args.device_key {
+                Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
+                None => KnownHosts::default_location()?,
+            };
+            crate::signaling::connect(server, &key, &device_name(), id, &known, &endpoint).await
+        }
+        Target::Ip { addr, host, code } => hext_net::connect(&endpoint, host)
+            .await
+            .with_context(|| format!("falha ao conectar em {addr}"))
+            .map(|conn| (conn, code)),
+    };
+    match connected {
+        Ok((conn, code)) => Ok((endpoint, conn, code)),
+        Err(e) => {
+            endpoint.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Who to connect to, and how.
+enum Target<'a> {
+    /// By ID, through the signaling server.
+    Id { id: DeviceId, server: &'a str },
+    /// By IP, with the access code and the host's key.
+    Ip {
+        addr: std::net::SocketAddr,
+        host: hext_net::EndpointAddr,
+        code: String,
+    },
+}
+
+fn target(args: &ViewArgs) -> Result<Target<'_>> {
     // An address first: "192.168.0.10" must never be taken for an ID.
     let addr = parse_addr(&args.target);
     if let (Err(_), Ok(id)) = (&addr, args.target.parse::<DeviceId>()) {
@@ -308,14 +349,7 @@ async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
                 "pelo ID, --code e --key não são usados: o host aceita o pedido e a chave dele vem do servidor"
             );
         }
-        // Next to the key, so each key (profile) has its own.
-        let known = match &args.device_key {
-            Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
-            None => KnownHosts::default_location()?,
-        };
-        let (conn, code) =
-            crate::signaling::connect(server, &key, &device_name(), id, &known, &endpoint).await?;
-        return Ok((endpoint, conn, code));
+        return Ok(Target::Id { id, server });
     }
     let addr = addr?;
     let (Some(code), Some(host_key)) = (args.code.clone(), args.key) else {
@@ -324,10 +358,7 @@ async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
         );
     };
     let host = hext_net::EndpointAddr::new(hext_net::endpoint_id(&host_key)?).with_ip_addr(addr);
-    let conn = hext_net::connect(&endpoint, host)
-        .await
-        .with_context(|| format!("falha ao conectar em {addr}"))?;
-    Ok((endpoint, conn, code))
+    Ok(Target::Ip { addr, host, code })
 }
 
 /// Receives and decodes without a window, printing stats every second.

@@ -56,13 +56,10 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         })
         .await?;
     let client = hello.peer;
-    let path = match hext_net::path(&conn) {
-        Some(p) if p.relay => "pelo relay",
-        Some(_) => "direto",
-        None => "",
-    };
+    // (Not the path: right after the handshake it is usually the relay,
+    // and a direct one follows; the viewer's title shows it live.)
     info!(
-        "conectado: {} ({:?}, v{}) {path}",
+        "conectado: {} ({:?}, v{})",
         client.device_name, client.os, client.app_version,
     );
 

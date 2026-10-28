@@ -80,15 +80,37 @@ pub fn remote_key(conn: &Connection) -> PublicKey {
 /// The `iroh` ID of a device key.
 pub fn endpoint_id(key: &PublicKey) -> Result<EndpointId> {
     EndpointId::from_bytes(key.as_bytes())
-        .map_err(|_| NetError::Connect("a chave informada não é uma chave válida".into()))
+        .map_err(|_| NetError::Connect("chave do host inválida".into()))
 }
 
+/// Most entries [`addr_to_strings`] gives, and the longest one: what the
+/// signaling server passes on.
+const MAX_ENTRIES: usize = 32;
+const MAX_ENTRY_LEN: usize = 256;
+
 /// Where a host can be reached, as text for signaling: `relay <url>` and
-/// `ip <addr>` entries (short, so they fit the server's limits).
+/// `ip <addr>` entries, within the server's limits. Relays come first (the
+/// fallback), then public addresses (for hole punching), then local ones.
 pub fn addr_to_strings(addr: &EndpointAddr) -> Vec<String> {
     let relays = addr.relay_urls().map(|url| format!("relay {url}"));
-    let ips = addr.ip_addrs().map(|ip| format!("ip {ip}"));
-    relays.chain(ips).collect()
+    let mut ips: Vec<&SocketAddr> = addr.ip_addrs().collect();
+    ips.sort_by_key(|ip| is_local(ip));
+    let ips = ips.into_iter().map(|ip| format!("ip {ip}"));
+    relays
+        .chain(ips)
+        .filter(|entry| entry.len() <= MAX_ENTRY_LEN)
+        .take(MAX_ENTRIES)
+        .collect()
+}
+
+/// A private, loopback or link-local address (only reachable nearby).
+fn is_local(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local()
+        }
+    }
 }
 
 /// The host with `key` at the addresses from [`addr_to_strings`] (unknown

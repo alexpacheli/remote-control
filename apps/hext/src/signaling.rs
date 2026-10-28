@@ -23,6 +23,8 @@ const ANSWER_TIME: Duration = Duration::from_secs(55);
 /// Waits between attempts to reach the server, doubling up to the last.
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// How long the host waits for its relay before answering a request.
+const RELAY_WAIT: Duration = Duration::from_secs(5);
 /// How long to try reaching the host (directly or through the relay).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -34,7 +36,7 @@ pub async fn host(
     server: String,
     key: Arc<DeviceKey>,
     name: String,
-    endpoint: Endpoint,
+    (endpoint, has_relay): (Endpoint, bool),
     codes: SessionCodes,
     slot: Arc<Semaphore>,
 ) {
@@ -52,7 +54,15 @@ pub async fn host(
                 } else {
                     info!("reconectado ao servidor");
                 }
-                if let Err(e) = serve(&mut client, &mut answers, &endpoint, &codes, &slot).await {
+                if let Err(e) = serve(
+                    &mut client,
+                    &mut answers,
+                    (&endpoint, has_relay),
+                    &codes,
+                    &slot,
+                )
+                .await
+                {
                     warn!("servidor de sinalização: {e}");
                 }
             }
@@ -67,7 +77,7 @@ pub async fn host(
 async fn serve(
     client: &mut Client,
     answers: &mut mpsc::UnboundedReceiver<String>,
-    endpoint: &Endpoint,
+    (endpoint, has_relay): (&Endpoint, bool),
     codes: &SessionCodes,
     slot: &Semaphore,
 ) -> Result<(), hext_signal::ClientError> {
@@ -124,6 +134,12 @@ async fn serve(
         }
         let answer = if accepted && !busy {
             println!("  Aceito: conectando...");
+            // The relay must be among the addresses: without it, a viewer
+            // on another network has nothing to fall back on. Right after
+            // starting (or a network change) it may still be connecting.
+            if has_relay && endpoint.addr().relay_urls().next().is_none() {
+                let _ = tokio::time::timeout(RELAY_WAIT, endpoint.online()).await;
+            }
             ClientMsg::Accept {
                 request,
                 addrs: hext_net::addr_to_strings(&endpoint.addr()),

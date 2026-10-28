@@ -39,6 +39,11 @@ pub fn auth_message(nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
 /// Longest device name the server keeps.
 pub const MAX_NAME_LEN: usize = 64;
 
+/// Most addresses a host may give in [`ClientMsg::Accept`], and the
+/// longest one (a relay URL).
+pub const MAX_ADDRS: usize = 32;
+pub const MAX_ADDR_LEN: usize = 256;
+
 /// Server to app.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

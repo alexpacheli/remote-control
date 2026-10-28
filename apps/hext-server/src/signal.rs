@@ -11,7 +11,8 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use hext_crypto::PublicKey;
 use hext_signal::{
-    ClientMsg, DeviceId, MAX_NAME_LEN, NONCE_LEN, PROTOCOL, Rejection, ServerMsg, auth_message,
+    ClientMsg, DeviceId, MAX_ADDR_LEN, MAX_ADDRS, MAX_NAME_LEN, NONCE_LEN, PROTOCOL, Rejection,
+    ServerMsg, auth_message,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::{mpsc, oneshot};
@@ -416,7 +417,11 @@ async fn on_message(state: &State, me: &mut Session, msg: ClientMsg) -> Option<S
             let accepted = ServerMsg::Accepted {
                 request: p.viewer_request,
                 host_key: me.key,
-                addrs: addrs.iter().take(16).map(|a| clean(a)).collect(),
+                addrs: addrs
+                    .iter()
+                    .take(MAX_ADDRS)
+                    .map(|a| clean_to(a, MAX_ADDR_LEN))
+                    .collect(),
                 session_code: clean(&session_code),
             };
             state.send_to(p.viewer, p.viewer_session, accepted).await;
@@ -531,9 +536,14 @@ async fn next_msg(
 /// people: no control or invisible characters (which could reorder or
 /// disguise the text), not too long.
 fn clean(text: &str) -> String {
+    clean_to(text, MAX_NAME_LEN)
+}
+
+/// [`clean`], up to `max` characters.
+fn clean_to(text: &str, max: usize) -> String {
     text.chars()
         .filter(|&c| !c.is_control() && !invisible(c))
-        .take(MAX_NAME_LEN)
+        .take(max)
         .collect::<String>()
         .trim()
         .to_owned()

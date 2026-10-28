@@ -151,5 +151,6 @@ async fn accepted_by_id_then_streams() {
         hext_net::connect(&client_endpoint, wrong),
     )
     .await;
-    assert!(!matches!(attempt, Ok(Ok(_))));
+    // Refused in the handshake, not left hanging.
+    assert!(matches!(attempt, Ok(Err(_))));
 }

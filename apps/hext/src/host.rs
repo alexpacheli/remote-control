@@ -20,10 +20,12 @@ const WRONG_CODE_PENALTY: Duration = Duration::from_secs(1);
 
 pub async fn run(args: HostArgs) -> Result<()> {
     let key = Arc::new(crate::device_key(args.device_key.as_deref())?);
+    let relay = crate::relay(&args.relay)?;
+    let has_relay = relay.is_some();
     let endpoint = hext_net::bind(
         &key,
         &EndpointConfig {
-            relay: crate::relay(&args.relay)?,
+            relay,
             bind: Some(args.listen),
             accept: true,
         },
@@ -48,13 +50,22 @@ pub async fn run(args: HostArgs) -> Result<()> {
         hext_input::preflight();
     }
 
-    let port = args.listen.port();
     // Where other machines reach this one: the address listened on, or the
-    // LAN address when listening on all.
+    // LAN address when listening on all; and the port actually bound for
+    // that address family (one socket per family; `--listen` may say 0).
     let reachable = match args.listen.ip() {
         ip if ip.is_unspecified() => local_ip(),
         ip => Some(ip),
     };
+    let port = reachable
+        .and_then(|ip| {
+            let bound = endpoint.bound_sockets();
+            bound
+                .into_iter()
+                .find(|s| s.is_ipv4() == ip.is_ipv4())
+                .map(|s| s.port())
+        })
+        .unwrap_or(args.listen.port());
     let ip = reachable.map_or_else(|| "<IP-deste-PC>".to_owned(), |ip| ip.to_string());
     println!();
     println!("  Hext Remote — aguardando conexão");
@@ -63,8 +74,14 @@ pub async fn run(args: HostArgs) -> Result<()> {
     println!("  Chave:             {}", key.public_key());
     println!();
     println!("  No outro computador:");
+    // The port only when it is not the one `view` assumes.
+    let target = if port == hext_proto::DEFAULT_PORT {
+        ip.clone()
+    } else {
+        format!("{ip}:{port}")
+    };
     println!(
-        "    {} view {ip} --code {code} --key {}",
+        "    {} view {target} --code {code} --key {}",
         exe_name(),
         key.public_key()
     );
@@ -104,7 +121,7 @@ pub async fn run(args: HostArgs) -> Result<()> {
             server,
             key.clone(),
             device_name(),
-            endpoint.clone(),
+            (endpoint.clone(), has_relay),
             session_codes,
             slot.clone(),
         ));

@@ -120,8 +120,8 @@ async fn a_host_without_the_expected_key_is_refused() {
     let wrong = hext_net::addr_from_strings(&other, &hext_net::addr_to_strings(&addr)).unwrap();
     let (client, _) = viewer().await;
     let result = tokio::time::timeout(Duration::from_secs(15), connect(&client, wrong)).await;
-    assert!(matches!(result, Ok(Err(_)) | Err(_)), "{result:?}");
-    assert!(!matches!(result, Ok(Ok(_))));
+    // Refused in the handshake, not left hanging.
+    assert!(matches!(result, Ok(Err(_))), "{result:?}");
 }
 
 #[tokio::test]
