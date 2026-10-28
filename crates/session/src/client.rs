@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hext_codec::{DecoderPreference, YuvFrame};
-use hext_net::{Connection, ControlStream, FramedRecv, FramedSend};
-use hext_proto::{Control, Hello, InputEvent, PeerInfo, StreamKind, VideoFrame};
+use hext_net::video::{Event, Reassembler};
+use hext_net::{Connection, ControlStream, FramedSend, NetError};
+use hext_proto::{Control, Datagram, Hello, InputEvent, PeerInfo, StreamKind, VideoFrame};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -65,12 +66,6 @@ pub async fn start(
 ) -> Result<ClientHandle> {
     let (control, host) = hext_net::client_handshake(&conn, hello).await?;
     let input_stream = hext_net::open_uni(&conn, StreamKind::Input).await?;
-    let (kind, video) = hext_net::accept_uni(&conn).await?;
-    if kind != StreamKind::Video {
-        return Err(SessionError::Protocol(format!(
-            "unexpected {kind:?} stream"
-        )));
-    }
 
     let stats = Arc::new(Mutex::new(Stats::default()));
     let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -79,7 +74,6 @@ pub async fn start(
     let task = tokio::spawn(run(
         conn.clone(),
         control,
-        video,
         input_stream,
         input_rx,
         shutdown_rx,
@@ -112,7 +106,6 @@ pub async fn start(
 async fn run(
     conn: Connection,
     mut control: ControlStream,
-    mut video: FramedRecv,
     mut input_stream: FramedSend,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
     mut shutdown: oneshot::Receiver<()>,
@@ -121,11 +114,10 @@ async fn run(
     ready: oneshot::Sender<Result<()>>,
     on_frame: impl FnMut(DecodedFrame) + Send + 'static,
 ) -> Result<()> {
-    // Decoding is CPU-bound, so it gets its own thread. The short queue makes
-    // a slow decoder stop the reads, and QUIC flow control then slows the
-    // host down, instead of a backlog (and delay) building up here.
+    // Decoding is CPU-bound, so it gets its own thread, behind a short queue.
     let (frames_tx, mut frames_rx) = mpsc::channel::<VideoFrame>(2);
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<()>();
+    let (loss_tx, video_conn, video_stats) = (keyframe_tx.clone(), conn.clone(), stats.clone());
     let decoder = std::thread::Builder::new()
         .name("hext-decode".into())
         .spawn(move || {
@@ -139,37 +131,30 @@ async fn run(
             )
         })
         .map_err(|e| SessionError::Protocol(format!("decoder thread: {e}")))?;
-    let mut receiver = tokio::spawn(async move {
-        loop {
-            let frame: VideoFrame = video.recv().await?;
-            if frames_tx.send(frame).await.is_err() {
-                return Ok(()); // decoder gone: the session is ending
-            }
-        }
-    });
+    let mut receiver = tokio::spawn(receive_video(video_conn, frames_tx, loss_tx, video_stats));
 
     let mut say_bye = false;
     let result = loop {
         tokio::select! {
             done = &mut receiver => break match done {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => peer_closed_is_ok(e),
+                Ok(Err(e)) => peer_closed_is_ok(&conn, e),
                 Err(e) => Err(SessionError::Protocol(format!("video: {e}"))),
             },
             Some(event) = input_rx.recv() => {
                 if let Err(e) = send_input(&mut input_stream, &mut input_rx, event).await {
-                    break peer_closed_is_ok(e);
+                    break peer_closed_is_ok(&conn, e);
                 }
             }
             Some(()) = keyframe_rx.recv() => {
                 if let Err(e) = control.send(&Control::RequestKeyframe).await {
-                    break peer_closed_is_ok(e);
+                    break peer_closed_is_ok(&conn, e);
                 }
             }
             msg = control.recv() => match msg {
                 Ok(Control::Bye) => break Ok(()),
                 Ok(other) => debug!("mensagem inesperada: {other:?}"),
-                Err(e) => break peer_closed_is_ok(e),
+                Err(e) => break peer_closed_is_ok(&conn, e),
             },
             _ = &mut shutdown => {
                 say_bye = true;
@@ -188,12 +173,80 @@ async fn run(
     result
 }
 
-/// The host leaving is a normal end of session, not an error.
-fn peer_closed_is_ok(e: hext_net::NetError) -> Result<()> {
-    if e.is_peer_closed() {
-        Ok(())
-    } else {
-        Err(e.into())
+/// Rebuilds frames from the host's video datagrams and queues them for the
+/// decoder; a frame lost despite FEC asks the host for a keyframe.
+async fn receive_video(
+    conn: Connection,
+    frames: mpsc::Sender<VideoFrame>,
+    keyframe: mpsc::UnboundedSender<()>,
+    stats: Arc<Mutex<Stats>>,
+) -> hext_net::Result<()> {
+    let mut reassembler = Reassembler::new();
+    // Also notices a lost frame when nothing newer arrives (a still screen).
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let events = tokio::select! {
+            datagram = hext_net::recv_datagram(&conn) => match datagram {
+                Ok(Datagram::Video(packet)) => reassembler.push(packet, Instant::now()),
+                Ok(Datagram::VideoIdle { last_frame }) => {
+                    reassembler.idle(last_frame, Instant::now())
+                }
+                Ok(_) => continue,
+                // One malformed datagram; the connection is fine.
+                Err(NetError::Codec(e)) => {
+                    debug!("datagrama inválido: {e}");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
+            _ = tick.tick() => reassembler.tick(Instant::now()),
+        };
+        if events.is_empty() {
+            continue;
+        }
+        for event in events {
+            match event {
+                // Never wait for the decoder: the datagrams (and loss checks)
+                // must keep flowing. A decoder that can't keep up drops to
+                // the next keyframe instead of falling ever further behind.
+                Event::Frame(frame) => match frames.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!("decodificador atrasado; pulando até um keyframe");
+                        reassembler.resync(Instant::now());
+                        let _ = keyframe.send(());
+                        break;
+                    }
+                    // Decoder gone: the session is ending.
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                },
+                Event::Lost => {
+                    debug!("quadro perdido apesar do FEC; pedindo keyframe");
+                    let _ = keyframe.send(());
+                }
+            }
+        }
+        stats.lock().expect("lock").video = reassembler.counters;
+    }
+}
+
+/// The host leaving is a normal end of session, not an error, unless it
+/// closed with an error code (e.g. its screen capture failed to start).
+fn peer_closed_is_ok(conn: &Connection, e: hext_net::NetError) -> Result<()> {
+    if !e.is_peer_closed() {
+        return Err(e.into());
+    }
+    match conn.close_reason() {
+        Some(hext_net::ConnectionError::ApplicationClosed(close))
+            if close.error_code != hext_net::VarInt::from_u32(0) =>
+        {
+            Err(SessionError::Protocol(format!(
+                "o host encerrou a sessão: {}",
+                String::from_utf8_lossy(&close.reason)
+            )))
+        }
+        _ => Ok(()),
     }
 }
 

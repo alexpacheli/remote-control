@@ -9,6 +9,7 @@ mod endpoint;
 mod identity;
 mod session;
 mod verify;
+pub mod video;
 
 pub use endpoint::{client_endpoint, connect, host_endpoint};
 pub use identity::{Fingerprint, Identity};
@@ -17,7 +18,7 @@ pub use session::{
     recv_datagram, send_datagram,
 };
 
-pub use quinn::{Connection, Endpoint, Incoming};
+pub use quinn::{Connection, ConnectionError, Endpoint, Incoming, VarInt};
 
 use hext_proto::{CodecError, RejectReason};
 

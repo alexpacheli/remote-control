@@ -10,6 +10,7 @@ publish.workspace = true
 hex.workspace = true
 hext-proto.workspace = true
 quinn.workspace = true
+reed-solomon-erasure.workspace = true
 rcgen.workspace = true
 ring.workspace = true
 rustls.workspace = true

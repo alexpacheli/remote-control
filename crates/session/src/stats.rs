@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use hext_metrics::Rolling;
+use hext_net::video::Counters;
 
 /// Viewer-side statistics for the stats line (window title for now).
 pub struct Stats {
@@ -16,6 +17,8 @@ pub struct Stats {
     decode_hardware: bool,
     pub width: u32,
     pub height: u32,
+    /// FEC and loss totals since the session started.
+    pub video: Counters,
 }
 
 /// Rates and averages over the last full second.
@@ -30,6 +33,7 @@ pub struct Snapshot {
     pub hardware: bool,
     /// This viewer decodes on the GPU.
     pub decode_hardware: bool,
+    pub video: Counters,
 }
 
 impl Default for Stats {
@@ -46,6 +50,7 @@ impl Default for Stats {
             decode_hardware: false,
             width: 0,
             height: 0,
+            video: Counters::default(),
         }
     }
 }
@@ -91,6 +96,7 @@ impl Stats {
             decode_ms: avg_ms(&self.decode),
             hardware: self.hardware,
             decode_hardware: self.decode_hardware,
+            video: self.video,
         });
         self.window_start = Instant::now();
         self.frames = 0;
@@ -110,7 +116,16 @@ impl std::fmt::Display for Snapshot {
             unit(self.hardware),
             self.decode_ms,
             unit(self.decode_hardware),
-        )
+        )?;
+        // Only once the network actually loses something.
+        if self.video != Counters::default() {
+            write!(
+                f,
+                " | total: FEC {} blocos, {} quadros perdidos",
+                self.video.recovered, self.video.lost
+            )?;
+        }
+        Ok(())
     }
 }
 

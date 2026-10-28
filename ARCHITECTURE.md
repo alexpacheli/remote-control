@@ -234,7 +234,7 @@ A latência é **medida desde a F1**: um overlay de estatísticas mostra captura
 
 ### 6.2 Resiliência
 
-- **FEC** (Reed-Solomon) nos quadros de vídeo: um pacote perdido é recuperado sem retransmissão.
+- **FEC** (Reed-Solomon) nos quadros de vídeo: um pacote perdido é recuperado sem retransmissão. *(Implementado: cada quadro vira pacotes do tamanho de um datagrama, em blocos de até 64 com 20% de paridade; os pacotes saem intercalados entre blocos, para que uma rajada de perdas se espalhe. O título do visualizador mostra quantos blocos o FEC recuperou e quantos quadros se perderam.)*
 - **Controle de congestionamento próprio para vídeo**, baseado em atraso no estilo GCC. Ele baixa o bitrate *antes* de a fila encher, para não acumular atraso.
 - **Perda grave:** o cliente pede um keyframe ou uma atualização de intra-refresh.
 
@@ -375,7 +375,7 @@ docs/
 | Fase | Entrega | Pronto quando |
 |---|---|---|
 | **F0 — Fundação** ✅ | Workspace, CI nos 3 SOs, esqueleto do protocolo (handshake QUIC, pinagem por impressão digital, ping por datagrama) e estatísticas de latência. O app é uma linha de comando; a UI Tauri e o overlay visual entram com o visualizador na F1. | CI verde gerando binários de Windows e macOS |
-| **F1 — MVP LAN Windows** ✅ | Captura DXGI → H.264 (OpenH264 em software, igual nos 3 SOs) → QUIC por IP direto → decode → render wgpu. Mouse, teclado (scancodes) e cursor local. Código de acesso de 9 dígitos. Vídeo num stream QUIC confiável por enquanto. Codificação por hardware via Media Foundation, com zero-copy: a GPU converte a tela para NV12 (processador de vídeo D3D11, BT.601) e o encoder lê a textura direto. Pendente: vídeo por datagramas + FEC. | Controlar um PC Windows na LAN com **< 30 ms** e fluidez visível |
+| **F1 — MVP LAN Windows** ✅ | Captura DXGI → H.264 (OpenH264 em software, igual nos 3 SOs) → QUIC por IP direto → decode → render wgpu. Mouse, teclado (scancodes) e cursor local. Código de acesso de 9 dígitos. Codificação por hardware via Media Foundation, com zero-copy: a GPU converte a tela para NV12 (processador de vídeo D3D11, BT.601) e o encoder lê a textura direto. Vídeo por datagramas QUIC com FEC Reed-Solomon (20% por bloco de até 64 pacotes, intercalados), entrega em ordem e pedido de keyframe quando um quadro se perde mesmo assim. | Controlar um PC Windows na LAN com **< 30 ms** e fluidez visível |
 | **F2 — macOS** ✅ | Host e cliente macOS: ScreenCaptureKit (no tamanho lógico da tela), CGEvent (arrastar, duplo clique, modificadores), mapa scancode → tecla do Mac, Ctrl↔Cmd conforme o sistema do host, checagem de Gravação de Tela e Acessibilidade. Codificação na GPU do Mac via VideoToolbox (controle de taxa de baixa latência, Constrained Baseline), com a captura já em NV12/BT.601 feita pela GPU no ScreenCaptureKit — sem conversão de cor na CPU nem no encoder. `hext bench` mede as configurações. | Windows ↔ macOS nos dois sentidos, na LAN |
 | **F3 — Internet** | VPS, ID numérico, sinalização, STUN, hole punching, relay UDP + TCP/443, pedido de aceite, ponta a ponta | Conectar pela internet só com o ID, inclusive atrás de NAT/firewall |
 | **F4 — Essenciais de suporte** | Serviço Windows (login/UAC/Ctrl+Alt+Del), inicialização automática nos 3 SOs, senha não assistida (PAKE), clipboard, arquivos, chat, multi-monitor completo, reiniciar e reconectar, tela de login no macOS | Um técnico consegue fazer um atendimento real de ponta a ponta |
