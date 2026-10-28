@@ -41,10 +41,13 @@ struct Shared {
 ///
 /// Returns the client's identity once the session ends normally.
 pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo> {
+    // The viewer proved it holds this key; a session code is only good from
+    // the viewer it was issued to.
+    let viewer = hext_net::remote_key(&conn);
     let (mut control, hello) =
         hext_net::host_handshake(&conn, config.peer.clone(), |hello: &Hello| {
             if codes_match(&config.access_code, &hello.access_code)
-                || config.session_codes.redeem(&hello.access_code)
+                || config.session_codes.redeem(&hello.access_code, &viewer)
             {
                 Ok(())
             } else {
@@ -53,12 +56,14 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         })
         .await?;
     let client = hello.peer;
+    let path = match hext_net::path(&conn) {
+        Some(p) if p.relay => "pelo relay",
+        Some(_) => "direto",
+        None => "",
+    };
     info!(
-        "conectado: {} ({:?}, v{}) de {}",
-        client.device_name,
-        client.os,
-        client.app_version,
-        conn.remote_address()
+        "conectado: {} ({:?}, v{}) {path}",
+        client.device_name, client.os, client.app_version,
     );
 
     let shared = Arc::new(Shared {

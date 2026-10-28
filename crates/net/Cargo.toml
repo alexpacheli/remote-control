@@ -1,25 +1,20 @@
 [package]
 name = "hext-net"
-description = "Hext Remote transport: QUIC endpoints, certificate pinning and handshake"
+description = "Hext Remote transport: iroh (QUIC) endpoints keyed by device, handshake and video datagrams"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-hex.workspace = true
 hext-crypto.workspace = true
 hext-proto.workspace = true
-quinn.workspace = true
+iroh.workspace = true
 reed-solomon-erasure.workspace = true
-rcgen.workspace = true
-ring.workspace = true
-rustls.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-webpki.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

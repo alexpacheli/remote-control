@@ -1,27 +1,41 @@
 //! Host (test pattern) → QUIC → client decode, over loopback.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hext_codec::{DecoderPreference, EncoderSettings};
-use hext_net::Identity;
+use hext_crypto::DeviceKey;
+use hext_net::{EndpointAddr, EndpointConfig};
 use hext_proto::{Hello, InputEvent, PeerInfo};
 use hext_session::host::HostConfig;
 use hext_session::{SessionError, client, host};
 
 const CODE: &str = "111222333";
 
+/// A host endpoint on this machine (direct only).
+async fn host_endpoint() -> hext_net::Endpoint {
+    let config = EndpointConfig {
+        accept: true,
+        ..Default::default()
+    };
+    hext_net::bind(&DeviceKey::generate().unwrap(), &config)
+        .await
+        .unwrap()
+}
+
+async fn viewer_endpoint() -> hext_net::Endpoint {
+    hext_net::bind(&DeviceKey::generate().unwrap(), &EndpointConfig::default())
+        .await
+        .unwrap()
+}
+
 async fn start_host() -> (
-    SocketAddr,
-    Identity,
+    EndpointAddr,
     tokio::task::JoinHandle<Result<PeerInfo, SessionError>>,
 ) {
-    let identity = Identity::generate().unwrap();
-    let endpoint =
-        hext_net::host_endpoint(SocketAddr::from(([127, 0, 0, 1], 0)), &identity).unwrap();
-    let addr = endpoint.local_addr().unwrap();
+    let endpoint = host_endpoint().await;
+    let addr = endpoint.addr();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
         access_code: CODE.into(),
@@ -33,20 +47,18 @@ async fn start_host() -> (
     let server = tokio::spawn(async move {
         let conn = endpoint.accept().await.unwrap().await.unwrap();
         let result = host::serve(conn, config).await;
-        endpoint.wait_idle().await;
+        endpoint.close().await;
         result
     });
-    (addr, identity, server)
+    (addr, server)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn streams_and_decodes_video() {
-    let (addr, identity, server) = start_host().await;
+    let (addr, server) = start_host().await;
 
-    let endpoint = hext_net::client_endpoint(addr).unwrap();
-    let conn = hext_net::connect(&endpoint, addr, Some(identity.fingerprint()))
-        .await
-        .unwrap();
+    let endpoint = viewer_endpoint().await;
+    let conn = hext_net::connect(&endpoint, addr).await.unwrap();
     let decoded = Arc::new(AtomicU32::new(0));
     let counter = decoded.clone();
     let session = client::start(
@@ -87,10 +99,8 @@ async fn streams_and_decodes_video() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn host_ending_the_session_is_not_an_error() {
-    let identity = Identity::generate().unwrap();
-    let endpoint =
-        hext_net::host_endpoint(SocketAddr::from(([127, 0, 0, 1], 0)), &identity).unwrap();
-    let addr = endpoint.local_addr().unwrap();
+    let endpoint = host_endpoint().await;
+    let addr = endpoint.addr();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
         access_code: CODE.into(),
@@ -108,10 +118,8 @@ async fn host_ending_the_session_is_not_an_error() {
         let _ = session.await;
     });
 
-    let endpoint = hext_net::client_endpoint(addr).unwrap();
-    let conn = hext_net::connect(&endpoint, addr, Some(identity.fingerprint()))
-        .await
-        .unwrap();
+    let endpoint = viewer_endpoint().await;
+    let conn = hext_net::connect(&endpoint, addr).await.unwrap();
     let session = client::start(
         conn,
         Hello {

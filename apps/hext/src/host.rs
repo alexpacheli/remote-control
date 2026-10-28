@@ -1,10 +1,11 @@
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use hext_codec::{EncoderPreference, EncoderSettings};
-use hext_net::{Identity, NetError};
+use hext_net::{EndpointConfig, NetError};
 use hext_proto::{PeerInfo, RejectReason};
 use hext_session::host::{self, HostConfig};
 use hext_session::{SessionCodes, SessionError};
@@ -19,8 +20,15 @@ const WRONG_CODE_PENALTY: Duration = Duration::from_secs(1);
 
 pub async fn run(args: HostArgs) -> Result<()> {
     let key = Arc::new(crate::device_key(args.device_key.as_deref())?);
-    let identity = Identity::from_device_key(&key)?;
-    let endpoint = hext_net::host_endpoint(args.listen, &identity)?;
+    let endpoint = hext_net::bind(
+        &key,
+        &EndpointConfig {
+            relay: crate::relay(&args.relay)?,
+            bind: Some(args.listen),
+            accept: true,
+        },
+    )
+    .await?;
     let code = match args.code {
         Some(code) => code,
         None => random_code()?,
@@ -40,7 +48,7 @@ pub async fn run(args: HostArgs) -> Result<()> {
         hext_input::preflight();
     }
 
-    let port = endpoint.local_addr()?.port();
+    let port = args.listen.port();
     // Where other machines reach this one: the address listened on, or the
     // LAN address when listening on all.
     let reachable = match args.listen.ip() {
@@ -52,13 +60,13 @@ pub async fn run(args: HostArgs) -> Result<()> {
     println!("  Hext Remote — aguardando conexão");
     println!("  Endereço:          {ip}:{port}");
     println!("  Código de acesso:  {}", group(&code));
-    println!("  Impressão digital: {}", identity.fingerprint());
+    println!("  Chave:             {}", key.public_key());
     println!();
     println!("  No outro computador:");
     println!(
-        "    {} view {ip} --code {code} --fingerprint {}",
+        "    {} view {ip} --code {code} --key {}",
         exe_name(),
-        identity.fingerprint()
+        key.public_key()
     );
     if let Some(server) = &args.server {
         println!(
@@ -90,18 +98,13 @@ pub async fn run(args: HostArgs) -> Result<()> {
     let slot = Arc::new(Semaphore::new(1));
 
     if let Some(server) = args.server.clone() {
-        // Viewers accepted through the server connect to this address.
-        let Some(ip) = reachable else {
-            anyhow::bail!(
-                "não foi possível descobrir o IP deste computador na rede; informe-o com --listen <IP>:{port}"
-            );
-        };
-        let addr = SocketAddr::new(ip, port);
+        // Viewers accepted through the server get this endpoint's current
+        // addresses: the relay and the direct ones `iroh` found.
         tokio::spawn(crate::signaling::host(
             server,
             key.clone(),
             device_name(),
-            addr,
+            endpoint.clone(),
             session_codes,
             slot.clone(),
         ));
@@ -112,13 +115,13 @@ pub async fn run(args: HostArgs) -> Result<()> {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let Ok(permit) = slot.clone().try_acquire_owned() else {
-                    info!("recusando {}: já existe uma sessão", incoming.remote_address());
+                    info!("recusando {:?}: já existe uma sessão", incoming.remote_addr());
                     incoming.refuse();
                     continue;
                 };
                 let config = config.clone();
                 tokio::spawn(async move {
-                    let remote = incoming.remote_address();
+                    let remote = format!("{:?}", incoming.remote_addr());
                     let result = match incoming.await {
                         Ok(conn) => host::serve(conn, config).await,
                         Err(e) => Err(NetError::from(e).into()),
@@ -137,8 +140,7 @@ pub async fn run(args: HostArgs) -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
-    endpoint.close(0u32.into(), b"host encerrado");
-    endpoint.wait_idle().await;
+    endpoint.close().await;
     Ok(())
 }
 

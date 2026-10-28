@@ -13,10 +13,23 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use hext_net::Fingerprint;
 use hext_proto::DEFAULT_PORT;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Our relay (São Paulo), for when the two computers cannot connect directly.
+const DEFAULT_RELAY: &str = "https://relay.hext.com.br";
+
+/// The `--relay` option: a URL, or `off` for direct connections only.
+fn relay(value: &str) -> Result<Option<hext_net::RelayUrl>> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let url = value
+        .parse()
+        .with_context(|| format!("relay inválido: {value}"))?;
+    Ok(Some(url))
+}
 
 #[derive(Parser)]
 #[command(
@@ -86,6 +99,9 @@ struct HostArgs {
     /// computador e pergunta aqui se aceita cada pedido de acesso.
     #[arg(long)]
     server: Option<String>,
+    /// Relay para quando não dá para conectar direto (`off` desliga).
+    #[arg(long, default_value = DEFAULT_RELAY)]
+    relay: String,
 }
 
 /// Which encoder (host) or decoder (viewer) to use.
@@ -112,9 +128,12 @@ struct ViewArgs {
     /// Arquivo da chave deste computador (criado na primeira execução).
     #[arg(long)]
     device_key: Option<std::path::PathBuf>,
-    /// Impressão digital mostrada pelo host. Sem ela a conexão é cifrada mas não autenticada.
+    /// Chave mostrada pelo host (para conectar pelo IP).
     #[arg(long)]
-    fingerprint: Option<Fingerprint>,
+    key: Option<hext_crypto::PublicKey>,
+    /// Relay para quando não dá para conectar direto (`off` desliga).
+    #[arg(long, default_value = DEFAULT_RELAY)]
+    relay: String,
     /// Visualizador no Mac, host Windows/Linux: o que a tecla Command envia.
     #[arg(long, value_enum, default_value_t = CmdKey::Ctrl)]
     cmd_key: CmdKey,
@@ -149,12 +168,12 @@ enum CmdKey {
 }
 
 fn main() -> Result<()> {
-    // quinn_udp warns on every MTU probe that a link (e.g. Tailscale, MTU
-    // 1280) cannot carry; quinn just keeps the smaller size, so hide them.
+    // noq_udp (iroh's QUIC) warns on every MTU probe that a link (e.g.
+    // Tailscale, MTU 1280) cannot carry; it just keeps the smaller size.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,quinn_udp=error".into()
+                "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,noq_udp=error".into()
             }),
         )
         .init();

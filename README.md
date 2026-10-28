@@ -12,7 +12,7 @@ Acesso e suporte remoto para Windows, macOS e Linux, focado em fluidez.
 | `crates/proto` | Mensagens do protocolo: handshake, vídeo, input |
 | `crates/crypto` | Identidade do computador: chave Ed25519 criada na primeira execução e guardada no disco |
 | `crates/signal` | Sinalização: ID de 9 dígitos, mensagens entre o app e o servidor, cliente WebSocket |
-| `crates/net` | QUIC, verificação do host por impressão digital, streams |
+| `crates/net` | Transporte (`iroh`/QUIC): direto quando possível, relay senão; cada computador é a sua chave |
 | `crates/capture` | Captura de tela (DXGI no Windows, ScreenCaptureKit no macOS) e imagem de teste |
 | `crates/codec` | H.264 (codificar e decodificar): placa de vídeo (Media Foundation no Windows, VideoToolbox no Mac) ou OpenH264 em software |
 | `crates/input` | Mapa de teclas e injeção de mouse/teclado (SendInput no Windows, CGEvent no macOS) |
@@ -56,16 +56,15 @@ Os binários ainda não são assinados (isso entra na F6):
    .\HextRemote.exe host
    ```
 
-   Ele mostra o **endereço**, um **código de acesso** e a **impressão digital**, além do comando
+   Ele mostra o **endereço**, um **código de acesso** e a **chave** deste computador, além do comando
    pronto para o outro computador. Permita o acesso quando o Firewall perguntar (porta UDP 7420).
-   A impressão digital vem da chave deste computador, criada na primeira execução em
-   `%APPDATA%\HextRemote\device.key` (no Mac, `~/Library/Application Support/HextRemote`), e não muda
-   entre execuções: o comando do outro computador pode ser guardado.
+   A chave é criada na primeira execução em `%APPDATA%\HextRemote\device.key` (no Mac,
+   `~/Library/Application Support/HextRemote`) e não muda: o comando do outro computador pode ser guardado.
 
 2. **No Mac**, cole o comando mostrado pelo Windows, trocando o nome do programa:
 
    ```sh
-   ./HextRemote view 192.168.0.10 --code 482913557 --fingerprint <impressão digital>
+   ./HextRemote view 192.168.0.10 --code 482913557 --key <chave>
    ```
 
    Abre uma janela com a tela do Windows. Mouse e teclado da janela controlam o Windows.
@@ -74,7 +73,7 @@ Os binários ainda não são assinados (isso entra na F6):
    `view ... --decoder software` força o processador.
 
 - **Tecla Command:** por padrão funciona como Ctrl (Cmd+C copia no Windows). Use `--cmd-key win` para que ela seja a tecla Windows.
-- **Fora de casa:** sem servidor (F3), os dois precisam estar na mesma rede, ou use o [Tailscale](https://tailscale.com) nos dois e o IP `100.x.y.z` dele.
+- **Fora de casa:** conecte pelo ID (abaixo); pelo IP, os dois precisam estar na mesma rede (ou no Tailscale).
 - **Outros monitores:** `host --display 1` compartilha o segundo monitor.
 - **Ajustes:** `host --bitrate-mbps 15 --fps 60`.
 - **Codificador:** por padrão usa a placa de vídeo (NVIDIA, AMD ou Intel, via Media Foundation) e volta
@@ -83,7 +82,7 @@ Os binários ainda não são assinados (isso entra na F6):
 
 ## Testar: conectar pelo ID (servidor de sinalização)
 
-Em vez de IP, código e impressão digital, o técnico digita o **ID de 9 dígitos** do host, e quem está no
+Em vez de IP, código e chave, o técnico digita o **ID de 9 dígitos** do host, e quem está no
 host aceita ou recusa o pedido. Enquanto o servidor não está na VPS (marco 6 da F3), rode o
 `hext-server` (que vem junto nos artefatos) num dos computadores:
 
@@ -95,9 +94,12 @@ host aceita ou recusa o pedido. Enquanto o servidor não está na VPS (marco 6 d
    `s` e Enter.
 
 Na primeira conexão, o técnico guarda a chave do host (`known_hosts`, na mesma pasta da chave). Se outro
-computador aparecer com o mesmo ID, a conexão é bloqueada com um aviso. Por enquanto, depois do aceite a
-conexão vai direto ao IP do host, então os dois precisam estar na mesma rede (ou no Tailscale). A travessia
-de NAT chega com o `iroh` (marco 4).
+computador aparecer com o mesmo ID, a conexão é bloqueada com um aviso.
+
+Depois do aceite, os dois tentam se conectar **direto**, mesmo em redes diferentes (atravessando o NAT);
+quando não dá (firewall corporativo, por exemplo), a conexão passa pelo **relay** em São Paulo
+(`relay.hext.com.br`). O título da janela mostra `(P2P)` ou `(relay)`. `--relay off` desliga o relay;
+`--relay <url>` usa outro.
 
 ## Testar: controlar o Mac a partir do Windows
 
@@ -108,7 +110,7 @@ de NAT chega com o `iroh` (marco 4).
 
    Libere as duas em **Ajustes do Sistema → Privacidade e Segurança**, **feche o Terminal por completo
    (Cmd+Q)** e abra de novo. O host avisa no terminal se alguma faltar.
-2. **No Windows**: `.\HextRemote.exe view <IP-do-Mac> --code ... --fingerprint ...` (o comando aparece no Mac).
+2. **No Windows**: `.\HextRemote.exe view <IP-do-Mac> --code ... --key ...` (o comando aparece no Mac).
 
 - **Teclado:** no Windows, **Ctrl funciona como Command** (Ctrl+C copia no Mac) e a tecla Windows vira Control.
   Para manter o Ctrl normal: `view ... --ctrl-key ctrl`.

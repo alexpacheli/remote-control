@@ -37,7 +37,12 @@ impl ClientHandle {
 
     /// Current round-trip time estimate of the connection.
     pub fn rtt(&self) -> Duration {
-        self.conn.rtt()
+        self.path().map_or(Duration::ZERO, |p| p.rtt)
+    }
+
+    /// The path in use: direct (peer to peer) or through the relay.
+    pub fn path(&self) -> Option<hext_net::PathInfo> {
+        hext_net::path(&self.conn)
     }
 
     /// `true` once the session ended (host left, network lost or closed).

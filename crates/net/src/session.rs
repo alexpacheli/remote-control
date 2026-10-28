@@ -22,12 +22,12 @@ const READ_CHUNK: usize = 64 * 1024;
 
 /// Sending half of a stream of length-prefixed postcard messages.
 pub struct FramedSend {
-    send: quinn::SendStream,
+    send: iroh::endpoint::SendStream,
     max: usize,
 }
 
 impl FramedSend {
-    fn new(send: quinn::SendStream, max: usize) -> Self {
+    fn new(send: iroh::endpoint::SendStream, max: usize) -> Self {
         Self { send, max }
     }
 
@@ -46,14 +46,14 @@ impl FramedSend {
 
 /// Receiving half of a stream of length-prefixed postcard messages.
 pub struct FramedRecv {
-    recv: quinn::RecvStream,
+    recv: iroh::endpoint::RecvStream,
     max: usize,
     /// Bytes received but not yet consumed as a preamble or frame.
     buf: Vec<u8>,
 }
 
 impl FramedRecv {
-    fn new(recv: quinn::RecvStream, max: usize) -> Self {
+    fn new(recv: iroh::endpoint::RecvStream, max: usize) -> Self {
         Self {
             recv,
             max,
@@ -85,9 +85,9 @@ impl FramedRecv {
 
     /// Appends the next chunk of the stream to `buf`. Cancel-safe.
     async fn fill(&mut self) -> Result<()> {
-        match self.recv.read_chunk(READ_CHUNK, true).await? {
+        match self.recv.read_chunk(READ_CHUNK).await? {
             Some(chunk) => {
-                self.buf.extend_from_slice(&chunk.bytes);
+                self.buf.extend_from_slice(&chunk);
                 Ok(())
             }
             None => Err(NetError::StreamClosed),
@@ -102,7 +102,7 @@ pub struct ControlStream {
 }
 
 impl ControlStream {
-    fn new((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
+    fn new((send, recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream)) -> Self {
         Self {
             send: FramedSend::new(send, MAX_FRAME_LEN),
             recv: FramedRecv::new(recv, MAX_FRAME_LEN),
