@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+#[cfg(windows)]
+mod gpu_nv12;
 #[cfg(target_os = "macos")]
 mod macos;
 mod test_pattern;
@@ -31,7 +33,15 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    /// The pixels in system memory; empty when the image is only on the GPU
+    /// (see `texture`).
     pub data: Vec<u8>,
+    /// Windows: the image as an NV12 texture on the capture's D3D11 device
+    /// (created with video support and multithread protection), handed to
+    /// the encoder without leaving the GPU. Valid until a few more frames
+    /// are captured: the capturer reuses a small ring of textures.
+    #[cfg(windows)]
+    pub texture: Option<::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
 }
 
 /// Where a display sits on the host's virtual desktop, in physical pixels.

@@ -14,6 +14,8 @@
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 
+#[cfg(windows)]
+mod d3d11;
 pub mod h264;
 #[cfg(windows)]
 mod mf;
@@ -96,13 +98,25 @@ pub enum PixelFormat {
     Nv12,
 }
 
+/// Where an [`Image`]'s pixels are.
+#[derive(Debug, Clone, Copy)]
+pub enum Pixels<'a> {
+    /// Tightly packed, in system memory.
+    Memory(&'a [u8]),
+    /// Windows: an NV12 texture, encoded without leaving the GPU when the
+    /// encoder can (otherwise read back). Its device must have video
+    /// support and multithread protection.
+    #[cfg(windows)]
+    D3d11(&'a windows::Win32::Graphics::Direct3D11::ID3D11Texture2D),
+}
+
 /// An image to encode. Width and height must be even.
 #[derive(Debug, Clone, Copy)]
 pub struct Image<'a> {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
-    pub data: &'a [u8],
+    pub pixels: Pixels<'a>,
 }
 
 impl<'a> Image<'a> {
@@ -111,7 +125,7 @@ impl<'a> Image<'a> {
             width,
             height,
             format: PixelFormat::Bgra,
-            data,
+            pixels: Pixels::Memory(data),
         }
     }
 
@@ -120,7 +134,16 @@ impl<'a> Image<'a> {
             width,
             height,
             format: PixelFormat::Nv12,
-            data,
+            pixels: Pixels::Memory(data),
+        }
+    }
+
+    /// The pixels if they are in system memory.
+    pub fn memory(&self) -> Option<&'a [u8]> {
+        match self.pixels {
+            Pixels::Memory(data) => Some(data),
+            #[cfg(windows)]
+            Pixels::D3d11(_) => None,
         }
     }
 }
@@ -271,15 +294,22 @@ fn check_frame(image: &Image<'_>) -> Result<(), CodecError> {
             "{width}x{height} must be even and non-zero"
         )));
     }
+    let Some(data) = image.memory() else {
+        // GPU textures are only produced in NV12.
+        return match image.format {
+            PixelFormat::Nv12 => Ok(()),
+            PixelFormat::Bgra => Err(CodecError::InvalidFrame("BGRA texture".into())),
+        };
+    };
     let pixels = width as usize * height as usize;
     let expected = match image.format {
         PixelFormat::Bgra => pixels * 4,
         PixelFormat::Nv12 => pixels * 3 / 2,
     };
-    if image.data.len() != expected {
+    if data.len() != expected {
         return Err(CodecError::InvalidFrame(format!(
             "{} bytes for {width}x{height} {:?}",
-            image.data.len(),
+            data.len(),
             image.format
         )));
     }

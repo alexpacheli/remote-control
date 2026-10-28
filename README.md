@@ -95,5 +95,5 @@ Os binários ainda não são assinados (isso entra na F6):
 ### Limitações atuais
 
 - No Linux o host ainda transmite só uma imagem de teste (`--test-pattern`).
-- Codificação por hardware ainda copia a imagem pela memória do sistema (Windows e Mac); o caminho direto na GPU (zero-copy) vem depois.
+- No Mac a imagem ainda passa pela memória do sistema (1,5 bytes por pixel, já em NV12); no Windows ela vai direto da captura para o encoder pela GPU (zero-copy), exceto em placas sem processador de vídeo D3D11 ou com o encoder em outra placa (ex.: notebooks com duas GPUs), que voltam ao caminho pela memória.
 - Janelas abertas como administrador, a tela de UAC e a tela de bloqueio não recebem controle (precisam do serviço, na F4).

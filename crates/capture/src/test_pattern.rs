@@ -23,6 +23,8 @@ impl TestPattern {
                 height,
                 format: PixelFormat::Bgra,
                 data: vec![0; (width * height * 4) as usize],
+                #[cfg(windows)]
+                texture: None,
             },
             interval: Duration::from_secs(1) / fps.max(1),
             next_at: Instant::now(),
