@@ -234,7 +234,9 @@ A latência é **medida desde a F1**: um overlay de estatísticas mostra captura
 
 ### 6.2 Resiliência
 
-- **FEC** (Reed-Solomon) nos quadros de vídeo: um pacote perdido é recuperado sem retransmissão. *(Implementado: cada quadro vira pacotes do tamanho de um datagrama, em blocos de até 64 com 20% de paridade; os pacotes saem intercalados entre blocos, para que uma rajada de perdas se espalhe. O título do visualizador mostra quantos blocos o FEC recuperou e quantos quadros se perderam.)*
+- **FEC** (Reed-Solomon) nos quadros de vídeo: um pacote perdido é recuperado sem retransmissão. *(Implementado: cada quadro vira pacotes do tamanho de um datagrama, em blocos de até 64 com 20% de paridade (40% nos keyframes, que são grandes e caros de perder); os pacotes saem intercalados entre blocos, para que uma rajada de perdas se espalhe. O título do visualizador mostra quantos blocos o FEC recuperou e quantos quadros se perderam.)*
+- **Pacing:** os pacotes de um quadro saem a no máximo 4× o bitrate do vídeo. Um quadro típico sai em poucos milissegundos, e um keyframe (~10× maior) se espalha por alguns intervalos de quadro em vez de sair numa rajada. O spike do `iroh` mostrou que essa rajada estoura o buffer de algum roteador no caminho direto e perde mais pacotes do que o FEC recupera ([spike-iroh.md](docs/spike-iroh.md)). No Windows, o host pede timers de 1 ms enquanto envia, porque o padrão de 15,6 ms transformaria o pacing em rajadas. *(Implementado.)*
+- **Intra-refresh** no lugar de keyframes inteiros, quando o encoder suportar. Os keyframes periódicos já são raros (a cada 60 s); os keyframes que sobram são o do início e os pedidos depois de uma perda.
 - **Controle de congestionamento próprio para vídeo**, baseado em atraso no estilo GCC. Ele baixa o bitrate *antes* de a fila encher, para não acumular atraso.
 - **Perda grave:** o cliente pede um keyframe ou uma atualização de intra-refresh.
 

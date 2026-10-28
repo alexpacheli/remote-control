@@ -8,6 +8,7 @@
 mod endpoint;
 mod identity;
 mod session;
+mod timer;
 mod verify;
 pub mod video;
 

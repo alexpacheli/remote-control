@@ -4,7 +4,13 @@
 //! shards and adds Reed-Solomon parity per block, so a few lost packets are
 //! rebuilt on arrival instead of retransmitted (which would hold back every
 //! later frame, as on a stream). Packets are interleaved across blocks so a
-//! burst of losses spreads over several of them.
+//! burst of losses spreads over several of them. Keyframes, which are
+//! large and expensive to lose (the viewer stops until the next one), carry
+//! more parity.
+//!
+//! [`VideoSender`] paces the packets ([`Pacer`]): a large frame sent at
+//! once arrives as a burst at the slowest link on the path, which overflows
+//! its buffer and loses more packets than FEC can rebuild.
 //!
 //! [`Reassembler`] rebuilds frames and hands them out in order. A frame
 //! that cannot be rebuilt breaks the chain of predicted frames after it, so
@@ -29,6 +35,22 @@ pub const BLOCK_SIZE: usize = 64;
 
 /// Parity shards per data shard (at least one per block).
 pub const PARITY_RATIO: f32 = 0.2;
+
+/// Parity shards per data shard in a keyframe.
+pub const KEYFRAME_PARITY_RATIO: f32 = 0.4;
+
+/// Packets go out at up to this many times the video bitrate: a typical
+/// frame leaves within a few milliseconds, a keyframe (often 10× larger)
+/// is spread over a few frame intervals instead of leaving in one burst.
+pub const PACING_HEADROOM: u32 = 4;
+
+/// A frame's first this long of sending goes out at once after a pause (a
+/// typical frame, unpaced); longer frames are paced.
+pub const PACING_BURST: Duration = Duration::from_millis(4);
+
+/// Sending a wake-up this late may make up for at once (a timer tick on
+/// Windows by default); beyond that the frame is sent slower.
+const PACING_CATCH_UP: Duration = Duration::from_millis(16);
 
 /// How long a missing frame may go without receiving a packet, while newer
 /// frames exist (packets can arrive out of order), before it counts as lost.
@@ -56,8 +78,13 @@ const MIN_SHARD: usize = 64;
 const PACKET_OVERHEAD: usize = 32;
 
 /// Parity shards for a block of `k` data shards.
-fn parity_for(k: usize) -> usize {
-    ((k as f32 * PARITY_RATIO).ceil() as usize).max(1)
+fn parity_for(k: usize, keyframe: bool) -> usize {
+    let ratio = if keyframe {
+        KEYFRAME_PARITY_RATIO
+    } else {
+        PARITY_RATIO
+    };
+    ((k as f32 * ratio).ceil() as usize).max(1)
 }
 
 /// Cuts frames into packets, reusing the Reed-Solomon codecs.
@@ -68,7 +95,13 @@ pub struct Packetizer {
 
 impl Packetizer {
     /// Packets of one frame, ready to send (data and parity, interleaved).
-    pub fn packetize(&mut self, frame: u64, bytes: &[u8], shard: usize) -> Vec<VideoPacket> {
+    pub fn packetize(
+        &mut self,
+        frame: u64,
+        bytes: &[u8],
+        shard: usize,
+        keyframe: bool,
+    ) -> Vec<VideoPacket> {
         let shard = shard.clamp(MIN_SHARD, u16::MAX as usize);
         let data_shards = bytes.len().div_ceil(shard).max(1);
         let blocks = data_shards.div_ceil(BLOCK_SIZE);
@@ -77,7 +110,7 @@ impl Packetizer {
         for block in 0..blocks {
             let first = block * BLOCK_SIZE;
             let k = (data_shards - first).min(BLOCK_SIZE);
-            let parity = parity_for(k);
+            let parity = parity_for(k, keyframe);
             let mut shards: Vec<Vec<u8>> = (0..k + parity)
                 .map(|i| {
                     let mut piece = vec![0; shard];
@@ -125,16 +158,70 @@ impl Packetizer {
     }
 }
 
+/// Spaces packets so they leave at a steady rate.
+///
+/// Each packet is given a send time: when the packets before it have had
+/// time to leave at the pacing rate. A frame after a pause may send
+/// [`PACING_BURST`] worth right away. A late wake-up (coarse timers) sends
+/// what is due at once, so the average rate holds.
+#[derive(Debug, Clone)]
+pub struct Pacer {
+    bytes_per_sec: f64,
+    /// When the next packet may leave.
+    next: Option<Instant>,
+}
+
+impl Pacer {
+    pub fn new(bits_per_sec: u64) -> Self {
+        Self {
+            bytes_per_sec: (bits_per_sec.max(1) as f64) / 8.0,
+            next: None,
+        }
+    }
+
+    /// Pacing for a video `bitrate_bps` ([`PACING_HEADROOM`] times it).
+    pub fn for_bitrate(bitrate_bps: u32) -> Self {
+        Self::new(u64::from(bitrate_bps) * u64::from(PACING_HEADROOM))
+    }
+
+    /// A new frame starts: time not used since the last one is not saved
+    /// up, except for [`PACING_BURST`].
+    pub fn begin_frame(&mut self, now: Instant) {
+        let earliest = now.checked_sub(PACING_BURST).unwrap_or(now);
+        self.next = Some(self.next.map_or(earliest, |next| next.max(earliest)));
+    }
+
+    /// When a packet of `len` bytes may leave (at or before `now` when it
+    /// may leave right away); reserves its time.
+    pub fn reserve(&mut self, len: usize, now: Instant) -> Instant {
+        let earliest = now.checked_sub(PACING_CATCH_UP).unwrap_or(now);
+        let at = self.next.unwrap_or(now).max(earliest);
+        self.next = Some(at + Duration::from_secs_f64(len as f64 / self.bytes_per_sec));
+        at
+    }
+}
+
 /// Sends frames as video datagrams (host side).
-#[derive(Default)]
 pub struct VideoSender {
     packetizer: Packetizer,
+    pacer: Pacer,
     last_frame: Option<u64>,
+    _timers: crate::timer::FineTimers,
 }
 
 impl VideoSender {
-    /// Sends one frame. Waits when the connection is congested, so a slow
-    /// network slows the host down instead of dropping packets here.
+    /// A sender for video of about `bitrate_bps`, which sets the pacing.
+    pub fn new(bitrate_bps: u32) -> Self {
+        Self {
+            packetizer: Packetizer::default(),
+            pacer: Pacer::for_bitrate(bitrate_bps),
+            last_frame: None,
+            _timers: crate::timer::FineTimers::new(),
+        }
+    }
+
+    /// Sends one frame, paced. Waits when the connection is congested, so
+    /// a slow network slows the host down instead of dropping packets here.
     pub async fn send(&mut self, conn: &Connection, frame: &VideoFrame) -> Result<()> {
         let bytes = hext_proto::encode(frame)?;
         let max = conn
@@ -142,8 +229,16 @@ impl VideoSender {
             .ok_or_else(|| NetError::Unexpected("o outro lado não aceita datagramas".into()))?;
         let shard = max.saturating_sub(PACKET_OVERHEAD);
         self.last_frame = Some(frame.seq);
-        for packet in self.packetizer.packetize(frame.seq, &bytes, shard) {
+        let packets = self
+            .packetizer
+            .packetize(frame.seq, &bytes, shard, frame.keyframe);
+        self.pacer.begin_frame(Instant::now());
+        for packet in packets {
             let datagram = hext_proto::encode(&Datagram::Video(packet))?;
+            let at = self.pacer.reserve(datagram.len(), Instant::now());
+            if at > Instant::now() {
+                tokio::time::sleep_until(at.into()).await;
+            }
             match conn.send_datagram_wait(datagram.into()).await {
                 Ok(()) => {}
                 // The path MTU shrank mid-frame: this frame is lost (the
@@ -480,7 +575,7 @@ mod tests {
     }
 
     fn packets(f: &VideoFrame) -> Vec<VideoPacket> {
-        Packetizer::default().packetize(f.seq, &hext_proto::encode(f).unwrap(), 1100)
+        Packetizer::default().packetize(f.seq, &hext_proto::encode(f).unwrap(), 1100, f.keyframe)
     }
 
     fn frames(events: &[Event]) -> Vec<u64> {
@@ -504,7 +599,7 @@ mod tests {
         let expected: usize = (0..blocks)
             .map(|b| {
                 let k = (data_shards - b * BLOCK_SIZE).min(BLOCK_SIZE);
-                k + parity_for(k)
+                k + parity_for(k, true)
             })
             .sum();
         assert_eq!(pkts.len(), expected);
@@ -516,9 +611,10 @@ mod tests {
             pkts.iter()
                 .all(|p| p.data.len() == 1100 && p.len as usize == bytes)
         );
-        // 20% parity, at least one per block.
-        assert_eq!(parity_for(64), 13);
-        assert_eq!(parity_for(1), 1);
+        // 20% parity (40% in keyframes), at least one per block.
+        assert_eq!(parity_for(64, false), 13);
+        assert_eq!(parity_for(64, true), 26);
+        assert_eq!(parity_for(1, false), 1);
     }
 
     #[test]
@@ -810,5 +906,88 @@ mod tests {
         let mut p = packets(&frame(0, true, 2_000)).remove(0);
         p.len = u32::MAX;
         assert!(r.push(p, now).is_empty());
+    }
+
+    #[test]
+    fn keyframes_carry_more_parity() {
+        let packets_of = |keyframe| packets(&frame(0, keyframe, 50_000)).len();
+        let data = (hext_proto::encode(&frame(0, false, 50_000)).unwrap().len()).div_ceil(1100);
+        assert_eq!(packets_of(false), data + parity_for(data, false));
+        assert_eq!(packets_of(true), data + parity_for(data, true));
+
+        // A quarter of the packets lost: a keyframe survives; with the usual
+        // parity it would not.
+        let lose = |i: usize| i.is_multiple_of(4);
+        let (events, counters) = deliver_with_loss(&frame(0, true, 50_000), lose);
+        assert_eq!(frames(&events), vec![0]);
+        assert!(counters.recovered > 0);
+        let usual = data + parity_for(data, false);
+        assert!(usual.div_ceil(4) > parity_for(data, false));
+    }
+
+    #[test]
+    fn pacer_sends_a_small_frame_at_once() {
+        let mut pacer = Pacer::new(32_000_000); // 4 MB/s: 4 ms is 16 kB
+        let now = Instant::now() + Duration::from_secs(1);
+        pacer.begin_frame(now);
+        for _ in 0..14 {
+            assert!(pacer.reserve(1100, now) <= now);
+        }
+    }
+
+    #[test]
+    fn pacer_spreads_a_large_frame() {
+        let mut pacer = Pacer::new(32_000_000);
+        let now = Instant::now() + Duration::from_secs(1);
+        // 200 kB: 50 ms at 4 MB/s, the first 4 ms of it at once.
+        pacer.begin_frame(now);
+        let last = (0..200).map(|_| pacer.reserve(1000, now)).last().unwrap();
+        let spread = last.duration_since(now);
+        assert!(
+            spread > Duration::from_millis(44) && spread < Duration::from_millis(47),
+            "{spread:?}"
+        );
+    }
+
+    #[test]
+    fn pacer_catches_up_after_a_late_wakeup() {
+        let mut pacer = Pacer::new(8_000_000); // 1 MB/s: 1 ms per kB
+        let start = Instant::now() + Duration::from_secs(1);
+        pacer.begin_frame(start);
+        let first = (0..10).map(|_| pacer.reserve(1000, start)).last().unwrap();
+        assert!(first > start);
+        // Woken 10 ms late: what was due goes out now, the rest stays paced.
+        let late = first + Duration::from_millis(10);
+        let due = (0..30)
+            .map(|_| pacer.reserve(1000, late))
+            .filter(|&at| at <= late)
+            .count();
+        assert_eq!(due, 10);
+        // Much later (the connection was congested): only some is made up.
+        let stalled = late + Duration::from_secs(1);
+        let due = (0..30)
+            .map(|_| pacer.reserve(1000, stalled))
+            .filter(|&at| at <= stalled)
+            .count();
+        assert_eq!(due, 17, "16 ms at 1 kB/ms, plus the packet due now");
+    }
+
+    #[test]
+    fn pacer_credit_does_not_build_up() {
+        let mut pacer = Pacer::new(8_000_000);
+        let start = Instant::now() + Duration::from_secs(1);
+        pacer.begin_frame(start);
+        pacer.reserve(1000, start);
+        // A long pause gives only the burst credit, not the whole pause.
+        let later = start + Duration::from_secs(10);
+        pacer.begin_frame(later);
+        let at_once = (0..100)
+            .map(|_| pacer.reserve(1000, later))
+            .filter(|&at| at <= later)
+            .count();
+        assert_eq!(
+            at_once, 5,
+            "4 ms credit at 1 kB/ms, plus the packet at `later`"
+        );
     }
 }
