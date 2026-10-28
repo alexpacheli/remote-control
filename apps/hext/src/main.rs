@@ -4,6 +4,7 @@
 //! host's screen and forwards mouse and keyboard. The desktop UI (Tauri)
 //! replaces the command line later.
 
+mod bench;
 mod host;
 mod viewer;
 
@@ -33,6 +34,24 @@ enum Command {
     Host(HostArgs),
     /// Abre a tela de um host e controla mouse e teclado.
     View(ViewArgs),
+    /// Mede o tempo de codificação de vídeo com uma imagem da tela (macOS).
+    Bench(BenchArgs),
+}
+
+#[derive(clap::Args)]
+struct BenchArgs {
+    /// Monitor a capturar (0 = principal).
+    #[arg(long, default_value_t = 0)]
+    display: usize,
+    /// Quadros por configuração.
+    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u32).range(20..=10_000))]
+    frames: u32,
+    /// Taxa de bits do vídeo, em Mbps.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=200))]
+    bitrate_mbps: u32,
+    /// Quadros por segundo (o ritmo do host).
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
+    fps: u32,
 }
 
 #[derive(clap::Args)]
@@ -124,6 +143,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Host(args) => tokio::runtime::Runtime::new()?.block_on(host::run(args)),
         Command::View(args) => viewer::run(args),
+        Command::Bench(args) => bench::run(&args),
     }
 }
 

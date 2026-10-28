@@ -32,30 +32,35 @@ use objc2_core_media::{
     kCMVideoCodecType_H264,
 };
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-    CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
-    kCVImageBufferColorPrimaries_SMPTE_C, kCVImageBufferTransferFunction_ITU_R_709_2,
-    kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVPixelBufferHeightKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
-    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferPool,
+    CVPixelBufferUnlockBaseAddress, kCVImageBufferColorPrimaries_SMPTE_C,
+    kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVReturnSuccess,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxFrameDelayCount,
-    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
-    kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
-    kVTCompressionPropertyKey_YCbCrMatrix, kVTEncodeFrameOptionKey_ForceKeyFrame,
-    kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+    kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
+    kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
+    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Baseline_AutoLevel,
+    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
 use crate::h264::{self, PROFILE_BASELINE};
+use crate::nv12::bgra_to_nv12;
 use crate::{
-    CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge, profile_error,
+    CodecError, Encoded, EncoderSettings, SoftwareEncoder, VideoEncoder, check_frame, merge,
+    profile_error,
 };
 
 /// A keyframe at least every minute (frames are only encoded when the screen
@@ -72,6 +77,27 @@ const PROBE_SIZE: (u32, u32) = (640, 480);
 
 fn status_error(context: &str, status: i32) -> CodecError {
     CodecError::Hardware(format!("{context}: OSStatus {status}"))
+}
+
+/// Session options that trade speed against other things; the host uses
+/// [`Tuning::HOST`], and [`benchmark`] compares the alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tuning {
+    /// Low-latency rate control.
+    low_latency: bool,
+    /// Input in NV12 (converted beforehand) instead of BGRA (converted by
+    /// VideoToolbox).
+    nv12: bool,
+    /// `PrioritizeEncodingSpeedOverQuality`.
+    speed: bool,
+}
+
+impl Tuning {
+    const HOST: Self = Self {
+        low_latency: true,
+        nv12: false,
+        speed: false,
+    };
 }
 
 pub struct VtEncoder {
@@ -145,6 +171,8 @@ impl Timings {
 struct Session {
     width: u32,
     height: u32,
+    /// Input is NV12 rather than BGRA.
+    nv12: bool,
     session: CFRetained<VTCompressionSession>,
     /// Shared with the output callback through its refcon pointer: boxed so
     /// its address is stable, and outlives the session (see `Drop`).
@@ -236,11 +264,15 @@ impl Session {
         width: u32,
         height: u32,
     ) -> Result<(Self, bool), CodecError> {
-        match Self::open(settings, width, height, true) {
+        match Self::open(settings, width, height, Tuning::HOST) {
             Ok(session) => Ok((session, true)),
             Err(e) => {
                 tracing::debug!("VideoToolbox sem baixa latência em {width}x{height}: {e}");
-                Ok((Self::open(settings, width, height, false)?, false))
+                let tuning = Tuning {
+                    low_latency: false,
+                    ..Tuning::HOST
+                };
+                Ok((Self::open(settings, width, height, tuning)?, false))
             }
         }
     }
@@ -249,22 +281,27 @@ impl Session {
         settings: &EncoderSettings,
         width: u32,
         height: u32,
-        low_latency: bool,
+        tuning: Tuning,
     ) -> Result<Self, CodecError> {
         let outputs: Box<Outputs> = Box::default();
         let yes: &CFType = CFBoolean::new(true);
 
         let mut spec_keys =
             vec![unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder }];
-        if low_latency {
+        if tuning.low_latency {
             spec_keys.push(unsafe { kVTVideoEncoderSpecification_EnableLowLatencyRateControl });
         }
         let spec_values = vec![yes; spec_keys.len()];
         let spec = CFDictionary::<CFString, CFType>::from_slices(&spec_keys, &spec_values);
 
-        // The pool hands out IOSurface-backed BGRA buffers the media engine
-        // reads directly.
-        let format = CFNumber::new_i32(kCVPixelFormatType_32BGRA as i32);
+        // The pool hands out IOSurface-backed buffers the media engine reads
+        // directly.
+        let pixel_format = if tuning.nv12 {
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        } else {
+            kCVPixelFormatType_32BGRA
+        };
+        let format = CFNumber::new_i32(pixel_format as i32);
         let (w, h) = (
             CFNumber::new_i32(width as i32),
             CFNumber::new_i32(height as i32),
@@ -313,6 +350,7 @@ impl Session {
         let this = Self {
             width,
             height,
+            nv12: tuning.nv12,
             session,
             outputs,
             started: Instant::now(),
@@ -321,6 +359,12 @@ impl Session {
             timings: Timings::default(),
         };
         this.configure(settings, fps)?;
+        if tuning.speed {
+            this.set(
+                unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
+                CFBoolean::new(true),
+            );
+        }
         let status = unsafe { this.session.prepare_to_encode_frames() };
         if status != 0 {
             return Err(status_error("PrepareToEncodeFrames", status));
@@ -393,11 +437,12 @@ impl Session {
         status == 0
     }
 
-    fn encode(&mut self, bgra: &[u8], keyframe: bool) -> Result<Option<Encoded>, CodecError> {
+    /// Encodes one image: BGRA, or NV12 if the session was opened for it.
+    fn encode(&mut self, image: &[u8], keyframe: bool) -> Result<Option<Encoded>, CodecError> {
         let started = Instant::now();
         let pixels = self.pixel_buffer()?;
         let buffered = Instant::now();
-        copy_into(&pixels, self.width, self.height, bgra)?;
+        copy_into(&pixels, self.width, self.height, image, self.nv12)?;
         let copied = Instant::now();
 
         let pts = unsafe { CMTime::new(self.next_pts(), TIMESCALE) };
@@ -484,15 +529,16 @@ impl Drop for Session {
     }
 }
 
-/// Copies tightly packed BGRA rows into a (possibly padded) pixel buffer.
+/// Copies a tightly packed BGRA or NV12 image into a (possibly padded)
+/// pixel buffer of the same format.
 fn copy_into(
     pixels: &CVPixelBuffer,
     width: u32,
     height: u32,
-    bgra: &[u8],
+    image: &[u8],
+    nv12: bool,
 ) -> Result<(), CodecError> {
     let (width, height) = (width as usize, height as usize);
-    let row_len = width * 4;
     if CVPixelBufferGetWidth(pixels) < width || CVPixelBufferGetHeight(pixels) < height {
         return Err(CodecError::Hardware(
             "pixel buffer menor que a imagem".into(),
@@ -502,22 +548,51 @@ fn copy_into(
     if status != kCVReturnSuccess {
         return Err(status_error("CVPixelBufferLockBaseAddress", status));
     }
-    let stride = CVPixelBufferGetBytesPerRow(pixels);
-    let base = CVPixelBufferGetBaseAddress(pixels).cast::<u8>();
-    let ok = !base.is_null() && stride >= row_len;
-    if ok {
-        for (y, row) in bgra.chunks_exact(row_len).take(height).enumerate() {
-            // SAFETY: the buffer is locked and holds at least `height` rows of
-            // `stride >= row_len` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(y * stride), row_len) };
-        }
-    }
+    let ok = if nv12 {
+        // Y plane, then the half-height interleaved UV plane.
+        let (y, uv) = image.split_at(width * height);
+        copy_plane(pixels, Some(0), y, width, height)
+            && copy_plane(pixels, Some(1), uv, width, height / 2)
+    } else {
+        copy_plane(pixels, None, image, width * 4, height)
+    };
     unsafe { CVPixelBufferUnlockBaseAddress(pixels, CVPixelBufferLockFlags(0)) };
     if ok {
         Ok(())
     } else {
         Err(CodecError::Hardware("pixel buffer inacessível".into()))
     }
+}
+
+/// Copies `rows` rows of `row_len` bytes into a locked buffer's plane (or
+/// the whole buffer for a non-planar format). Returns false if it won't fit.
+fn copy_plane(
+    pixels: &CVPixelBuffer,
+    plane: Option<usize>,
+    src: &[u8],
+    row_len: usize,
+    rows: usize,
+) -> bool {
+    let (base, stride) = match plane {
+        Some(plane) => (
+            CVPixelBufferGetBaseAddressOfPlane(pixels, plane),
+            CVPixelBufferGetBytesPerRowOfPlane(pixels, plane),
+        ),
+        None => (
+            CVPixelBufferGetBaseAddress(pixels),
+            CVPixelBufferGetBytesPerRow(pixels),
+        ),
+    };
+    let base = base.cast::<u8>();
+    if base.is_null() || stride < row_len || src.len() < row_len * rows {
+        return false;
+    }
+    for (y, row) in src.chunks_exact(row_len).take(rows).enumerate() {
+        // SAFETY: the buffer is locked and this plane holds at least `rows`
+        // rows of `stride >= row_len` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(y * stride), row_len) };
+    }
+    true
 }
 
 /// Called by VideoToolbox for each encoded (or dropped) frame; with
@@ -634,6 +709,127 @@ fn annex_b(sample: &CMSampleBuffer) -> Result<Encoded, CodecError> {
     Ok(Encoded {
         data,
         keyframe: true,
+    })
+}
+
+/// Encode times of one configuration in [`benchmark`].
+#[derive(Debug, Clone, Copy)]
+pub struct BenchStats {
+    /// Frames that produced output (after the warm-up).
+    pub frames: u32,
+    pub avg_ms: f64,
+    pub p95_ms: f64,
+    /// Average encoded size.
+    pub avg_kb: f64,
+}
+
+/// Frames at the start of each configuration left out of the stats (the
+/// first keyframe, and the media engine ramping up its clock).
+const BENCH_WARMUP: u32 = 10;
+
+/// Encodes the same images with OpenH264 and with each VideoToolbox
+/// configuration, paced at `settings.max_fps` like the host, and reports
+/// how long one `encode` takes in each.
+///
+/// `image_at(t, buffer)` writes frame `t` (tightly packed BGRA) into
+/// `buffer`; producing it, and the NV12 conversion where needed, are not
+/// counted.
+pub fn benchmark(
+    settings: EncoderSettings,
+    width: u32,
+    height: u32,
+    frames: u32,
+    mut image_at: impl FnMut(u32, &mut Vec<u8>),
+) -> Vec<(String, Result<BenchStats, CodecError>)> {
+    let mut results = Vec::new();
+    let mut bgra = Vec::new();
+    let mut nv12 = Vec::new();
+    let mut yuv = None;
+    let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
+
+    let mut software = SoftwareEncoder::new(settings);
+    let stats = measure(frames, interval, |t| {
+        image_at(t, &mut bgra);
+        let started = Instant::now();
+        let encoded = software.encode(width, height, &bgra)?;
+        Ok((started.elapsed(), encoded))
+    });
+    results.push(("CPU (OpenH264), BGRA".to_owned(), stats));
+
+    for low_latency in [true, false] {
+        for nv12_input in [false, true] {
+            for speed in [false, true] {
+                let tuning = Tuning {
+                    low_latency,
+                    nv12: nv12_input,
+                    speed,
+                };
+                let label = format!(
+                    "GPU, {}, {}{}",
+                    if nv12_input { "NV12" } else { "BGRA" },
+                    if low_latency {
+                        "baixa latência"
+                    } else {
+                        "normal"
+                    },
+                    if speed { ", velocidade" } else { "" },
+                );
+                let stats =
+                    Session::open(&settings, width, height, tuning).and_then(|mut session| {
+                        measure(frames, interval, |t| {
+                            image_at(t, &mut bgra);
+                            let image = if nv12_input {
+                                bgra_to_nv12(width, height, &bgra, &mut yuv, &mut nv12);
+                                &nv12
+                            } else {
+                                &bgra
+                            };
+                            let started = Instant::now();
+                            let encoded = session.encode(image, t == 0)?;
+                            Ok((started.elapsed(), encoded))
+                        })
+                    });
+                results.push((label, stats));
+            }
+        }
+    }
+    results
+}
+
+/// Runs `encode_frame(t)` for `frames` frames, one every `interval`, and
+/// summarizes the times it reports.
+fn measure(
+    frames: u32,
+    interval: Duration,
+    mut encode_frame: impl FnMut(u32) -> Result<(Duration, Option<Encoded>), CodecError>,
+) -> Result<BenchStats, CodecError> {
+    let start = Instant::now();
+    let mut times = Vec::new();
+    let mut bytes = 0usize;
+    for t in 0..frames {
+        let due = start + interval * t;
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let (time, encoded) = encode_frame(t)?;
+        if let Some(encoded) = encoded
+            && t >= BENCH_WARMUP
+        {
+            times.push(time);
+            bytes += encoded.data.len();
+        }
+    }
+    if times.is_empty() {
+        return Err(CodecError::Hardware("nenhum quadro codificado".into()));
+    }
+    times.sort();
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let n = times.len();
+    Ok(BenchStats {
+        frames: n as u32,
+        avg_ms: ms(times.iter().sum::<Duration>()) / n as f64,
+        p95_ms: ms(times[(n * 95 / 100).min(n - 1)]),
+        avg_kb: bytes as f64 / 1024.0 / n as f64,
     })
 }
 

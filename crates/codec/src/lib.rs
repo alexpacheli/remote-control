@@ -24,6 +24,8 @@ mod vt;
 
 pub use nv12::bgra_to_nv12;
 pub use software::SoftwareEncoder;
+#[cfg(target_os = "macos")]
+pub use vt::{BenchStats, benchmark};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
