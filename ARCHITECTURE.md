@@ -345,6 +345,7 @@ crates/
   render/                  # wgpu: vídeo, cursor local, overlay de estatísticas
   session/                 # orquestração host/cliente, canais, permissões
   crypto/                  # chaves de dispositivo, PAKE, fingerprints
+  signal/                  # sinalização: IDs, mensagens app ↔ servidor, cliente WSS
   platform-windows/        # serviço, agent, secure desktop, SendSAS
   platform-macos/          # LaunchDaemon/Agent, TCC
 apps/

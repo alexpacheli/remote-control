@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 hext-crypto = { path = "crates/crypto" }
+hext-signal = { path = "crates/signal" }
 hext-proto = { path = "crates/proto" }
 hext-net = { path = "crates/net" }
 hext-metrics = { path = "crates/metrics" }
@@ -20,8 +21,10 @@ hext-render = { path = "crates/render" }
 hext-session = { path = "crates/session" }
 
 anyhow = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.6", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 gethostname = "1.1"
 hex = "0.4"
 # Software H.264 (Cisco OpenH264, built from source): encoder and decoder fallback.
@@ -32,13 +35,18 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # Forward error correction for video datagrams.
 reed-solomon-erasure = "6"
+# SQLite compiled in (no system library): the server's database.
+rusqlite = { version = "0.41", features = ["bundled"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
+serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
+# WebSocket client for signaling; TLS through our rustls (ring) config.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.8"
