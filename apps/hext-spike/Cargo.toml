@@ -11,7 +11,7 @@ anyhow.workspace = true
 clap.workspace = true
 hext-net.workspace = true
 hext-proto.workspace = true
-iroh = "1.4"
+iroh = { version = "1.4", features = ["unstable-net-report"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

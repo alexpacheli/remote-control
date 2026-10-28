@@ -22,7 +22,7 @@ use hext_net::video::{Event, Packetizer, Reassembler};
 use hext_proto::{Datagram, VideoFrame};
 use iroh::endpoint::presets::{self, Preset};
 use iroh::endpoint::{Connection, QuicTransportConfig};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, Watcher as _};
 use tokio::sync::Mutex;
 
 const ALPN: &[u8] = b"hext/spike/1";
@@ -86,6 +86,8 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         seconds: u64,
     },
+    /// Diagnóstico da rede deste computador: UDP, endereço público e tipo de NAT.
+    Netcheck,
 }
 
 /// Synthetic video shape.
@@ -136,6 +138,7 @@ async fn main() -> Result<()> {
             view(&endpoint, id.into(), Duration::from_secs(seconds)).await?;
             endpoint.close().await;
         }
+        Command::Netcheck => netcheck().await?,
     }
     Ok(())
 }
@@ -394,6 +397,64 @@ async fn view(endpoint: &Endpoint, host: EndpointAddr, duration: Duration) -> Re
         println!("nunca ficou direto: tudo passou pelo relay");
     }
     Ok(total)
+}
+
+/// Asks the relays (n0's, several around the world) how this network's NAT
+/// behaves: a NAT that changes the public port per destination ("symmetric")
+/// defeats hole punching, whatever the library.
+async fn netcheck() -> Result<()> {
+    let endpoint = endpoint(presets::N0, false, None, false).await?;
+    println!("testando a rede (alguns segundos)...");
+    let mut watcher = endpoint.net_report();
+    let report = tokio::time::timeout(Duration::from_secs(20), watcher.initialized())
+        .await
+        .context("sem resposta dos relays em 20 s (UDP e HTTPS bloqueados?)")?;
+    // A second round has more probes behind it.
+    let report = tokio::time::timeout(Duration::from_secs(8), watcher.updated())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .unwrap_or(report);
+
+    println!("UDP IPv4: {}", yes_no(report.udp_v4));
+    println!("UDP IPv6: {}", yes_no(report.udp_v6));
+    println!(
+        "endereço público IPv4: {}",
+        report.global_v4.map_or("—".to_owned(), |a| a.to_string())
+    );
+    let symmetric = report.mapping_varies_by_dest();
+    println!(
+        "porta pública muda conforme o destino (NAT simétrico): {}",
+        symmetric.map_or("não deu para medir", |v| if v { "SIM" } else { "não" })
+    );
+    println!(
+        "relay mais próximo: {}",
+        report
+            .preferred_relay
+            .map_or("—".to_owned(), |r| r.to_string())
+    );
+    println!("portal cativo: {:?}", report.captive_portal);
+    println!();
+    if !report.udp_v4 && !report.udp_v6 {
+        println!("=> UDP bloqueado nesta rede: só o relay (HTTPS) funciona daqui.");
+    } else if symmetric == Some(true) {
+        println!(
+            "=> NAT simétrico: conexão direta com outra rede é improvável a partir daqui; \
+             vai pelo relay."
+        );
+    } else {
+        println!(
+            "=> NAT favorável: conexão direta deve funcionar, \
+             se o outro lado também for e nenhum firewall local bloquear."
+        );
+    }
+    endpoint.close().await;
+    Ok(())
+}
+
+fn yes_no(v: bool) -> &'static str {
+    if v { "sim" } else { "NÃO" }
 }
 
 /// The selected path: "direto <addr>" or "relay <url>", with its RTT.
