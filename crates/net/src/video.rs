@@ -52,6 +52,9 @@ pub const PACING_BURST: Duration = Duration::from_millis(4);
 /// Windows by default); beyond that the frame is sent slower.
 const PACING_CATCH_UP: Duration = Duration::from_millis(16);
 
+/// A send that waited this long was held back by congestion control.
+const SEND_STALL: Duration = Duration::from_millis(1);
+
 /// How long a missing frame may go without receiving a packet, while newer
 /// frames exist (packets can arrive out of order), before it counts as lost.
 pub const LOSS_WAIT: Duration = Duration::from_millis(40);
@@ -199,6 +202,12 @@ impl Pacer {
         self.next = Some(at + Duration::from_secs_f64(len as f64 / self.bytes_per_sec));
         at
     }
+
+    /// Sending was held back (congestion) until `now`: the time lost is
+    /// not made up, which would be a burst into a congested path.
+    pub fn stalled(&mut self, now: Instant) {
+        self.next = Some(self.next.map_or(now, |next| next.max(now)));
+    }
 }
 
 /// Sends frames as video datagrams (host side).
@@ -206,7 +215,8 @@ pub struct VideoSender {
     packetizer: Packetizer,
     pacer: Pacer,
     last_frame: Option<u64>,
-    _timers: crate::timer::FineTimers,
+    /// Held while frames flow, released while the screen is still.
+    timers: Option<crate::timer::FineTimers>,
 }
 
 impl VideoSender {
@@ -216,7 +226,7 @@ impl VideoSender {
             packetizer: Packetizer::default(),
             pacer: Pacer::for_bitrate(bitrate_bps),
             last_frame: None,
-            _timers: crate::timer::FineTimers::new(),
+            timers: None,
         }
     }
 
@@ -232,14 +242,22 @@ impl VideoSender {
         let packets = self
             .packetizer
             .packetize(frame.seq, &bytes, shard, frame.keyframe);
+        self.timers
+            .get_or_insert_with(crate::timer::FineTimers::new);
         self.pacer.begin_frame(Instant::now());
         for packet in packets {
             let datagram = hext_proto::encode(&Datagram::Video(packet))?;
-            let at = self.pacer.reserve(datagram.len(), Instant::now());
-            if at > Instant::now() {
+            let now = Instant::now();
+            let at = self.pacer.reserve(datagram.len(), now);
+            if at > now {
                 tokio::time::sleep_until(at.into()).await;
             }
-            match conn.send_datagram_wait(datagram.into()).await {
+            let before = Instant::now();
+            let sent = conn.send_datagram_wait(datagram.into()).await;
+            if before.elapsed() > SEND_STALL {
+                self.pacer.stalled(Instant::now());
+            }
+            match sent {
                 Ok(()) => {}
                 // The path MTU shrank mid-frame: this frame is lost (the
                 // viewer asks for a keyframe), the next one uses the new size.
@@ -253,7 +271,8 @@ impl VideoSender {
     /// While nothing changes on screen: tells the viewer which frame was the
     /// last, so it notices if that one never arrived. Call every few
     /// hundred milliseconds without frames.
-    pub async fn send_idle(&self, conn: &Connection) -> Result<()> {
+    pub async fn send_idle(&mut self, conn: &Connection) -> Result<()> {
+        self.timers = None;
         let Some(last_frame) = self.last_frame else {
             return Ok(());
         };
@@ -632,9 +651,16 @@ mod tests {
     }
 
     /// Feeds `f`'s packets except those `lose` picks; returns the events.
+    /// Delivers `f` (after the keyframe it follows, if it is not one)
+    /// without the packets `lose` picks.
     fn deliver_with_loss(f: &VideoFrame, lose: impl Fn(usize) -> bool) -> (Vec<Event>, Counters) {
         let mut r = Reassembler::new();
         let now = Instant::now();
+        if !f.keyframe {
+            for p in packets(&frame(f.seq - 1, true, 1_000)) {
+                r.push(p, now);
+            }
+        }
         let events = packets(f)
             .into_iter()
             .enumerate()
@@ -646,7 +672,7 @@ mod tests {
 
     #[test]
     fn fec_rebuilds_random_loss() {
-        let f = frame(0, true, 300_000);
+        let f = frame(1, false, 300_000);
         // ~10% loss, deterministic (a simple LCG).
         let lose = |i: usize| (i.wrapping_mul(2_654_435_761) >> 7).is_multiple_of(10);
         let (events, counters) = deliver_with_loss(&f, lose);
@@ -659,7 +685,7 @@ mod tests {
     fn interleaving_spreads_a_burst() {
         // 20 packets in a row: one block alone could not rebuild that many
         // (13 parity), but interleaved they hit every block, 4-5 each.
-        let f = frame(0, true, 300_000);
+        let f = frame(1, false, 300_000);
         let (events, counters) = deliver_with_loss(&f, |i| (100..120).contains(&i));
         assert_eq!(events, vec![Event::Frame(f)]);
         // Blocks that only lost parity need no rebuilding.
@@ -668,9 +694,11 @@ mod tests {
 
     #[test]
     fn too_much_loss_is_not_a_frame() {
-        let f = frame(0, true, 300_000);
-        let (events, _) = deliver_with_loss(&f, |i| i.is_multiple_of(3));
-        assert!(events.is_empty());
+        for keyframe in [false, true] {
+            let f = frame(1, keyframe, 300_000);
+            let (events, _) = deliver_with_loss(&f, |i| i.is_multiple_of(2));
+            assert!(events.is_empty(), "keyframe: {keyframe}");
+        }
     }
 
     #[test]
@@ -915,14 +943,14 @@ mod tests {
         assert_eq!(packets_of(false), data + parity_for(data, false));
         assert_eq!(packets_of(true), data + parity_for(data, true));
 
-        // A quarter of the packets lost: a keyframe survives; with the usual
-        // parity it would not.
+        // A quarter of the packets lost: a keyframe survives, a frame with
+        // the usual parity does not.
         let lose = |i: usize| i.is_multiple_of(4);
-        let (events, counters) = deliver_with_loss(&frame(0, true, 50_000), lose);
-        assert_eq!(frames(&events), vec![0]);
+        let (events, counters) = deliver_with_loss(&frame(1, true, 50_000), lose);
+        assert_eq!(frames(&events), vec![1]);
         assert!(counters.recovered > 0);
-        let usual = data + parity_for(data, false);
-        assert!(usual.div_ceil(4) > parity_for(data, false));
+        let (events, _) = deliver_with_loss(&frame(1, false, 50_000), lose);
+        assert!(frames(&events).is_empty());
     }
 
     #[test]
@@ -970,6 +998,22 @@ mod tests {
             .filter(|&at| at <= stalled)
             .count();
         assert_eq!(due, 17, "16 ms at 1 kB/ms, plus the packet due now");
+    }
+
+    #[test]
+    fn pacer_does_not_burst_after_congestion() {
+        let mut pacer = Pacer::new(8_000_000);
+        let start = Instant::now() + Duration::from_secs(1);
+        pacer.begin_frame(start);
+        pacer.reserve(1000, start);
+        // The connection held the next packet back for 30 ms.
+        let unblocked = start + Duration::from_millis(30);
+        pacer.stalled(unblocked);
+        let due = (0..30)
+            .map(|_| pacer.reserve(1000, unblocked))
+            .filter(|&at| at <= unblocked)
+            .count();
+        assert_eq!(due, 1);
     }
 
     #[test]
