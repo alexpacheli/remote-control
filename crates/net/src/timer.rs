@@ -5,7 +5,7 @@
 //! Windows 10 2004) keeps packets spread. Elsewhere timers are already fine.
 
 /// Holds the finer timer resolution while it lives.
-pub(crate) struct FineTimers {
+pub struct FineTimers {
     #[cfg(windows)]
     active: bool,
 }
@@ -23,7 +23,7 @@ mod imp {
     };
 
     impl super::FineTimers {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             // Windows 11 ignores the request while the process has no
             // visible window (a minimized host) unless told otherwise.
             static KEEP_RESOLUTION: Once = Once::new();
@@ -60,7 +60,7 @@ mod imp {
 
 #[cfg(not(windows))]
 impl FineTimers {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {}
     }
 }
