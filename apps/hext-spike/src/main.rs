@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hext_net::video::{Event, Packetizer, Reassembler};
+use hext_net::timer::FineTimers;
+use hext_net::video::{Event, Pacer, Packetizer, Reassembler};
 use hext_proto::{Datagram, VideoFrame};
 use iroh::endpoint::presets::{self, Preset};
 use iroh::endpoint::{Connection, QuicTransportConfig};
@@ -65,6 +66,9 @@ enum Command {
         /// Um keyframe (10× maior) a cada tantos segundos.
         #[arg(long, default_value_t = 2)]
         keyframe_secs: u32,
+        /// Manda cada quadro de uma vez, sem pacing (como antes), para comparar.
+        #[arg(long)]
+        no_pacing: bool,
         /// Só pelo relay (sem conexão direta), para medir o pior caso.
         #[arg(long)]
         relay_only: bool,
@@ -96,6 +100,7 @@ struct Video {
     fps: u32,
     mbps: f64,
     keyframe_secs: u32,
+    pacing: bool,
 }
 
 #[tokio::main]
@@ -111,6 +116,7 @@ async fn main() -> Result<()> {
             fps,
             mbps,
             keyframe_secs,
+            no_pacing,
             relay_only,
             relay,
         } => {
@@ -124,6 +130,7 @@ async fn main() -> Result<()> {
                 fps,
                 mbps,
                 keyframe_secs,
+                pacing: !no_pacing,
             };
             host(&endpoint, video, None).await?;
             endpoint.close().await;
@@ -223,6 +230,9 @@ async fn host(endpoint: &Endpoint, video: Video, stop_after: Option<Duration>) -
     let p_frame = (video.mbps * 1_000_000.0 / 8.0 / f64::from(fps)) as usize;
     let keyframe_every = u64::from(fps * video.keyframe_secs.max(1));
     let mut packetizer = Packetizer::default();
+    // As in the app: packets paced at a few times the bitrate, on fine timers.
+    let mut pacer = Pacer::for_bitrate((video.mbps * 1_000_000.0) as u32);
+    let _timers = FineTimers::new();
     let mut rng = 0x2545_f491_4f6c_dd1d_u64;
     let (mut seq, mut frames, mut bytes, mut skipped) = (0u64, 0u32, 0usize, 0u32);
     let started = Instant::now();
@@ -266,9 +276,17 @@ async fn host(endpoint: &Endpoint, video: Video, stop_after: Option<Duration>) -
             .context("o outro lado não aceita datagramas")?
             .min(MAX_DATAGRAM);
         sent_at.lock().await.insert(seq, Instant::now());
-        for packet in packetizer.packetize(seq, &encoded, max.saturating_sub(OVERHEAD)) {
+        pacer.begin_frame(Instant::now());
+        for packet in packetizer.packetize(seq, &encoded, max.saturating_sub(OVERHEAD), key) {
             let mut datagram = vec![TAG_VIDEO];
             datagram.extend(hext_proto::encode(&Datagram::Video(packet))?);
+            if video.pacing {
+                let now = Instant::now();
+                let at = pacer.reserve(datagram.len(), now);
+                if at > now {
+                    tokio::time::sleep_until(at.into()).await;
+                }
+            }
             conn.send_datagram_wait(datagram.into()).await?;
         }
         frames += 1;
@@ -492,6 +510,7 @@ mod tests {
             fps: 30,
             mbps: 2.0,
             keyframe_secs: 1,
+            pacing: true,
         };
         let host_task = tokio::spawn(async move {
             let acked = host(&host_ep, video, Some(Duration::from_secs(3))).await;
