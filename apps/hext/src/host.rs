@@ -4,11 +4,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use hext_codec::{EncoderPreference, EncoderSettings};
-use hext_crypto::FileKeyStore;
 use hext_net::{Identity, NetError};
 use hext_proto::{PeerInfo, RejectReason};
-use hext_session::SessionError;
 use hext_session::host::{self, HostConfig};
+use hext_session::{SessionCodes, SessionError};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -19,7 +18,8 @@ use crate::{APP_VERSION, CodecChoice, HostArgs, device_name, exe_name};
 const WRONG_CODE_PENALTY: Duration = Duration::from_secs(1);
 
 pub async fn run(args: HostArgs) -> Result<()> {
-    let identity = device_identity(args.device_key.as_deref())?;
+    let key = Arc::new(crate::device_key(args.device_key.as_deref())?);
+    let identity = Identity::from_device_key(&key)?;
     let endpoint = hext_net::host_endpoint(args.listen, &identity)?;
     let code = match args.code {
         Some(code) => code,
@@ -54,11 +54,19 @@ pub async fn run(args: HostArgs) -> Result<()> {
         exe_name(),
         identity.fingerprint()
     );
+    if let Some(server) = &args.server {
+        println!(
+            "  ou, pelo ID (mostrado abaixo): {} view <ID> --server {server}",
+            exe_name()
+        );
+    }
     println!();
 
+    let session_codes = SessionCodes::default();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local(APP_VERSION, device_name()),
         access_code: code,
+        session_codes: session_codes.clone(),
         display: args.display,
         test_pattern: args.test_pattern,
         encoder: EncoderSettings {
@@ -74,6 +82,24 @@ pub async fn run(args: HostArgs) -> Result<()> {
     // One session at a time, handshake included: attempts are serialized,
     // which together with the penalty rate-limits code guessing.
     let slot = Arc::new(Semaphore::new(1));
+
+    if let Some(server) = args.server.clone() {
+        // Viewers accepted through the server connect to this address: the
+        // one listened on, or this machine's LAN address when listening on all.
+        let ip = match args.listen.ip() {
+            ip if ip.is_unspecified() => local_ip().unwrap_or(ip),
+            ip => ip,
+        };
+        let addr = SocketAddr::new(ip, port);
+        tokio::spawn(crate::signaling::host(
+            server,
+            key.clone(),
+            device_name(),
+            addr,
+            session_codes,
+            slot.clone(),
+        ));
+    }
 
     loop {
         tokio::select! {
@@ -108,23 +134,6 @@ pub async fn run(args: HostArgs) -> Result<()> {
     endpoint.close(0u32.into(), b"host encerrado");
     endpoint.wait_idle().await;
     Ok(())
-}
-
-/// The TLS identity from this computer's key, created on first run. The
-/// fingerprint stays the same between runs, so viewers can keep it.
-fn device_identity(path: Option<&std::path::Path>) -> Result<Identity> {
-    let store = match path {
-        Some(path) => FileKeyStore::new(path),
-        None => FileKeyStore::default_location()?,
-    };
-    let (key, created) = hext_crypto::load_or_create(&store)?;
-    if created {
-        info!(
-            "chave deste computador criada em {}",
-            store.path().display()
-        );
-    }
-    Ok(Identity::from_device_key(&key)?)
 }
 
 /// A random 9-digit code, like "482913557".

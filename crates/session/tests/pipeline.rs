@@ -25,6 +25,7 @@ async fn start_host() -> (
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
         access_code: CODE.into(),
+        session_codes: Default::default(),
         display: 0,
         test_pattern: true,
         encoder: EncoderSettings::default(),
@@ -93,6 +94,7 @@ async fn host_ending_the_session_is_not_an_error() {
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
         access_code: CODE.into(),
+        session_codes: Default::default(),
         display: 0,
         test_pattern: true,
         encoder: EncoderSettings::default(),

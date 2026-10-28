@@ -6,6 +6,7 @@
 
 mod bench;
 mod host;
+mod signaling;
 mod viewer;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -81,6 +82,10 @@ struct HostArgs {
     /// fica na pasta de configurações do usuário.
     #[arg(long)]
     device_key: Option<std::path::PathBuf>,
+    /// Servidor de sinalização (ex.: wss://signal.hext.com.br): mostra o ID deste
+    /// computador e pergunta aqui se aceita cada pedido de acesso.
+    #[arg(long)]
+    server: Option<String>,
 }
 
 /// Which encoder (host) or decoder (viewer) to use.
@@ -96,11 +101,17 @@ enum CodecChoice {
 
 #[derive(clap::Args)]
 struct ViewArgs {
-    /// IP do host, com porta opcional (padrão 7420).
-    addr: String,
-    /// Código de acesso mostrado pelo host.
+    /// ID do host (com --server), ou o IP dele com porta opcional (padrão 7420).
+    target: String,
+    /// Código de acesso mostrado pelo host (para conectar pelo IP).
     #[arg(long)]
-    code: String,
+    code: Option<String>,
+    /// Servidor de sinalização, para conectar pelo ID (ex.: wss://signal.hext.com.br).
+    #[arg(long)]
+    server: Option<String>,
+    /// Arquivo da chave deste computador (criado na primeira execução).
+    #[arg(long)]
+    device_key: Option<std::path::PathBuf>,
     /// Impressão digital mostrada pelo host. Sem ela a conexão é cifrada mas não autenticada.
     #[arg(long)]
     fingerprint: Option<Fingerprint>,
@@ -153,6 +164,22 @@ fn main() -> Result<()> {
         Command::View(args) => viewer::run(args),
         Command::Bench(args) => bench::run(&args),
     }
+}
+
+/// This computer's key, created on first run.
+fn device_key(path: Option<&std::path::Path>) -> Result<hext_crypto::DeviceKey> {
+    let store = match path {
+        Some(path) => hext_crypto::FileKeyStore::new(path),
+        None => hext_crypto::FileKeyStore::default_location()?,
+    };
+    let (key, created) = hext_crypto::load_or_create(&store)?;
+    if created {
+        tracing::info!(
+            "chave deste computador criada em {}",
+            store.path().display()
+        );
+    }
+    Ok(key)
 }
 
 fn device_name() -> String {

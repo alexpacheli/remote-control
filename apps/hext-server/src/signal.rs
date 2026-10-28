@@ -399,13 +399,18 @@ async fn on_message(state: &State, me: &mut Session, msg: ClientMsg) -> Option<S
             .await
             .err()
             .map(|reason| ServerMsg::Rejected { request, reason }),
-        ClientMsg::Accept { request, addrs } => {
+        ClientMsg::Accept {
+            request,
+            addrs,
+            session_code,
+        } => {
             let p = take_mine(state, me, request)?;
             state.audit(p.viewer, p.host, "accepted");
             let accepted = ServerMsg::Accepted {
                 request: p.viewer_request,
                 host_key: me.key,
                 addrs: addrs.iter().take(16).map(|a| clean(a)).collect(),
+                session_code: clean(&session_code),
             };
             state.send_to(p.viewer, p.viewer_session, accepted).await;
             None

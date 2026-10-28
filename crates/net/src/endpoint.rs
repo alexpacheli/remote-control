@@ -5,8 +5,8 @@ use std::time::Duration;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::crypto::CryptoProvider;
 
-use crate::verify::PinnedVerifier;
-use crate::{Connection, Endpoint, Fingerprint, Identity, NetError, Result};
+use crate::verify::{HostPin, PinnedVerifier};
+use crate::{Connection, Endpoint, Identity, NetError, Result};
 
 /// SNI sent by clients. Hosts are authenticated by fingerprint, not by name.
 const SERVER_NAME: &str = "hext";
@@ -63,13 +63,13 @@ pub fn client_endpoint(remote: SocketAddr) -> Result<Endpoint> {
 pub async fn connect(
     endpoint: &Endpoint,
     addr: SocketAddr,
-    pin: Option<Fingerprint>,
+    pin: impl Into<HostPin>,
 ) -> Result<Connection> {
     let provider = provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedVerifier::new(pin, provider)))
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier::new(pin.into(), provider)))
         .with_no_client_auth();
     tls.alpn_protocols = vec![hext_proto::ALPN.to_vec()];
 

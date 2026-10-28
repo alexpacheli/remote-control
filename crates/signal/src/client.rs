@@ -4,12 +4,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hext_crypto::DeviceKey;
+use hext_crypto::{DeviceKey, PublicKey};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
-use crate::{ClientMsg, DeviceId, PROTOCOL, SIGNAL_PATH, ServerMsg, auth_message};
+use crate::{ClientMsg, DeviceId, PROTOCOL, Rejection, SIGNAL_PATH, ServerMsg, auth_message};
 
 /// How long logging in may take.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -36,10 +36,25 @@ pub enum ClientError {
 
 type Result<T, E = ClientError> = std::result::Result<T, E>;
 
+/// Longest wait for a host's answer (the server gives up sooner).
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// A logged-in connection to the server.
 pub struct Client {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     id: DeviceId,
+    next_request: u64,
+}
+
+/// A host's yes: what to expect and how to get in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+    /// The host's device key: pin it.
+    pub host_key: PublicKey,
+    /// Where it can be reached (`ip:port`).
+    pub addrs: Vec<String>,
+    /// Present it instead of an access code; good for one session.
+    pub session_code: String,
 }
 
 impl Client {
@@ -64,6 +79,7 @@ impl Client {
                 ws,
                 // Replaced once the server says.
                 id: DeviceId::new(DeviceId::MIN).expect("a valid ID"),
+                next_request: 1,
             };
             let nonce = match client.recv().await? {
                 ServerMsg::Challenge { protocol, nonce } if protocol == PROTOCOL => nonce,
@@ -98,6 +114,39 @@ impl Client {
     /// This device's ID.
     pub fn id(&self) -> DeviceId {
         self.id
+    }
+
+    /// Asks device `to` for access and waits for its user's answer (or the
+    /// server's: offline, timeout…).
+    pub async fn request_access(&mut self, to: DeviceId) -> Result<Result<Access, Rejection>> {
+        let request = self.next_request;
+        self.next_request += 1;
+        self.send(&ClientMsg::Connect { request, to }).await?;
+        let answer = async {
+            loop {
+                match self.recv().await? {
+                    ServerMsg::Accepted {
+                        request: r,
+                        host_key,
+                        addrs,
+                        session_code,
+                    } if r == request => {
+                        return Ok(Ok(Access {
+                            host_key,
+                            addrs,
+                            session_code,
+                        }));
+                    }
+                    ServerMsg::Rejected { request: r, reason } if r == request => {
+                        return Ok(Err(reason));
+                    }
+                    _ => {} // about something else
+                }
+            }
+        };
+        tokio::time::timeout(ANSWER_TIMEOUT, answer)
+            .await
+            .map_err(|_| ClientError::Timeout)?
     }
 
     pub async fn send(&mut self, msg: &ClientMsg) -> Result<()> {

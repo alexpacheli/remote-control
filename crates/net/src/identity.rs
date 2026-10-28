@@ -95,6 +95,11 @@ impl Identity {
         self.fingerprint
     }
 
+    /// Whether this identity's certificate is for `key` (its device key).
+    pub fn is_for(&self, key: &hext_crypto::PublicKey) -> bool {
+        crate::verify::certifies(&self.cert, key)
+    }
+
     pub(crate) fn key_der(&self) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Pkcs8(self.key.clone_key())
     }
@@ -128,6 +133,9 @@ mod tests {
         assert_eq!(first.cert, again.cert);
         let other = Identity::generate().unwrap();
         assert_ne!(first.fingerprint(), other.fingerprint());
+        // The certificate carries the device key, which is what viewers pin.
+        assert!(first.is_for(&key.public_key()));
+        assert!(!other.is_for(&key.public_key()));
     }
 
     /// The fingerprint viewers pin must not change when a dependency (rcgen,

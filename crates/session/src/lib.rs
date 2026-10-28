@@ -6,8 +6,10 @@
 
 pub mod client;
 pub mod host;
+mod session_codes;
 mod stats;
 
+pub use session_codes::SessionCodes;
 pub use stats::Stats;
 
 use hext_capture::CaptureError;

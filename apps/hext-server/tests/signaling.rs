@@ -86,6 +86,7 @@ async fn request_accept_and_decline() {
     host.send(&ClientMsg::Accept {
         request,
         addrs: vec!["192.168.0.10:7420".into()],
+        session_code: "s3cr3t".into(),
     })
     .await
     .unwrap();
@@ -95,6 +96,7 @@ async fn request_accept_and_decline() {
             request: 1,
             host_key: host_key.public_key(),
             addrs: vec!["192.168.0.10:7420".into()],
+            session_code: "s3cr3t".into(),
         }
     );
 
@@ -324,6 +326,7 @@ async fn unanswered_requests_time_out() {
     host.send(&ClientMsg::Accept {
         request,
         addrs: vec![],
+        session_code: String::new(),
     })
     .await
     .unwrap();
@@ -350,6 +353,7 @@ async fn only_the_host_can_answer() {
         .send(&ClientMsg::Accept {
             request,
             addrs: vec!["evil:1".into()],
+            session_code: "x".into(),
         })
         .await
         .unwrap();

@@ -19,6 +19,7 @@ pub use session::{
     ControlStream, FramedRecv, FramedSend, accept_uni, client_handshake, host_handshake, open_uni,
     recv_datagram, send_datagram,
 };
+pub use verify::HostPin;
 
 pub use quinn::{Connection, ConnectionError, Endpoint, Incoming, VarInt};
 
