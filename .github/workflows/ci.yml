@@ -51,6 +51,10 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Server image
+        if: runner.os == 'Linux'
+        run: docker build -f apps/hext-server/Dockerfile -t hext-server .
+
       - name: Build release (Windows)
         if: runner.os == 'Windows'
         shell: bash

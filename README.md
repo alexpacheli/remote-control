@@ -11,6 +11,7 @@ Acesso e suporte remoto para Windows, macOS e Linux, focado em fluidez.
 |---|---|
 | `crates/proto` | Mensagens do protocolo: handshake, vídeo, input |
 | `crates/crypto` | Identidade do computador: chave Ed25519 criada na primeira execução e guardada no disco |
+| `crates/signal` | Sinalização: ID de 9 dígitos, mensagens entre o app e o servidor, cliente WebSocket |
 | `crates/net` | QUIC, verificação do host por impressão digital, streams |
 | `crates/capture` | Captura de tela (DXGI no Windows, ScreenCaptureKit no macOS) e imagem de teste |
 | `crates/codec` | H.264 (codificar e decodificar): placa de vídeo (Media Foundation no Windows, VideoToolbox no Mac) ou OpenH264 em software |
@@ -19,6 +20,7 @@ Acesso e suporte remoto para Windows, macOS e Linux, focado em fluidez.
 | `crates/session` | Pipelines do host e do cliente |
 | `crates/metrics` | Estatísticas de latência |
 | `apps/hext` | O app: comandos `host` e `view` |
+| `apps/hext-server` | Servidor: IDs, presença e sinalização (veja [docs/hext-server.md](docs/hext-server.md)) |
 
 ## Desenvolvimento
 
