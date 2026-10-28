@@ -5,18 +5,20 @@
 //!   [preamble](encode_preamble) from each side and then carries [`Control`]
 //!   messages as length-prefixed frames (see [`frame`]);
 //! - **unidirectional streams**, each starting with a [`StreamKind`] byte:
-//!   video frames (host → client) and input events (client → host);
-//! - unreliable **QUIC datagrams** carrying [`Datagram`] messages (ping).
+//!   input events (client → host);
+//! - unreliable **QUIC datagrams** carrying [`Datagram`] messages: video
+//!   ([`VideoPacket`]s: each [`VideoFrame`] split into shards with
+//!   Reed-Solomon parity, so a lost packet neither stalls later frames nor
+//!   needs a retransmission) and ping.
 //!
-//! All messages are serialized with `postcard`. In F1 video travels on a
-//! reliable stream; datagrams with FEC replace it once tuned over the internet.
+//! All messages are serialized with `postcard`.
 
 use serde::{Deserialize, Serialize};
 
 pub mod frame;
 
 /// Bumped on any incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// TLS ALPN identifier. It carries no version: versions are compared through
 /// the preamble, so mismatched peers still connect and can report why they fail.
@@ -53,8 +55,8 @@ pub const MAX_VIDEO_FRAME_LEN: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StreamKind {
-    /// Host → client, carries [`VideoFrame`]s.
-    Video = 1,
+    // 1 was the video stream (protocol 3 and earlier); video now travels in
+    // datagrams.
     /// Client → host, carries [`InputEvent`]s.
     Input = 2,
 }
@@ -62,7 +64,6 @@ pub enum StreamKind {
 impl StreamKind {
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            1 => Some(Self::Video),
             2 => Some(Self::Input),
             _ => None,
         }
@@ -71,7 +72,6 @@ impl StreamKind {
     /// Largest frame accepted on a stream of this kind.
     pub const fn max_frame_len(self) -> usize {
         match self {
-            Self::Video => MAX_VIDEO_FRAME_LEN,
             Self::Input => frame::MAX_FRAME_LEN,
         }
     }
@@ -149,8 +149,15 @@ pub enum RejectReason {
 }
 
 /// Messages sent as unreliable QUIC datagrams.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Datagram {
+    /// Host → client: one shard of a video frame.
+    Video(VideoPacket),
+    /// Host → client, while nothing changes on screen: the number of the
+    /// last frame sent, so a frame that lost every packet is noticed.
+    VideoIdle {
+        last_frame: u64,
+    },
     /// RTT probe; the receiver echoes it back as [`Datagram::Pong`].
     Ping {
         seq: u32,
@@ -162,7 +169,33 @@ pub enum Datagram {
     },
 }
 
-/// One encoded H.264 access unit on the video stream.
+/// One shard of a serialized [`VideoFrame`].
+///
+/// The frame's bytes are cut into `shard`-byte data shards (the last one
+/// zero-padded), grouped into blocks of `block_size`; each block also gets
+/// `parity` Reed-Solomon parity shards, so any `k` of its `k + parity`
+/// packets rebuild its `k` data shards. Data shard `i` of block `b` holds
+/// the frame bytes from `(b * block_size + i) * shard`; `index` counts data
+/// shards first, then parity.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VideoPacket {
+    /// Frame number ([`VideoFrame::seq`]).
+    pub frame: u64,
+    /// Size of the serialized frame, in bytes.
+    pub len: u32,
+    /// Bytes per shard (the same for every packet of the frame).
+    pub shard: u16,
+    /// Data shards per block (the last block may have fewer).
+    pub block_size: u16,
+    pub block: u16,
+    pub index: u16,
+    /// Parity shards of this block.
+    pub parity: u16,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// One encoded H.264 access unit.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrame {
     pub seq: u64,
@@ -262,6 +295,21 @@ mod tests {
         };
         let bytes = encode(&msg).unwrap();
         assert_eq!(decode::<Datagram>(&bytes).unwrap(), msg);
+
+        let packet = Datagram::Video(VideoPacket {
+            frame: 1 << 40,
+            len: 300_000,
+            shard: 1100,
+            block_size: 64,
+            block: 4,
+            index: 70,
+            parity: 13,
+            data: vec![7; 1100],
+        });
+        let bytes = encode(&packet).unwrap();
+        // The header stays small next to the shard.
+        assert!(bytes.len() <= 1100 + 32, "{} bytes", bytes.len());
+        assert_eq!(decode::<Datagram>(&bytes).unwrap(), packet);
     }
 
     #[test]
@@ -293,10 +341,13 @@ mod tests {
 
     #[test]
     fn stream_kinds() {
-        for kind in [StreamKind::Video, StreamKind::Input] {
-            assert_eq!(StreamKind::from_byte(kind as u8), Some(kind));
-        }
+        assert_eq!(
+            StreamKind::from_byte(StreamKind::Input as u8),
+            Some(StreamKind::Input)
+        );
         assert_eq!(StreamKind::from_byte(0), None);
+        // The old video stream is refused.
+        assert_eq!(StreamKind::from_byte(1), None);
     }
 
     #[test]

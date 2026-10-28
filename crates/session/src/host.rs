@@ -6,12 +6,16 @@ use std::time::{Duration, Instant};
 
 use hext_codec::EncoderSettings;
 use hext_input::Area;
+use hext_net::video::VideoSender;
 use hext_net::{Connection, NetError};
 use hext_proto::{Control, Hello, InputEvent, PeerInfo, RejectReason, StreamKind, VideoFrame};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::{Result, SessionError, codes_match};
+
+/// How often a still screen repeats the number of its last frame.
+const IDLE_NOTICE: Duration = Duration::from_millis(250);
 
 pub struct HostConfig {
     pub peer: PeerInfo,
@@ -79,20 +83,18 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         return Err(e);
     }
 
-    let mut video = match hext_net::open_uni(&conn, StreamKind::Video).await {
-        Ok(video) => video,
-        Err(e) => {
-            // Stop the detached capture thread, which holds the capturer/encoder.
-            shared.stop.store(true, Ordering::Relaxed);
-            let _ = tokio::task::spawn_blocking(move || capture.join()).await;
-            return Err(e.into());
-        }
-    };
+    // Video goes out as datagrams with FEC (see `hext_net::video`).
+    let video = conn.clone();
     let mut writer = tokio::spawn(async move {
-        while let Some(frame) = frames_rx.recv().await {
-            video.send(&frame).await?;
+        let mut sender = VideoSender::default();
+        loop {
+            match tokio::time::timeout(IDLE_NOTICE, frames_rx.recv()).await {
+                Ok(Some(frame)) => sender.send(&video, &frame).await?,
+                Ok(None) => return Ok::<_, NetError>(()),
+                // A still screen: let the viewer check it has the last frame.
+                Err(_) => sender.send_idle(&video).await?,
+            }
         }
-        Ok::<_, NetError>(())
     });
     let mut input = tokio::spawn(receive_input(conn.clone(), shared.clone()));
 

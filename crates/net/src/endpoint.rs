@@ -15,12 +15,22 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Video datagrams waiting to be read: room for a few large keyframes.
+const DATAGRAM_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
+
+/// Video datagrams waiting to be sent. Small, so that when the network
+/// can't keep up the host waits (and skips screen updates) instead of
+/// queueing seconds of video: ~200 ms at 10 Mbps.
+const DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
+
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(2)));
     t.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(10)).expect("10s fits a VarInt"),
     ));
+    t.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
+    t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     Arc::new(t)
 }
 
