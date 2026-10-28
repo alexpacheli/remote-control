@@ -86,6 +86,12 @@ impl DxgiCapturer {
             let _ = unsafe { multithread.SetMultithreadProtected(true) };
         }
         let output: IDXGIOutput1 = output.cast().map_err(platform)?;
+        // `HEXT_ZERO_COPY=0` forces the copy through system memory, to
+        // compare against the GPU path on the same machine.
+        let disabled = std::env::var("HEXT_ZERO_COPY").is_ok_and(|v| v == "0");
+        if disabled {
+            tracing::info!("HEXT_ZERO_COPY=0: captura pela memória do sistema");
+        }
 
         let mut capturer = Self {
             device,
@@ -94,7 +100,7 @@ impl DxgiCapturer {
             duplication: None,
             staging: None,
             converter: None,
-            cpu_only: !video,
+            cpu_only: !video || disabled,
             gpu_failed_at: None,
             frame: None,
             rect: Rect::default(),

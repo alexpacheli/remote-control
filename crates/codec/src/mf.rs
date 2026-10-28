@@ -229,7 +229,9 @@ impl MfEncoder {
                 .ok(),
             _ => None,
         };
-        if device.is_some() && !same_adapter {
+        if manager.is_some() {
+            tracing::info!("zero-copy: o encoder lê a imagem direto da GPU");
+        } else if device.is_some() && !same_adapter {
             tracing::info!("encoder em outro adaptador que a captura; imagem pela memória");
         }
 
