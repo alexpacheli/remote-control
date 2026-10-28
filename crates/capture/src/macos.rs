@@ -6,6 +6,10 @@
 //! (e.g. 1920x1080 for a 4K "looks like 1080p" display): the GPU does the
 //! downscale for free and the encoder gets a quarter of the pixels.
 //! The cursor is not drawn into the image; the viewer shows its own.
+//!
+//! Frames come in NV12 (BT.601, limited range): the GPU converts while it
+//! scales, so neither the CPU nor the video encoder has to, and the copy
+//! out of the frame is 1.5 bytes per pixel instead of 4.
 
 // Objective-C / CoreVideo calls are unsafe by nature; each block below is a plain API call.
 #![allow(unsafe_code)]
@@ -20,12 +24,14 @@ use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::CFArray;
 use objc2_core_graphics::{
     CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
+    kCGDisplayStreamYCbCrMatrix_ITU_R_601_4,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
+    CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+    CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
 use objc2_screen_capture_kit::{
@@ -33,7 +39,7 @@ use objc2_screen_capture_kit::{
     SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
 
-use crate::{CaptureError, Capturer, Frame, Rect, even};
+use crate::{CaptureError, Capturer, Frame, PixelFormat, Rect, even};
 
 /// How long to wait for ScreenCaptureKit to answer a request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,7 +78,7 @@ impl Shared {
         let Some(pixels) = (unsafe { sample.image_buffer() }) else {
             return;
         };
-        if CVPixelBufferGetPixelFormatType(&pixels) != kCVPixelFormatType_32BGRA {
+        if CVPixelBufferGetPixelFormatType(&pixels) != PIXEL_FORMAT {
             return;
         }
         if unsafe { CVPixelBufferLockBaseAddress(&pixels, CVPixelBufferLockFlags::ReadOnly) } != 0 {
@@ -82,9 +88,6 @@ impl Shared {
             even(CVPixelBufferGetWidth(&pixels) as u32),
             even(CVPixelBufferGetHeight(&pixels) as u32),
         );
-        let stride = CVPixelBufferGetBytesPerRow(&pixels);
-        let base = CVPixelBufferGetBaseAddress(&pixels) as *const u8;
-        let row_len = width as usize * 4;
         let mut data = self
             .latest
             .lock()
@@ -93,17 +96,13 @@ impl Shared {
             .take()
             .unwrap_or_default();
         data.clear();
-        data.reserve(row_len * height as usize);
-        if !base.is_null() {
-            for y in 0..height as usize {
-                // SAFETY: the buffer is locked and holds at least `height` rows
-                // of `stride` bytes, each with `width` BGRA pixels.
-                let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), row_len) };
-                data.extend_from_slice(row);
-            }
-        }
+        data.reserve(width as usize * height as usize * 3 / 2);
+        // Y plane, then the half-height interleaved U/V plane; both `width`
+        // bytes per row.
+        let copied = copy_plane(&pixels, 0, width as usize, height as usize, &mut data)
+            && copy_plane(&pixels, 1, width as usize, height as usize / 2, &mut data);
         unsafe { CVPixelBufferUnlockBaseAddress(&pixels, CVPixelBufferLockFlags::ReadOnly) };
-        if data.is_empty() {
+        if !copied {
             return;
         }
 
@@ -111,12 +110,39 @@ impl Shared {
         latest.frame = Some(Frame {
             width,
             height,
+            format: PixelFormat::Nv12,
             data,
         });
         latest.copy_time = started.elapsed();
         latest.seq += 1;
         self.ready.notify_all();
     }
+}
+
+/// Pixel format asked of ScreenCaptureKit: NV12, video (limited) range.
+const PIXEL_FORMAT: u32 = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+
+/// Appends `rows` rows of `row_len` bytes from a plane of a locked buffer.
+/// Returns false if the plane is missing or smaller than that.
+fn copy_plane(
+    pixels: &CVPixelBuffer,
+    plane: usize,
+    row_len: usize,
+    rows: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    let base = CVPixelBufferGetBaseAddressOfPlane(pixels, plane) as *const u8;
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, plane);
+    if base.is_null() || stride < row_len {
+        return false;
+    }
+    for y in 0..rows {
+        // SAFETY: the buffer is locked and this plane holds at least `rows`
+        // rows of `stride >= row_len` bytes.
+        let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), row_len) };
+        out.extend_from_slice(row);
+    }
+    true
 }
 
 /// Whether ScreenCaptureKit marked the sample as a new, complete frame.
@@ -258,7 +284,9 @@ impl ScreenCaptureKitCapturer {
             let config = SCStreamConfiguration::new();
             config.setWidth(width as usize);
             config.setHeight(height as usize);
-            config.setPixelFormat(kCVPixelFormatType_32BGRA);
+            config.setPixelFormat(PIXEL_FORMAT);
+            // The viewer's shader decodes BT.601, like the encoders produce.
+            config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
             config.setShowsCursor(false);
             config.setQueueDepth(3);
             config.setMinimumFrameInterval(CMTime::new(1, max_fps.clamp(1, 240) as i32));

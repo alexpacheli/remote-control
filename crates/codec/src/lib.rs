@@ -3,7 +3,8 @@
 //! Encoders sit behind [`VideoEncoder`]:
 //! - [`SoftwareEncoder`]: OpenH264, identical on every OS;
 //! - a hardware encoder on Windows (a Media Foundation transform from the
-//!   GPU vendor: NVIDIA, AMD or Intel).
+//!   GPU vendor: NVIDIA, AMD or Intel);
+//! - a hardware encoder on macOS (VideoToolbox, on the Mac's media engine).
 //!
 //! [`open_encoder`] picks one; in `Auto` mode a failing hardware encoder is
 //! replaced by the software one on the fly. Decoding is OpenH264 everywhere,
@@ -18,9 +19,13 @@ pub mod h264;
 mod mf;
 mod nv12;
 mod software;
+#[cfg(target_os = "macos")]
+mod vt;
 
-pub use nv12::bgra_to_nv12;
+pub use nv12::{bgra_to_nv12, split_uv};
 pub use software::SoftwareEncoder;
+#[cfg(target_os = "macos")]
+pub use vt::{BenchStats, benchmark};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
@@ -81,18 +86,52 @@ pub struct Encoded {
     pub keyframe: bool,
 }
 
+/// Layout of an [`Image`]'s pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Tightly packed BGRA rows (`width * 4` bytes each).
+    Bgra,
+    /// 4:2:0 YUV (BT.601, limited range): a `width * height` Y plane, then a
+    /// half-height plane of interleaved U/V pairs (`width` bytes per row).
+    Nv12,
+}
+
+/// An image to encode. Width and height must be even.
+#[derive(Debug, Clone, Copy)]
+pub struct Image<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub data: &'a [u8],
+}
+
+impl<'a> Image<'a> {
+    pub fn bgra(width: u32, height: u32, data: &'a [u8]) -> Self {
+        Self {
+            width,
+            height,
+            format: PixelFormat::Bgra,
+            data,
+        }
+    }
+
+    pub fn nv12(width: u32, height: u32, data: &'a [u8]) -> Self {
+        Self {
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            data,
+        }
+    }
+}
+
 pub trait VideoEncoder {
-    /// Encodes a tightly packed BGRA image. Width and height must be even.
+    /// Encodes one image, in either pixel format.
     ///
     /// Returns `None` when no output is ready for this image (rate control
     /// skipped it, or the encoder is still working on it): encode the latest
     /// image again soon, or that update never reaches the viewer.
-    fn encode(
-        &mut self,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<Option<Encoded>, CodecError>;
+    fn encode(&mut self, image: &Image<'_>) -> Result<Option<Encoded>, CodecError>;
 
     /// The next encoded frame will be a keyframe.
     fn force_keyframe(&mut self);
@@ -137,7 +176,11 @@ fn hardware(settings: EncoderSettings) -> Result<Box<dyn VideoEncoder>, CodecErr
     {
         Ok(Box::new(mf::MfEncoder::new(settings)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(vt::VtEncoder::new(settings)?))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = settings;
         Err(CodecError::NoHardware)
@@ -152,14 +195,9 @@ struct AutoEncoder {
 }
 
 impl VideoEncoder for AutoEncoder {
-    fn encode(
-        &mut self,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<Option<Encoded>, CodecError> {
+    fn encode(&mut self, image: &Image<'_>) -> Result<Option<Encoded>, CodecError> {
         if let Some(hardware) = &mut self.hardware {
-            match hardware.encode(width, height, bgra) {
+            match hardware.encode(image) {
                 Ok(encoded) => return Ok(encoded),
                 Err(e) => {
                     tracing::warn!("codificação por hardware falhou ({e}); usando software");
@@ -167,7 +205,7 @@ impl VideoEncoder for AutoEncoder {
                 }
             }
         }
-        self.software.encode(width, height, bgra)
+        self.software.encode(image)
     }
 
     fn force_keyframe(&mut self) {
@@ -203,16 +241,46 @@ impl VideoEncoder for AutoEncoder {
     }
 }
 
-fn check_frame(width: u32, height: u32, bgra: &[u8]) -> Result<(), CodecError> {
+/// Error for a hardware encoder whose output the viewer cannot decode.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn profile_error(profile: u8) -> CodecError {
+    CodecError::Hardware(format!(
+        "produz perfil H.264 {profile}, o visualizador precisa de Baseline ({})",
+        h264::PROFILE_BASELINE
+    ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// Adds `next` to the outputs collected in `ready`. Several access units in
+/// one payload decode in order, so none is dropped, except that a keyframe
+/// makes everything before it unnecessary: the payload then starts with it,
+/// and its keyframe flag stays truthful.
+pub(crate) fn merge(ready: &mut Option<Encoded>, next: Option<Encoded>) {
+    match (ready.as_mut(), next) {
+        (_, None) => {}
+        (None, Some(next)) => *ready = Some(next),
+        (Some(_), Some(next)) if next.keyframe => *ready = Some(next),
+        (Some(ready), Some(next)) => ready.data.extend_from_slice(&next.data),
+    }
+}
+
+fn check_frame(image: &Image<'_>) -> Result<(), CodecError> {
+    let (width, height) = (image.width, image.height);
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(CodecError::InvalidFrame(format!(
             "{width}x{height} must be even and non-zero"
         )));
     }
-    if bgra.len() != (width * height * 4) as usize {
+    let pixels = width as usize * height as usize;
+    let expected = match image.format {
+        PixelFormat::Bgra => pixels * 4,
+        PixelFormat::Nv12 => pixels * 3 / 2,
+    };
+    if image.data.len() != expected {
         return Err(CodecError::InvalidFrame(format!(
-            "{} bytes for {width}x{height} BGRA",
-            bgra.len()
+            "{} bytes for {width}x{height} {:?}",
+            image.data.len(),
+            image.format
         )));
     }
     Ok(())
@@ -272,6 +340,30 @@ pub(crate) mod tests {
         data
     }
 
+    /// [`image`] converted to NV12, as the macOS capture delivers it.
+    pub(crate) fn nv12_image(w: u32, h: u32, t: u32) -> Vec<u8> {
+        let mut nv12 = Vec::new();
+        bgra_to_nv12(w, h, &image(w, h, t), &mut None, &mut nv12);
+        nv12
+    }
+
+    #[test]
+    fn software_takes_nv12() {
+        let (w, h) = (320, 240);
+        let mut encoder = SoftwareEncoder::new(EncoderSettings::default());
+        let mut decoder = H264Decoder::new().unwrap();
+        let nv12 = nv12_image(w, h, 0);
+        let encoded = encoder.encode(&Image::nv12(w, h, &nv12)).unwrap().unwrap();
+        assert!(encoded.keyframe);
+        let frame = decoder.decode(&encoded.data).unwrap().unwrap();
+        // Same luma as the source NV12 (block 230 → ~213, background 40 → ~51).
+        let (block, background) = (frame.y[0], frame.y[(h as usize - 1) * w as usize]);
+        assert!(block.abs_diff(nv12[0]) <= 6, "block {block} vs {}", nv12[0]);
+        assert!((45..=58).contains(&background), "background {background}");
+        // Wrong sizes are rejected for NV12 too.
+        assert!(encoder.encode(&Image::nv12(w, h, &nv12[1..])).is_err());
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let (w, h) = (320, 240);
@@ -280,7 +372,10 @@ pub(crate) mod tests {
 
         let mut decoded = 0;
         for t in 0..10 {
-            let encoded = encoder.encode(w, h, &image(w, h, t)).unwrap().unwrap();
+            let encoded = encoder
+                .encode(&Image::bgra(w, h, &image(w, h, t)))
+                .unwrap()
+                .unwrap();
             assert_eq!(encoded.keyframe, t == 0, "frame {t}");
             if let Some(frame) = decoder.decode(&encoded.data).unwrap() {
                 assert_eq!((frame.width, frame.height), (w, h));
@@ -298,23 +393,35 @@ pub(crate) mod tests {
     #[test]
     fn auto_without_hardware_is_software() {
         let encoder = open_encoder(EncoderSettings::default()).unwrap();
-        if !cfg!(windows) {
+        if !cfg!(any(windows, target_os = "macos")) {
             assert!(!encoder.is_hardware());
+        }
+        // Without a hardware encoder (or on a machine whose one failed to
+        // open), Auto must have fallen back to OpenH264.
+        if !encoder.is_hardware() {
             assert!(encoder.name().contains("OpenH264"));
         }
     }
 
     #[test]
     fn forced_hardware_fails_without_it() {
-        if !cfg!(windows) {
-            let settings = EncoderSettings {
-                preference: EncoderPreference::Hardware,
-                ..Default::default()
-            };
-            assert!(matches!(
-                open_encoder(settings),
-                Err(CodecError::NoHardware)
-            ));
+        let settings = EncoderSettings {
+            preference: EncoderPreference::Hardware,
+            ..Default::default()
+        };
+        match open_encoder(settings) {
+            // Only where a hardware encoder can exist, and then it is one.
+            Ok(encoder) => assert!(
+                cfg!(any(windows, target_os = "macos")) && encoder.is_hardware(),
+                "{}",
+                encoder.name()
+            ),
+            Err(CodecError::NoHardware) => {}
+            // Platforms with hardware encoders may also report why it failed.
+            Err(e) => assert!(
+                cfg!(any(windows, target_os = "macos")) && matches!(e, CodecError::Hardware(_)),
+                "{e}"
+            ),
         }
     }
 }

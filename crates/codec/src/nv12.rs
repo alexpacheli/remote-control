@@ -41,6 +41,18 @@ pub fn bgra_to_nv12(
     }
 }
 
+/// Splits NV12's interleaved U/V plane into separate U and V planes (I420).
+pub fn split_uv(uv: &[u8], u: &mut Vec<u8>, v: &mut Vec<u8>) {
+    u.clear();
+    v.clear();
+    u.reserve(uv.len() / 2);
+    v.reserve(uv.len() / 2);
+    for pair in uv.chunks_exact(2) {
+        u.push(pair[0]);
+        v.push(pair[1]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +84,13 @@ mod tests {
         let (red_u, red_v, blue_u, blue_v) = (nv12[8], nv12[9], nv12[10], nv12[11]);
         assert!(red_v > 200 && red_u < 128, "red UV {red_u},{red_v}");
         assert!(blue_u > 200 && blue_v < 128, "blue UV {blue_u},{blue_v}");
+    }
+
+    #[test]
+    fn splits_interleaved_chroma() {
+        let (mut u, mut v) = (vec![9], Vec::new());
+        split_uv(&[1, 2, 3, 4, 5, 6], &mut u, &mut v);
+        assert_eq!((u, v), (vec![1, 3, 5], vec![2, 4, 6]));
     }
 
     #[test]

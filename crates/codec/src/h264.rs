@@ -84,6 +84,27 @@ pub fn sps_profile(data: &[u8]) -> Option<u8> {
         .and_then(|sps| sps.get(1).copied())
 }
 
+/// Converts length-prefixed NAL units (AVCC, as VideoToolbox outputs them)
+/// to Annex-B, appending them to `out`. `length_size` is the size of each
+/// length prefix (1, 2 or 4 bytes). Returns `None` if the data is malformed.
+pub fn avcc_to_annex_b(data: &[u8], length_size: usize, out: &mut Vec<u8>) -> Option<()> {
+    if !matches!(length_size, 1 | 2 | 4) {
+        return None;
+    }
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (prefix, tail) = rest.split_at_checked(length_size)?;
+        let len = prefix
+            .iter()
+            .fold(0usize, |len, &byte| (len << 8) | usize::from(byte));
+        let (nal, tail) = tail.split_at_checked(len)?;
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+        rest = tail;
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +151,36 @@ mod tests {
         assert_eq!(s.profile, sps_profile(&data));
         assert_eq!(s.profile, Some(PROFILE_BASELINE));
         assert_eq!(scan(&[0, 0, 1, 0x41]), Scan::default());
+    }
+
+    #[test]
+    fn avcc_becomes_annex_b() {
+        let avcc = [
+            0, 0, 0, 3, 0x67, 66, 0xC0, // SPS
+            0, 0, 0, 2, 0x65, 0x88, // IDR
+        ];
+        let mut out = vec![0xAA];
+        avcc_to_annex_b(&avcc, 4, &mut out).unwrap();
+        assert_eq!(
+            out,
+            [0xAA, 0, 0, 0, 1, 0x67, 66, 0xC0, 0, 0, 0, 1, 0x65, 0x88]
+        );
+        assert_eq!(scan(&out[1..]).profile, Some(PROFILE_BASELINE));
+
+        let mut short = Vec::new();
+        avcc_to_annex_b(&[2, 0x41, 0x9A], 1, &mut short).unwrap();
+        assert_eq!(short, [0, 0, 0, 1, 0x41, 0x9A]);
+    }
+
+    #[test]
+    fn malformed_avcc_is_rejected() {
+        let mut out = Vec::new();
+        // Length runs past the data.
+        assert!(avcc_to_annex_b(&[0, 0, 0, 9, 0x65], 4, &mut out).is_none());
+        // Truncated length prefix.
+        assert!(avcc_to_annex_b(&[0, 0], 4, &mut out).is_none());
+        assert!(avcc_to_annex_b(&[1, 0x65], 3, &mut out).is_none());
+        assert!(avcc_to_annex_b(&[], 4, &mut out).is_some());
     }
 
     #[test]

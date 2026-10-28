@@ -244,7 +244,7 @@ fn capture_loop(
         };
 
         let started = Instant::now();
-        let encoded = match encoder.encode(frame.width, frame.height, &frame.data) {
+        let encoded = match encoder.encode(&image(frame)) {
             Ok(Some(encoded)) => encoded,
             Ok(None) => {
                 skipped = true;
@@ -281,6 +281,19 @@ fn capture_loop(
         if !sent {
             break;
         }
+    }
+}
+
+/// The captured frame as encoder input.
+fn image(frame: &hext_capture::Frame) -> hext_codec::Image<'_> {
+    hext_codec::Image {
+        width: frame.width,
+        height: frame.height,
+        format: match frame.format {
+            hext_capture::PixelFormat::Bgra => hext_codec::PixelFormat::Bgra,
+            hext_capture::PixelFormat::Nv12 => hext_codec::PixelFormat::Nv12,
+        },
+        data: &frame.data,
     }
 }
 

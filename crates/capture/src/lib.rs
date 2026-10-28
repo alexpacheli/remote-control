@@ -14,13 +14,23 @@ mod windows;
 
 pub use test_pattern::TestPattern;
 
-/// A captured image: tightly packed BGRA rows (`width * 4` bytes each).
-///
-/// Width and height are always even, as 4:2:0 video requires.
+/// Layout of a captured image's pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Tightly packed BGRA rows (`width * 4` bytes each).
+    Bgra,
+    /// 4:2:0 YUV, BT.601 limited range, as video encoders take it: a
+    /// `width * height` Y plane, then a half-height plane of interleaved
+    /// U/V pairs (`width` bytes per row). No conversion left for the CPU.
+    Nv12,
+}
+
+/// A captured image. Width and height are always even, as 4:2:0 video requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
+    pub format: PixelFormat,
     pub data: Vec<u8>,
 }
 
