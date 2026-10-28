@@ -22,7 +22,7 @@ use hext_net::video::{Event, Packetizer, Reassembler};
 use hext_proto::{Datagram, VideoFrame};
 use iroh::endpoint::presets::{self, Preset};
 use iroh::endpoint::{Connection, QuicTransportConfig};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl};
 use tokio::sync::Mutex;
 
 const ALPN: &[u8] = b"hext/spike/1";
@@ -61,6 +61,9 @@ enum Command {
         /// Só pelo relay (sem conexão direta), para medir o pior caso.
         #[arg(long)]
         relay_only: bool,
+        /// Relay próprio (ex.: https://relay.hext.com.br) no lugar dos da n0.
+        #[arg(long)]
+        relay: Option<RelayUrl>,
     },
     /// Conecta num host pelo ID dele e recebe o vídeo.
     View {
@@ -69,6 +72,9 @@ enum Command {
         /// Só pelo relay (sem conexão direta), para medir o pior caso.
         #[arg(long)]
         relay_only: bool,
+        /// Relay próprio (ex.: https://relay.hext.com.br) no lugar dos da n0.
+        #[arg(long)]
+        relay: Option<RelayUrl>,
         /// Por quantos segundos receber.
         #[arg(long, default_value_t = 60)]
         seconds: u64,
@@ -97,8 +103,9 @@ async fn main() -> Result<()> {
             mbps,
             keyframe_secs,
             relay_only,
+            relay,
         } => {
-            let endpoint = endpoint(presets::N0, relay_only, true).await?;
+            let endpoint = endpoint(presets::N0, relay_only, relay, true).await?;
             wait_online(&endpoint).await;
             println!(
                 "\n  No outro computador:\n    hext-spike view {}\n",
@@ -115,9 +122,10 @@ async fn main() -> Result<()> {
         Command::View {
             id,
             relay_only,
+            relay,
             seconds,
         } => {
-            let endpoint = endpoint(presets::N0, relay_only, false).await?;
+            let endpoint = endpoint(presets::N0, relay_only, relay, false).await?;
             view(&endpoint, id.into(), Duration::from_secs(seconds)).await?;
             endpoint.close().await;
         }
@@ -125,7 +133,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn endpoint(preset: impl Preset, relay_only: bool, accept: bool) -> Result<Endpoint> {
+async fn endpoint(
+    preset: impl Preset,
+    relay_only: bool,
+    relay: Option<RelayUrl>,
+    accept: bool,
+) -> Result<Endpoint> {
     // The same datagram buffers as the app (see hext_net's endpoint).
     let transport = QuicTransportConfig::builder()
         .datagram_receive_buffer_size(Some(4 * 1024 * 1024))
@@ -134,6 +147,9 @@ async fn endpoint(preset: impl Preset, relay_only: bool, accept: bool) -> Result
     let mut builder = Endpoint::builder(preset).transport_config(transport);
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
+    }
+    if let Some(relay) = relay {
+        builder = builder.relay_mode(RelayMode::custom([relay]));
     }
     if relay_only {
         builder = builder.clear_ip_transports();
@@ -395,8 +411,10 @@ mod tests {
     /// connection, directly on this machine: no relay, no address lookup.
     #[tokio::test]
     async fn video_flows_over_iroh() {
-        let host_ep = endpoint(presets::Minimal, false, true).await.unwrap();
-        let view_ep = endpoint(presets::Minimal, false, false).await.unwrap();
+        let host_ep = endpoint(presets::Minimal, false, None, true).await.unwrap();
+        let view_ep = endpoint(presets::Minimal, false, None, false)
+            .await
+            .unwrap();
         let addr = host_ep.addr();
         let video = Video {
             fps: 30,
