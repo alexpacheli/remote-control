@@ -1,0 +1,19 @@
+[Unit]
+Description=Hext Remote server (IDs, presence, signaling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=hext
+EnvironmentFile=/etc/hext/secrets.env
+ExecStart=/usr/local/bin/hext-server --listen 127.0.0.1:8080 --db /var/lib/hext/hext-server.db --behind-proxy
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

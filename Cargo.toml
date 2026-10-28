@@ -24,7 +24,7 @@ hext-session = { path = "crates/session" }
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 bytemuck = { version = "1.25", features = ["derive"] }
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 gethostname = "1.1"
 hex = "0.4"

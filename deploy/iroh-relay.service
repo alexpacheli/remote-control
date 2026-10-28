@@ -1,0 +1,21 @@
+[Unit]
+Description=iroh relay for Hext Remote (behind Caddy)
+After=network-online.target caddy.service hext-server.service
+Wants=network-online.target
+
+[Service]
+# As Caddy's user, to read the certificate Caddy keeps for relay.hext.com.br.
+User=caddy
+Group=caddy
+EnvironmentFile=/etc/hext/secrets.env
+ExecStart=/usr/local/bin/iroh-relay --config-path /etc/hext/iroh-relay.toml
+# Until Caddy has the first certificate, the relay cannot start: retry.
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

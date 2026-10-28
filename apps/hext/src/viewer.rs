@@ -337,8 +337,8 @@ fn target(args: &ViewArgs) -> Result<Target<'_>> {
     // An address first: "192.168.0.10" must never be taken for an ID.
     let addr = parse_addr(&args.target);
     if let (Err(_), Ok(id)) = (&addr, args.target.parse::<DeviceId>()) {
-        let Some(server) = &args.server else {
-            bail!("para conectar pelo ID, informe o servidor com --server");
+        let Some(server) = crate::server(&args.server) else {
+            bail!("para conectar pelo ID é preciso o servidor de sinalização (--server)");
         };
         if args.code.is_some() || args.key.is_some() {
             warn!(

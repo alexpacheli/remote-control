@@ -67,13 +67,14 @@ A imagem já roda com `--behind-proxy`, por isso a porta é publicada só em `12
 
 O banco fica no volume `/data` (`hext-server.db`). O backup é copiar esse arquivo.
 
-### Caddy na frente (TLS automático)
+### Na VM, atrás do Caddy
 
-```
-signal.hext.com.br {
-    reverse_proxy 127.0.0.1:8080
-}
-```
+A instalação na VM (Caddy com TLS automático, `hext-server` e `iroh-relay`, que só aceita computadores
+registrados) está em [deploy.md](deploy.md): um script faz tudo.
 
-O Caddy obtém o certificado da Let's Encrypt sozinho e repassa o WebSocket. A subida na VPS, com domínio,
-limites por IP e o app usando esse servidor por padrão, é o marco 6 da F3 ([F3.md](F3.md)).
+### Acesso ao relay
+
+`POST /v1/relay-access` é o "porteiro" do `iroh-relay` (`access.http` na configuração dele). O relay manda
+a chave do computador em `X-Iroh-Endpoint-Id` e o segredo em `Authorization: Bearer …`, o mesmo de
+`--relay-token` ou `HEXT_RELAY_TOKEN`. A resposta é `200 true` se o computador tem um ID, `403` se não tem
+e `401` com o segredo errado. Sem `--relay-token`, a rota responde `404`.

@@ -1,0 +1,12 @@
+# Caddy in front of the Hext Remote services: TLS (Let's Encrypt, automatic)
+# on 443 for both names, everything else on 127.0.0.1.
+
+signal.hext.com.br {
+	# The relay's access check is for the relay on this machine only.
+	respond /v1/relay-access 404
+	reverse_proxy 127.0.0.1:8080
+}
+
+relay.hext.com.br {
+	reverse_proxy 127.0.0.1:3340
+}

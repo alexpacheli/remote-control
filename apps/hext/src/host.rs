@@ -85,9 +85,15 @@ pub async fn run(args: HostArgs) -> Result<()> {
         exe_name(),
         key.public_key()
     );
-    if let Some(server) = &args.server {
+    if let Some(server) = crate::server(&args.server) {
+        // The server option only when it is not the one `view` assumes.
+        let option = if server == crate::DEFAULT_SERVER {
+            String::new()
+        } else {
+            format!(" --server {server}")
+        };
         println!(
-            "  ou, pelo ID (mostrado abaixo): {} view <ID> --server {server}",
+            "  ou, pelo ID (mostrado abaixo): {} view <ID>{option}",
             exe_name()
         );
     }
@@ -114,7 +120,7 @@ pub async fn run(args: HostArgs) -> Result<()> {
     // which together with the penalty rate-limits code guessing.
     let slot = Arc::new(Semaphore::new(1));
 
-    if let Some(server) = args.server.clone() {
+    if let Some(server) = crate::server(&args.server).map(str::to_owned) {
         // Viewers accepted through the server get this endpoint's current
         // addresses: the relay and the direct ones `iroh` found.
         tokio::spawn(crate::signaling::host(
