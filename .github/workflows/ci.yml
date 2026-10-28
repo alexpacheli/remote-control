@@ -55,31 +55,36 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo build --release --locked -p hext --target x86_64-pc-windows-msvc
+          cargo build --release --locked -p hext -p hext-spike --target x86_64-pc-windows-msvc
           mkdir dist
           cp target/x86_64-pc-windows-msvc/release/hext.exe dist/HextRemote.exe
+          cp target/x86_64-pc-windows-msvc/release/hext-spike.exe dist/hext-spike.exe
 
       - name: Build release (macOS universal)
         if: runner.os == 'macOS'
         run: |
-          cargo build --release --locked -p hext --target aarch64-apple-darwin
-          cargo build --release --locked -p hext --target x86_64-apple-darwin
+          cargo build --release --locked -p hext -p hext-spike --target aarch64-apple-darwin
+          cargo build --release --locked -p hext -p hext-spike --target x86_64-apple-darwin
           mkdir dist
           lipo -create -output dist/HextRemote \
             target/aarch64-apple-darwin/release/hext \
             target/x86_64-apple-darwin/release/hext
+          lipo -create -output dist/hext-spike \
+            target/aarch64-apple-darwin/release/hext-spike \
+            target/x86_64-apple-darwin/release/hext-spike
           lipo -info dist/HextRemote
 
       - name: Build release (Linux)
         if: runner.os == 'Linux'
         run: |
-          cargo build --release --locked -p hext --target x86_64-unknown-linux-gnu
+          cargo build --release --locked -p hext -p hext-spike --target x86_64-unknown-linux-gnu
           mkdir dist
           cp target/x86_64-unknown-linux-gnu/release/hext dist/hext-remote
+          cp target/x86_64-unknown-linux-gnu/release/hext-spike dist/hext-spike
 
       - name: Smoke test
         shell: bash
-        run: dist/* --version
+        run: for bin in dist/*; do "$bin" --version; done
 
       - uses: actions/upload-artifact@v4
         with:

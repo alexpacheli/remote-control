@@ -1,0 +1,20 @@
+[package]
+name = "hext-spike"
+description = "F3 spike: Hext Remote video over iroh (hole punching and relay)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hext-net.workspace = true
+hext-proto.workspace = true
+iroh = "1.4"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
