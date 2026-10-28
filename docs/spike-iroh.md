@@ -56,6 +56,8 @@ cada 2 s. Relay próprio `relay.hext.com.br`, numa VM ARM da Oracle em São Paul
 | Relay próprio (SP), firewall do Windows bloqueando | relay | 0,40 s | — | ~21 ms | — | 0 em 20 s |
 | Relays da n0 (o mais próximo é Virgínia, EUA) | relay | 0,99 s | — | 0,4 → **6,6 s** (a fila cresce) | — | 19 em 30 s, ~3 fps |
 | Relay próprio, firewall do Windows liberado | **direto** | 0,37 s | **0,46 s** | ~15 ms | **~20 ms / 40–60 ms** | ~1 quadro a cada 2 s |
+| Relay próprio, sem keyframes periódicos | relay (firewall bloqueando) | 0,4 s | — | ~23 ms | ~25 ms / 35–50 ms | — |
+| Direto, sem keyframes periódicos, firewall com regra para o executável | **direto** | 0,38 s | 0,44 s | ~16 ms | **~21 ms / 30–40 ms** | **0 em 22 s**; 1 no keyframe pedido após uma queda de rede de ~5 s |
 
 O `netcheck` mostrou NAT favorável (não simétrico) e UDP liberado nos dois lados.
 
@@ -72,7 +74,8 @@ O `netcheck` mostrou NAT favorável (não simétrico) e UDP liberado nos dois la
 4. **Datagramas com mais de um caminho:** o `iroh` pode informar o tamanho máximo de um caminho e enviar
    por outro menor, descartando em silêncio. O app deve limitar os datagramas a ~1100 bytes.
 5. **Rajadas de keyframe causam perda no UDP direto**: ~1 quadro perdido a cada keyframe de ~170 KB, mais
-   do que o FEC de 20% cobre. Pelo relay (TCP) não houve perda. Isso reforça intra-refresh no lugar de
+   do que o FEC de 20% cobre. Pelo relay (TCP) não houve perda. **Confirmado:** sem keyframes periódicos
+   o caminho direto ficou 22 s sem nenhuma perda; a única perda veio no keyframe pedido depois de uma queda. Isso reforça intra-refresh no lugar de
    keyframes periódicos, envio espaçado (pacing) e controle de banda adaptativo (seções 4.2 e 6.2 do
    ARCHITECTURE).
 
