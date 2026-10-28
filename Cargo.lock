@@ -855,6 +855,7 @@ dependencies = [
  "gethostname",
  "hext-capture",
  "hext-codec",
+ "hext-crypto",
  "hext-input",
  "hext-net",
  "hext-proto",
@@ -900,6 +901,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hext-crypto"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "ring",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "hext-input"
 version = "0.1.0"
 dependencies = [
@@ -920,6 +931,7 @@ name = "hext-net"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "hext-crypto",
  "hext-proto",
  "quinn",
  "rcgen",

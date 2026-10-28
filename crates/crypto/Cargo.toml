@@ -1,0 +1,16 @@
+[package]
+name = "hext-crypto"
+description = "Hext Remote device identity: a persistent Ed25519 key per device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
