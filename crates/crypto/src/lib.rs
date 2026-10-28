@@ -41,6 +41,12 @@ pub enum CryptoError {
 
 pub type Result<T, E = CryptoError> = std::result::Result<T, E>;
 
+/// Compares secrets (codes, tokens) in constant time: no early exit at the
+/// first difference, which would leak how much of a guess was right.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Bytes in an Ed25519 seed (the private key).
 pub const SEED_LEN: usize = 32;
 
@@ -197,6 +203,14 @@ mod tests {
         assert!(!key.public_key().verify(b"challenge!", &sig));
         assert!(!other.public_key().verify(b"challenge", &sig));
         assert_ne!(key.public_key(), other.public_key());
+    }
+
+    #[test]
+    fn secrets_compare_whole() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 
     #[test]

@@ -38,8 +38,7 @@ pub fn codes_match(expected: &str, given: &str) -> bool {
             .filter(|b| !b.is_ascii_whitespace() && *b != b'-')
             .collect()
     };
-    let (a, b) = (normalize(expected), normalize(given));
-    a.len() == b.len() && a.iter().zip(&b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    hext_crypto::constant_time_eq(&normalize(expected), &normalize(given))
 }
 
 #[cfg(test)]

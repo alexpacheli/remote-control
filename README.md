@@ -92,7 +92,9 @@ host aceita ou recusa o pedido. O app usa o nosso servidor (`wss://signal.hext.c
    `s` e Enter.
 
 Outro servidor (o `hext-server` vem junto nos artefatos, para testes): `--server ws://<IP>:8080` nos dois;
-`--server off` desliga os IDs (só conexão pelo IP).
+`--server off` desliga os IDs (só conexão pelo IP). O nosso relay só atende computadores registrados no
+nosso servidor: com outro servidor, sem servidor ou pelo IP, a conexão é só direta, a não ser que você
+informe outro relay (`--relay <url>`).
 
 Na primeira conexão, o técnico guarda a chave do host (`known_hosts`, na mesma pasta da chave). Se outro
 computador aparecer com o mesmo ID, a conexão é bloqueada com um aviso.

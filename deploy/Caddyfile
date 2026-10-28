@@ -1,6 +1,12 @@
 # Caddy in front of the Hext Remote services: TLS (Let's Encrypt, automatic)
 # on 443 for both names, everything else on 127.0.0.1.
 
+{
+	# Let's Encrypt only (no fallback to another CA): iroh-relay reads the
+	# certificate from this CA's folder (see iroh-relay.toml).
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
 signal.hext.com.br {
 	# The relay's access check is for the relay on this machine only.
 	respond /v1/relay-access 404
@@ -8,5 +14,11 @@ signal.hext.com.br {
 }
 
 relay.hext.com.br {
+	reverse_proxy 127.0.0.1:3340
+}
+
+# Plain HTTP to the relay too, not a redirect: iroh's captive-portal probe
+# (http://relay…/generate_204) expects the relay's own answer.
+http://relay.hext.com.br {
 	reverse_proxy 127.0.0.1:3340
 }

@@ -80,6 +80,10 @@ sudo sqlite3 /var/lib/hext/hext-server.db \
 - O `hext-server` e o `iroh-relay` escutam só em `127.0.0.1`. Da internet chegam só o Caddy (80/443) e a
   descoberta de endereço do relay (UDP 7842).
 - O `/v1/relay-access` é bloqueado no Caddy e exige o segredo: só o relay da própria VM pergunta.
+- Por isso o app só usa o relay padrão com o servidor padrão: ele se registra no servidor antes de chegar ao
+  relay. Pelo IP, ou com `--server off` ou outro servidor, a conexão é só direta, a não ser que você informe
+  outro relay.
+- O Caddy usa só a Let's Encrypt (`acme_ca`), porque o relay lê o certificado da pasta dela.
 - Limites contra tentativas de adivinhar IDs: por computador, por IP (pelo `X-Forwarded-For` do Caddy) e
   de computadores novos por IP (veja `docs/hext-server.md`).
 - **Backup:** copie `/var/lib/hext/hext-server.db` de vez em quando. Ele guarda a ligação entre IDs e

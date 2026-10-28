@@ -167,21 +167,24 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
     rx
 }
 
-/// Viewer side: asks host `id` for access through `server`, checks its key
-/// against the one remembered for that ID, and connects from `endpoint`
-/// (directly or through the relay). Returns the connection and the
-/// one-time code to present.
+/// Logs in to `server` as a viewer: this also registers the device, which
+/// our relay requires before it serves it.
+pub async fn login(server: &str, key: &DeviceKey, name: &str) -> Result<Client> {
+    Client::connect(server, key, name, APP_VERSION, Role::Viewer)
+        .await
+        .context("servidor de sinalização")
+}
+
+/// Viewer side: asks host `id` for access through `client` (logged in),
+/// checks its key against the one remembered for that ID, and connects from
+/// `endpoint` (directly or through the relay). Returns the connection and
+/// the one-time code to present.
 pub async fn connect(
-    server: &str,
-    key: &DeviceKey,
-    name: &str,
+    mut client: Client,
     id: DeviceId,
     known: &KnownHosts,
     endpoint: &Endpoint,
 ) -> Result<(Connection, String)> {
-    let mut client = Client::connect(server, key, name, APP_VERSION, Role::Viewer)
-        .await
-        .context("servidor de sinalização")?;
     println!("Pedindo acesso a {id}... aguardando o outro computador aceitar.");
     let access = match client.request_access(id).await? {
         Ok(access) => access,

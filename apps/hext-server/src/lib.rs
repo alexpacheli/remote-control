@@ -76,7 +76,7 @@ async fn relay_access(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if !same_secret(presented, token) {
+    if !hext_crypto::constant_time_eq(presented.as_bytes(), token.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "");
     }
     let Some(key) = headers
@@ -104,15 +104,6 @@ async fn upgrade(
     ws.max_message_size(MAX_MESSAGE)
         .max_frame_size(MAX_MESSAGE)
         .on_upgrade(move |socket| async move { signal::handle(socket, &app.state, ip).await })
-}
-
-/// Compares secrets in constant time (no early exit on the first difference).
-fn same_secret(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0, |acc, (x, y)| acc | (x ^ y))
-            == 0
 }
 
 /// The device's address, for the per-address limits.
@@ -157,14 +148,6 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn secrets_compare_whole() {
-        assert!(same_secret("abc", "abc"));
-        assert!(!same_secret("abc", "abd"));
-        assert!(!same_secret("abc", "ab"));
-        assert!(!same_secret("", "a"));
-    }
 
     #[test]
     fn the_proxy_decides_the_address() {

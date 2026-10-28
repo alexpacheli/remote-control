@@ -20,6 +20,19 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Our relay (São Paulo), for when the two computers cannot connect directly.
 const DEFAULT_RELAY: &str = "https://relay.hext.com.br";
 
+/// The relay to use: the `--relay` option, except that our relay serves only
+/// devices registered with our server, so with another server (or none)
+/// the default relay is left out.
+fn relay_for(value: &str, server: Option<&str>) -> Result<Option<hext_net::RelayUrl>> {
+    if value == DEFAULT_RELAY && server != Some(DEFAULT_SERVER) {
+        tracing::info!(
+            "sem relay: o relay padrão só atende computadores registrados no servidor padrão (--relay <url> para usar outro)"
+        );
+        return Ok(None);
+    }
+    relay(value)
+}
+
 /// Our signaling server: IDs, presence and connection requests.
 const DEFAULT_SERVER: &str = "wss://signal.hext.com.br";
 

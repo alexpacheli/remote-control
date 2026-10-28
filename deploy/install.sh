@@ -54,13 +54,16 @@ sudo install -m 644 deploy/hext-server.service /etc/systemd/system/hext-server.s
 sudo install -m 644 deploy/iroh-relay.service /etc/systemd/system/iroh-relay.service
 sudo systemctl daemon-reload
 
-step "Firewall (80, 443 TCP; 7842 UDP)"
+step "Firewall (80, 443 TCP; 7842 UDP; IPv4 and IPv6)"
 # Oracle's images reject what is not listed: allow before the REJECT rule.
 allow() {
-    if ! sudo iptables -C INPUT -p "$1" --dport "$2" -j ACCEPT 2>/dev/null; then
-        reject=$(sudo iptables -L INPUT --line-numbers -n | awk '/REJECT/ {print $1; exit}')
-        sudo iptables -I INPUT "${reject:-1}" -p "$1" --dport "$2" -j ACCEPT
-    fi
+    for table in iptables ip6tables; do
+        command -v "$table" >/dev/null || continue
+        if ! sudo "$table" -C INPUT -p "$1" --dport "$2" -j ACCEPT 2>/dev/null; then
+            reject=$(sudo "$table" -L INPUT --line-numbers -n | awk '/REJECT/ {print $1; exit}')
+            sudo "$table" -I INPUT "${reject:-1}" -p "$1" --dport "$2" -j ACCEPT
+        fi
+    done
 }
 allow tcp 80
 allow tcp 443
