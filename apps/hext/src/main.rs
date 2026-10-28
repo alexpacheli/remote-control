@@ -77,6 +77,10 @@ struct HostArgs {
     /// Codificador de vídeo.
     #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
     encoder: CodecChoice,
+    /// Arquivo da chave deste computador (criado na primeira execução). O padrão
+    /// fica na pasta de configurações do usuário.
+    #[arg(long)]
+    device_key: Option<std::path::PathBuf>,
 }
 
 /// Which encoder (host) or decoder (viewer) to use.

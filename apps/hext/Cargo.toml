@@ -12,6 +12,7 @@ clap.workspace = true
 gethostname.workspace = true
 hext-capture.workspace = true
 hext-codec.workspace = true
+hext-crypto.workspace = true
 hext-input.workspace = true
 hext-net.workspace = true
 hext-proto.workspace = true

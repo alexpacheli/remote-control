@@ -1,9 +1,10 @@
 //! Hext Remote transport over QUIC.
 //!
-//! The host presents a self-signed certificate; the client authenticates it
-//! by pinning the certificate's SHA-256 [`Fingerprint`]. In F3 the
-//! fingerprint will come from the signaling server (device keys); in the LAN
-//! MVP it is shown by the host and typed into the client.
+//! The host presents a self-signed certificate derived from its device key
+//! (`hext_crypto`), so it is the same on every run; the client
+//! authenticates it by pinning the certificate's SHA-256 [`Fingerprint`].
+//! For now the host shows the fingerprint and it is typed into the client;
+//! in F3 it will come from the signaling server.
 
 mod endpoint;
 mod identity;

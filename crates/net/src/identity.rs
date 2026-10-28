@@ -1,6 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use hext_crypto::DeviceKey;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::Result;
@@ -57,7 +58,7 @@ impl FromStr for Fingerprint {
     }
 }
 
-/// A host's TLS certificate and private key.
+/// A host's TLS certificate and private key, derived from its device key.
 pub struct Identity {
     pub(crate) cert: CertificateDer<'static>,
     pub(crate) key: PrivatePkcs8KeyDer<'static>,
@@ -65,18 +66,30 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Generates a fresh self-signed identity. It lives only as long as the
-    /// process; persistent device keys arrive in F3.
-    pub fn generate() -> Result<Self> {
-        let certified = rcgen::generate_simple_self_signed(vec!["hext".to_owned()])?;
-        let cert = certified.cert.der().clone();
-        let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+    /// The identity of a device with this key. The certificate has no
+    /// random or time-dependent fields and Ed25519 signatures are
+    /// deterministic, so the same key always gives the same certificate and
+    /// fingerprint: a viewer can pin a host's fingerprint once.
+    pub fn from_device_key(device: &DeviceKey) -> Result<Self> {
+        let key = PrivatePkcs8KeyDer::from(device.pkcs8_der().to_vec());
+        let signing_key = rcgen::KeyPair::try_from(&key)?;
+        let mut params = rcgen::CertificateParams::new(vec!["hext".to_owned()])?;
+        params.serial_number = Some(rcgen::SerialNumber::from(1u64));
+        params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+        params.not_after = rcgen::date_time_ymd(9999, 12, 31);
+        let cert = params.self_signed(&signing_key)?.der().clone();
         let fingerprint = Fingerprint::of(&cert);
         Ok(Self {
             cert,
             key,
             fingerprint,
         })
+    }
+
+    /// A throwaway identity (a new random key), for tests.
+    pub fn generate() -> Result<Self> {
+        let key = DeviceKey::generate().map_err(|e| crate::NetError::Unexpected(e.to_string()))?;
+        Self::from_device_key(&key)
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -105,6 +118,17 @@ mod tests {
                 .unwrap(),
             fp
         );
+    }
+
+    #[test]
+    fn same_key_same_fingerprint() {
+        let key = DeviceKey::generate().unwrap();
+        let first = Identity::from_device_key(&key).unwrap();
+        let again = Identity::from_device_key(&DeviceKey::from_seed(key.seed()).unwrap()).unwrap();
+        assert_eq!(first.fingerprint(), again.fingerprint());
+        assert_eq!(first.cert, again.cert);
+        let other = Identity::generate().unwrap();
+        assert_ne!(first.fingerprint(), other.fingerprint());
     }
 
     #[test]

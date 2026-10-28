@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use hext_codec::{EncoderPreference, EncoderSettings};
+use hext_crypto::FileKeyStore;
 use hext_net::{Identity, NetError};
 use hext_proto::{PeerInfo, RejectReason};
 use hext_session::SessionError;
@@ -18,7 +19,7 @@ use crate::{APP_VERSION, CodecChoice, HostArgs, device_name, exe_name};
 const WRONG_CODE_PENALTY: Duration = Duration::from_secs(1);
 
 pub async fn run(args: HostArgs) -> Result<()> {
-    let identity = Identity::generate()?;
+    let identity = device_identity(args.device_key.as_deref())?;
     let endpoint = hext_net::host_endpoint(args.listen, &identity)?;
     let code = match args.code {
         Some(code) => code,
@@ -110,6 +111,23 @@ pub async fn run(args: HostArgs) -> Result<()> {
 }
 
 /// A random 9-digit code, like "482913557".
+/// The TLS identity from this computer's key, created on first run. The
+/// fingerprint stays the same between runs, so viewers can keep it.
+fn device_identity(path: Option<&std::path::Path>) -> Result<Identity> {
+    let store = match path {
+        Some(path) => FileKeyStore::new(path),
+        None => FileKeyStore::default_location()?,
+    };
+    let (key, created) = hext_crypto::load_or_create(&store)?;
+    if created {
+        info!(
+            "chave deste computador criada em {}",
+            store.path().display()
+        );
+    }
+    Ok(Identity::from_device_key(&key)?)
+}
+
 fn random_code() -> Result<String> {
     let mut bytes = [0u8; 8];
     SystemRandom::new()

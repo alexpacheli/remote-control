@@ -10,6 +10,7 @@ Acesso e suporte remoto para Windows, macOS e Linux, focado em fluidez.
 | Pasta | Conteúdo |
 |---|---|
 | `crates/proto` | Mensagens do protocolo: handshake, vídeo, input |
+| `crates/crypto` | Identidade do computador: chave Ed25519 criada na primeira execução e guardada no disco |
 | `crates/net` | QUIC, verificação do host por impressão digital, streams |
 | `crates/capture` | Captura de tela (DXGI no Windows, ScreenCaptureKit no macOS) e imagem de teste |
 | `crates/codec` | H.264 (codificar e decodificar): placa de vídeo (Media Foundation no Windows, VideoToolbox no Mac) ou OpenH264 em software |
@@ -55,6 +56,9 @@ Os binários ainda não são assinados (isso entra na F6):
 
    Ele mostra o **endereço**, um **código de acesso** e a **impressão digital**, além do comando
    pronto para o outro computador. Permita o acesso quando o Firewall perguntar (porta UDP 7420).
+   A impressão digital vem da chave deste computador, criada na primeira execução em
+   `%APPDATA%\HextRemote\device.key` (no Mac, `~/Library/Application Support/HextRemote`), e não muda
+   entre execuções: o comando do outro computador pode ser guardado.
 
 2. **No Mac**, cole o comando mostrado pelo Windows, trocando o nome do programa:
 
