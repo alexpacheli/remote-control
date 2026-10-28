@@ -10,15 +10,17 @@
 
 mod client;
 mod id;
+mod known_hosts;
 
 use hext_crypto::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
-pub use client::{Client, ClientError};
+pub use client::{Access, Client, ClientError, Role};
 pub use id::{DeviceId, ParseDeviceIdError};
+pub use known_hosts::{Check, KnownHosts};
 
 /// Signaling protocol version: both sides must speak the same one.
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 
 /// Path of the WebSocket endpoint on the server.
 pub const SIGNAL_PATH: &str = "/v1/signal";
@@ -65,6 +67,9 @@ pub enum ServerMsg {
         host_key: PublicKey,
         /// How to reach the host (transport-specific, e.g. `ip:port`).
         addrs: Vec<String>,
+        /// What to present to the host instead of an access code: good for
+        /// this one session.
+        session_code: String,
     },
     /// (To a viewer) the request went nowhere.
     Rejected { request: u64, reason: Rejection },
@@ -88,12 +93,20 @@ pub enum ClientMsg {
         signature: Signature,
         device_name: String,
         app_version: String,
+        /// A host, which takes requests (one login per device: a new one
+        /// replaces the old). A viewer only makes them.
+        accepts_requests: bool,
     },
     /// Ask to connect to device `to`. `request` is chosen by the viewer and
     /// comes back in the answer.
     Connect { request: u64, to: DeviceId },
-    /// (Host) accept a [`ServerMsg::Request`].
-    Accept { request: u64, addrs: Vec<String> },
+    /// (Host) accept a [`ServerMsg::Request`]: where to connect, and the
+    /// one-time code the viewer will present.
+    Accept {
+        request: u64,
+        addrs: Vec<String>,
+        session_code: String,
+    },
     /// (Host) refuse a [`ServerMsg::Request`].
     Reject { request: u64 },
 }
@@ -188,11 +201,13 @@ mod tests {
                 signature: key.sign(b"x"),
                 device_name: "PC".into(),
                 app_version: "0.1.0".into(),
+                accepts_requests: true,
             },
             ClientMsg::Connect { request: 7, to: id },
             ClientMsg::Accept {
                 request: 9,
                 addrs: vec!["192.168.0.10:7420".into()],
+                session_code: "123456789012".into(),
             },
             ClientMsg::Reject { request: 9 },
         ];

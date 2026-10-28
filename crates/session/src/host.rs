@@ -20,6 +20,9 @@ const IDLE_NOTICE: Duration = Duration::from_millis(250);
 pub struct HostConfig {
     pub peer: PeerInfo,
     pub access_code: String,
+    /// One-time codes given to viewers the host's user accepted (through
+    /// the server); each also opens one session.
+    pub session_codes: crate::SessionCodes,
     /// Display index (0 = primary).
     pub display: usize,
     /// Stream a synthetic pattern instead of the real screen.
@@ -40,7 +43,9 @@ struct Shared {
 pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo> {
     let (mut control, hello) =
         hext_net::host_handshake(&conn, config.peer.clone(), |hello: &Hello| {
-            if codes_match(&config.access_code, &hello.access_code) {
+            if codes_match(&config.access_code, &hello.access_code)
+                || config.session_codes.redeem(&hello.access_code)
+            {
                 Ok(())
             } else {
                 Err(RejectReason::WrongCode)

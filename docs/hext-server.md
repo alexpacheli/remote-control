@@ -12,20 +12,23 @@ Cada app mantém um WebSocket aberto em `wss://<servidor>/v1/signal`. As mensage
 ```
 App                                   Servidor
  │◄── challenge {protocol, nonce} ──────│   32 bytes aleatórios
- │─── hello {chave, assinatura, nome} ─►│   assinatura Ed25519 de "hext-signal-auth-v1\0" + nonce
+ │─── hello {chave, assinatura, nome,   │   assinatura Ed25519 de "hext-signal-auth-v1\0" + nonce
+ │           host ou técnico} ─────────►│
  │◄── welcome {id} ─────────────────────│   ID atribuído no primeiro login, o mesmo para sempre
 
 Técnico                  Servidor                   Host
  │── connect {1, id} ──────►│                          │
  │                          │── request {r, de, chave, nome} ─►│  (o host pergunta ao usuário)
- │                          │◄── accept {r, endereços} ────────│  ou reject {r}
- │◄─ accepted {1, chave do host, endereços} ─│                 │  ou rejected {1, motivo}
+ │                          │◄── accept {r, endereços, código} ─│  ou reject {r}
+ │◄─ accepted {1, chave do host, endereços, código} ─│         │  ou rejected {1, motivo}
 ```
 
 - **Login:** o app prova que tem a chave assinando o desafio. O servidor associa a chave pública a um ID
   aleatório no primeiro login (não sequencial) e devolve sempre o mesmo ID para a mesma chave. Não há senha
   nem token guardado.
-- **Mesma chave conectando de novo:** a conexão antiga é encerrada.
+- **Host e técnico:** no login, o app diz se recebe pedidos (host) ou só faz pedidos (técnico). Um novo
+  login de host com a mesma chave encerra o anterior (o computador reconectou); logins de técnico convivem
+  com o host do mesmo computador.
 - **Pedidos:** expiram em 60 s sem resposta (`rejected: timeout` para o técnico, `cancelled` para o host).
   Se o técnico sai, o host recebe `cancelled`; se o host sai, o técnico recebe `rejected: offline`. Só o
   host pedido pode responder.

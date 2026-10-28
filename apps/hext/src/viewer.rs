@@ -7,13 +7,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use hext_codec::{DecoderPreference, YuvFrame};
 use hext_input::keymap::{self, CommandKey};
+use hext_net::{Connection, Endpoint};
 use hext_proto::Os;
 use hext_proto::{Hello, InputEvent, MouseButton, PeerInfo};
 use hext_render::Renderer;
 use hext_session::client::{self, ClientHandle};
+use hext_signal::{DeviceId, KnownHosts};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -33,18 +35,15 @@ enum UserEvent {
 }
 
 pub fn run(args: ViewArgs) -> Result<()> {
-    let addr = parse_addr(&args.addr)?;
-    if args.fingerprint.is_none() {
-        warn!("sem --fingerprint: a conexão é cifrada, mas a identidade do host NÃO é verificada");
-    }
     let runtime = tokio::runtime::Runtime::new()?;
+    let (endpoint, conn, code) = runtime.block_on(open(&args))?;
     let hello = Hello {
         peer: PeerInfo::local(APP_VERSION, device_name()),
-        access_code: args.code.clone(),
+        access_code: code,
     };
 
     if args.headless {
-        return runtime.block_on(headless(addr, args, hello));
+        return runtime.block_on(headless(endpoint, conn, args, hello));
     }
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -53,10 +52,6 @@ pub fn run(args: ViewArgs) -> Result<()> {
 
     let (handle, closed_proxy) = (latest.clone(), proxy.clone());
     let session = runtime.block_on(async {
-        let endpoint = hext_net::client_endpoint(addr)?;
-        let conn = hext_net::connect(&endpoint, addr, args.fingerprint)
-            .await
-            .with_context(|| format!("falha ao conectar em {addr}"))?;
         let watch = conn.clone();
         let session = client::start(conn, hello, decoder(args.decoder), move |frame| {
             *handle.lock().expect("lock") = Some(frame.yuv);
@@ -281,12 +276,49 @@ impl ApplicationHandler<UserEvent> for Viewer {
     }
 }
 
-/// Receives and decodes without a window, printing stats every second.
-async fn headless(addr: std::net::SocketAddr, args: ViewArgs, hello: Hello) -> Result<()> {
+/// Connects to the host: by ID through the server (`--server`), or by IP
+/// with the access code. Returns the code to present to the host.
+async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
+    // An address first: "192.168.0.10" must never be taken for an ID.
+    let addr = parse_addr(&args.target);
+    if let (Err(_), Ok(id)) = (&addr, args.target.parse::<DeviceId>()) {
+        let Some(server) = &args.server else {
+            bail!("para conectar pelo ID, informe o servidor com --server");
+        };
+        if args.code.is_some() || args.fingerprint.is_some() {
+            warn!(
+                "pelo ID, --code e --fingerprint não são usados: o host aceita o pedido e a chave dele vem do servidor"
+            );
+        }
+        let key = crate::device_key(args.device_key.as_deref())?;
+        // Next to the key, so each key (profile) has its own.
+        let known = match &args.device_key {
+            Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
+            None => KnownHosts::default_location()?,
+        };
+        return crate::signaling::connect(server, &key, &device_name(), id, &known).await;
+    }
+    let addr = addr?;
+    let Some(code) = args.code.clone() else {
+        bail!("para conectar pelo IP, informe o código de acesso com --code");
+    };
+    if args.fingerprint.is_none() {
+        warn!("sem --fingerprint: a conexão é cifrada, mas a identidade do host NÃO é verificada");
+    }
     let endpoint = hext_net::client_endpoint(addr)?;
     let conn = hext_net::connect(&endpoint, addr, args.fingerprint)
         .await
         .with_context(|| format!("falha ao conectar em {addr}"))?;
+    Ok((endpoint, conn, code))
+}
+
+/// Receives and decodes without a window, printing stats every second.
+async fn headless(
+    endpoint: Endpoint,
+    conn: Connection,
+    args: ViewArgs,
+    hello: Hello,
+) -> Result<()> {
     let session = client::start(conn, hello, decoder(args.decoder), |_| {}).await?;
     println!(
         "Conectado a {} ({:?}, v{})",

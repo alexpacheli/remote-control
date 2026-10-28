@@ -16,7 +16,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use zeroize::Zeroizing;
 
-pub use store::{FileKeyStore, KeyStore, load_or_create};
+pub use store::{FileKeyStore, KeyStore, config_dir, load_or_create};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {

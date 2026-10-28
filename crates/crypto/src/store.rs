@@ -202,8 +202,8 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// This user's folder for the app's settings.
-fn config_dir() -> Result<PathBuf> {
+/// This user's folder for the app's settings (the key and other files).
+pub fn config_dir() -> Result<PathBuf> {
     let var = |name: &'static str| {
         std::env::var_os(name)
             .filter(|v| !v.is_empty())

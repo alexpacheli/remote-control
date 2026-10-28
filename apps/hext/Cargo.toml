@@ -18,6 +18,7 @@ hext-net.workspace = true
 hext-proto.workspace = true
 hext-render.workspace = true
 hext-session.workspace = true
+hext-signal.workspace = true
 ring.workspace = true
 tokio.workspace = true
 tracing.workspace = true
