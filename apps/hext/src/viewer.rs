@@ -144,11 +144,7 @@ impl Viewer {
             return;
         };
         let mut stats = session.stats.lock().expect("lock");
-        let path = match session.path() {
-            Some(p) if p.relay => " (relay)",
-            Some(_) => " (P2P)",
-            None => "",
-        };
+        let path = path_label(session);
         let mut title = format!("Hext Remote — {}{path}", session.host.device_name);
         if let Some(snapshot) = stats.snapshot() {
             title += &format!(
@@ -383,14 +379,24 @@ async fn headless(
         let (w, h) = (stats.width, stats.height);
         if let Some(snapshot) = stats.snapshot() {
             println!(
-                "{w}x{h} | {snapshot} | RTT {:.1} ms",
-                session.rtt().as_secs_f64() * 1000.0
+                "{w}x{h} | {snapshot} | RTT {:.1} ms{}",
+                session.rtt().as_secs_f64() * 1000.0,
+                path_label(&session)
             );
         }
     }
     session.close().await?;
     endpoint.close().await;
     Ok(())
+}
+
+/// " (P2P)" or " (relay)": the path the session is using now.
+fn path_label(session: &ClientHandle) -> &'static str {
+    match session.path() {
+        Some(p) if p.relay => " (relay)",
+        Some(_) => " (P2P)",
+        None => "",
+    }
 }
 
 fn decoder(choice: CodecChoice) -> DecoderPreference {
