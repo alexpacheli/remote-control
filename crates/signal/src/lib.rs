@@ -148,14 +148,14 @@ mod hex_array {
 
 mod hex_key {
     use hext_crypto::PublicKey;
-    use serde::{Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(v: &PublicKey, s: S) -> Result<S::Ok, S::Error> {
-        super::hex_array::serialize(v.as_bytes(), s)
+        s.collect_str(v)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PublicKey, D::Error> {
-        super::hex_array::deserialize(d).map(PublicKey::from_bytes)
+        <&str>::deserialize(d)?.parse().map_err(D::Error::custom)
     }
 }
 

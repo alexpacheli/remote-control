@@ -53,52 +53,49 @@ impl Db {
         })
     }
 
-    /// The ID of the device with this key, assigned on its first login (at
-    /// random, so IDs say nothing about how many devices exist or when
-    /// they joined). Updates its name and last-seen time.
-    pub fn login(
+    /// The ID of the device with this key, if it has logged in before;
+    /// updates its name and last-seen time.
+    pub fn find(
+        &self,
+        key: &PublicKey,
+        name: &str,
+        app_version: &str,
+    ) -> rusqlite::Result<Option<DeviceId>> {
+        let conn = self.conn.lock().expect("db lock");
+        let Some(id) = id_of(&conn, key)? else {
+            return Ok(None);
+        };
+        conn.execute(
+            "UPDATE devices SET name = ?2, app_version = ?3, last_seen = ?4 WHERE id = ?1",
+            params![id.get(), name, app_version, now()],
+        )?;
+        Ok(Some(id))
+    }
+
+    /// Gives a new device its ID: at random, so IDs say nothing about how
+    /// many devices exist or when they joined. (If the key is already
+    /// known, its ID.)
+    pub fn register(
         &self,
         key: &PublicKey,
         name: &str,
         app_version: &str,
     ) -> rusqlite::Result<DeviceId> {
         let conn = self.conn.lock().expect("db lock");
-        let now = now();
-        let known: Option<u32> = conn
-            .query_row(
-                "SELECT id FROM devices WHERE public_key = ?1",
-                params![key.as_bytes()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(id) = known.and_then(DeviceId::new) {
-            conn.execute(
-                "UPDATE devices SET name = ?2, app_version = ?3, last_seen = ?4 WHERE id = ?1",
-                params![id.get(), name, app_version, now],
-            )?;
-            return Ok(id);
-        }
         loop {
+            if let Some(id) = id_of(&conn, key)? {
+                return Ok(id);
+            }
             let id = self.random_id();
             let inserted = conn.execute(
                 "INSERT OR IGNORE INTO devices (id, public_key, name, app_version, created_at, last_seen)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![id.get(), key.as_bytes(), name, app_version, now],
+                params![id.get(), key.as_bytes(), name, app_version, now()],
             )?;
-            // Zero rows: the ID was taken (or the key raced in); try again.
             if inserted == 1 {
                 return Ok(id);
             }
-            let raced: Option<u32> = conn
-                .query_row(
-                    "SELECT id FROM devices WHERE public_key = ?1",
-                    params![key.as_bytes()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(id) = raced.and_then(DeviceId::new) {
-                return Ok(id);
-            }
+            // The ID was taken: draw another.
         }
     }
 
@@ -142,6 +139,21 @@ impl Db {
     }
 }
 
+/// The ID stored for `key`. An ID outside the 9-digit range (a damaged or
+/// hand-edited database) is an error, not a reason to register again.
+fn id_of(conn: &Connection, key: &PublicKey) -> rusqlite::Result<Option<DeviceId>> {
+    let stored: Option<u32> = conn
+        .query_row(
+            "SELECT id FROM devices WHERE public_key = ?1",
+            params![key.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    stored
+        .map(|n| DeviceId::new(n).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, n.into())))
+        .transpose()
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -158,9 +170,11 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let a = DeviceKey::generate().unwrap().public_key();
         let b = DeviceKey::generate().unwrap().public_key();
-        let id_a = db.login(&a, "A", "0.1.0").unwrap();
-        assert_eq!(db.login(&a, "A renamed", "0.2.0").unwrap(), id_a);
-        assert_ne!(db.login(&b, "B", "0.1.0").unwrap(), id_a);
+        assert_eq!(db.find(&a, "A", "0.1.0").unwrap(), None);
+        let id_a = db.register(&a, "A", "0.1.0").unwrap();
+        assert_eq!(db.find(&a, "A renamed", "0.2.0").unwrap(), Some(id_a));
+        assert_eq!(db.register(&a, "A", "0.1.0").unwrap(), id_a);
+        assert_ne!(db.register(&b, "B", "0.1.0").unwrap(), id_a);
     }
 
     #[test]
@@ -170,10 +184,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hext.db");
         let key = DeviceKey::generate().unwrap().public_key();
-        let id = Db::open(&path).unwrap().login(&key, "A", "0.1.0").unwrap();
+        let id = Db::open(&path)
+            .unwrap()
+            .register(&key, "A", "0.1.0")
+            .unwrap();
         assert_eq!(
-            Db::open(&path).unwrap().login(&key, "A", "0.1.0").unwrap(),
-            id
+            Db::open(&path).unwrap().find(&key, "A", "0.1.0").unwrap(),
+            Some(id)
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -192,6 +209,22 @@ mod tests {
             .filter(|w| w[0].abs_diff(w[1]) < 1_000)
             .count();
         assert_eq!(close, 0);
+    }
+
+    #[test]
+    fn a_damaged_id_is_an_error_not_a_hang() {
+        let db = Db::in_memory().unwrap();
+        let key = DeviceKey::generate().unwrap().public_key();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO devices VALUES (42, ?1, 'x', '0', 0, 0)",
+                params![key.as_bytes()],
+            )
+            .unwrap();
+        assert!(db.find(&key, "x", "0").is_err());
+        assert!(db.register(&key, "x", "0").is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hext_crypto::DeviceKey;
-use hext_server::{Db, State};
+use hext_server::{Config, Db, State};
 use hext_signal::{Client, ClientError, ClientMsg, DeviceId, PROTOCOL, Rejection, ServerMsg};
 
 /// A server on a random local port.
@@ -12,7 +12,11 @@ async fn server() -> (String, Arc<State>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let state = Arc::new(State::new(Db::in_memory().unwrap()));
-    tokio::spawn(hext_server::serve(listener, state.clone()));
+    tokio::spawn(hext_server::serve(
+        listener,
+        state.clone(),
+        Config::default(),
+    ));
     (url, state)
 }
 
@@ -113,14 +117,29 @@ async fn request_accept_and_decline() {
         }
     );
 
-    let audit: Vec<String> = state
-        .db
-        .audit_of(host.id())
-        .unwrap()
-        .into_iter()
-        .map(|(_, event)| event)
-        .collect();
-    assert_eq!(audit, ["requested", "accepted", "requested", "declined"]);
+    assert_eq!(
+        audit(&state, host.id(), 4).await,
+        ["requested", "accepted", "requested", "declined"]
+    );
+}
+
+/// The audit events about `to`, once there are `n` (they are written in
+/// the background).
+async fn audit(state: &State, to: DeviceId, n: usize) -> Vec<String> {
+    for _ in 0..200 {
+        let events: Vec<String> = state
+            .db
+            .audit_of(to)
+            .unwrap()
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect();
+        if events.len() >= n {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("audit entries never arrived");
 }
 
 #[tokio::test]
@@ -188,6 +207,73 @@ async fn guessing_ids_is_rate_limited() {
 }
 
 #[tokio::test]
+async fn reconnecting_does_not_reset_the_limit() {
+    let (url, _) = server().await;
+    let key = DeviceKey::generate().unwrap();
+    let mut last = None;
+    for round in 0..2u64 {
+        let mut viewer = login(&url, &key, "V").await;
+        for i in 0..6u64 {
+            let request = round * 10 + i;
+            let to = DeviceId::new(300_000_000 + request as u32).unwrap();
+            viewer
+                .send(&ClientMsg::Connect { request, to })
+                .await
+                .unwrap();
+            if let ServerMsg::Rejected { reason, .. } = recv(&mut viewer).await {
+                last = Some(reason);
+            }
+        }
+        viewer.close().await.unwrap();
+    }
+    // 12 requests in two connections: the last ones are over the limit of 10.
+    assert_eq!(last, Some(Rejection::TooManyRequests));
+}
+
+#[tokio::test]
+async fn one_waiting_request_per_viewer_and_host() {
+    let (url, _) = server().await;
+    let mut host = login(&url, &DeviceKey::generate().unwrap(), "H").await;
+    let mut viewer = login(&url, &DeviceKey::generate().unwrap(), "V").await;
+    let to = host.id();
+    viewer
+        .send(&ClientMsg::Connect { request: 1, to })
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut host).await, ServerMsg::Request { .. }));
+    // Asking again while the first waits does not pile up on the host.
+    viewer
+        .send(&ClientMsg::Connect { request: 2, to })
+        .await
+        .unwrap();
+    assert_eq!(
+        recv(&mut viewer).await,
+        ServerMsg::Rejected {
+            request: 2,
+            reason: Rejection::Busy
+        }
+    );
+}
+
+#[tokio::test]
+async fn new_devices_per_address_are_limited() {
+    let (url, _) = server().await;
+    let known = DeviceKey::generate().unwrap();
+    login(&url, &known, "K").await.close().await.unwrap();
+    for _ in 0..9 {
+        login(&url, &DeviceKey::generate().unwrap(), "N").await;
+    }
+    let refused = Client::connect(&url, &DeviceKey::generate().unwrap(), "N", "0.1.0").await;
+    assert!(
+        matches!(refused, Err(ClientError::Server(_))),
+        "{:?}",
+        refused.err()
+    );
+    // A device that already has an ID still gets in.
+    login(&url, &known, "K").await;
+}
+
+#[tokio::test]
 async fn a_viewer_leaving_cancels_its_request() {
     let (url, state) = server().await;
     let mut host = login(&url, &DeviceKey::generate().unwrap(), "H").await;
@@ -223,7 +309,9 @@ async fn unanswered_requests_time_out() {
         panic!("expected a request");
     };
     // As if the timeout had passed.
-    state.expire(Instant::now() + hext_server::signal::REQUEST_TIMEOUT);
+    state
+        .expire(Instant::now() + hext_server::signal::REQUEST_TIMEOUT)
+        .await;
     assert_eq!(
         recv(&mut viewer).await,
         ServerMsg::Rejected {

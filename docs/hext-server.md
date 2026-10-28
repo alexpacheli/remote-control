@@ -30,9 +30,13 @@ Técnico                  Servidor                   Host
   Se o técnico sai, o host recebe `cancelled`; se o host sai, o técnico recebe `rejected: offline`. Só o
   host pedido pode responder.
 - **Proteção:**
-  - até 10 pedidos por minuto por conexão (`too_many_requests`);
-  - até 5 pedidos esperando por host (`busy`);
-  - ID inexistente responde igual a ID offline, para não dar para sondar quais IDs existem.
+  - pedidos de conexão: até 10 por minuto por computador e 30 por endereço IP (`too_many_requests`). O
+    limite não zera ao reconectar;
+  - um pedido esperando por técnico e host, e até 5 por host (`busy`);
+  - logins: até 30 por minuto por endereço IP; computadores novos (IDs entregues): até 10 por hora por IP;
+  - ID inexistente responde igual a ID offline, para não dar para sondar quais IDs existem;
+  - nomes sem caracteres de controle nem invisíveis (como os que invertem a direção do texto), com até
+    64 caracteres, porque o nome do técnico aparece para quem está no host.
 - **Auditoria:** a tabela `audit` registra quem pediu, para qual ID, quando e o resultado (`requested`,
   `accepted`, `declined`, `timeout`, `cancelled`, `offline`, `busy`, `rate_limited`).
 - **Conexão viva:** o servidor manda ping a cada 20 s e desconecta quem fica 60 s em silêncio.
@@ -44,7 +48,10 @@ cargo run -p hext-server -- --listen 127.0.0.1:8080 --db hext-server.db
 curl http://127.0.0.1:8080/health   # ok
 ```
 
-O servidor fala HTTP simples. O TLS fica num proxy na frente, para os apps usarem `wss://`.
+O servidor fala HTTP simples. O TLS fica num proxy na frente, para os apps usarem `wss://`. Atrás do
+proxy, use `--behind-proxy`: os limites por IP passam a usar o endereço que o proxy coloca em
+`X-Forwarded-For`. Nesse caso, a porta do servidor precisa ficar acessível **só** para o proxy
+(`127.0.0.1`), ou qualquer um poderia mandar um `X-Forwarded-For` falso.
 
 ### Docker
 
@@ -52,6 +59,8 @@ O servidor fala HTTP simples. O TLS fica num proxy na frente, para os apps usare
 docker build -f apps/hext-server/Dockerfile -t hext-server .
 docker run -d --name hext-server -p 127.0.0.1:8080:8080 -v hext-data:/data hext-server
 ```
+
+A imagem já roda com `--behind-proxy`, por isso a porta é publicada só em `127.0.0.1`.
 
 O banco fica no volume `/data` (`hext-server.db`). O backup é copiar esse arquivo.
 

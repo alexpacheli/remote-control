@@ -1,6 +1,6 @@
 //! The app's side of signaling.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -138,8 +138,14 @@ fn unexpected(msg: &ServerMsg) -> ClientError {
     }
 }
 
-/// TLS with the usual public CAs, on the same crypto (ring) as the rest.
+/// TLS with the usual public CAs, on the same crypto (ring) as the rest
+/// (built once: the app reconnects often).
 fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(build_tls_config).clone()
+}
+
+fn build_tls_config() -> Arc<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };

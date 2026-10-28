@@ -12,4 +12,6 @@ USER hext
 VOLUME /data
 EXPOSE 8080
 # Plain HTTP: put a TLS proxy (Caddy) in front, so devices use wss://.
-ENTRYPOINT ["hext-server", "--listen", "0.0.0.0:8080", "--db", "/data/hext-server.db"]
+# Publish the port only on 127.0.0.1, where the proxy reaches it: the
+# per-address limits trust the proxy's X-Forwarded-For.
+ENTRYPOINT ["hext-server", "--listen", "0.0.0.0:8080", "--db", "/data/hext-server.db", "--behind-proxy"]
