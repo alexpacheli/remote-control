@@ -85,8 +85,9 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
 
     // Video goes out as datagrams with FEC (see `hext_net::video`).
     let video = conn.clone();
+    let bitrate = config.encoder.bitrate_bps;
     let mut writer = tokio::spawn(async move {
-        let mut sender = VideoSender::default();
+        let mut sender = VideoSender::new(bitrate);
         loop {
             match tokio::time::timeout(IDLE_NOTICE, frames_rx.recv()).await {
                 Ok(Some(frame)) => sender.send(&video, &frame).await?,
