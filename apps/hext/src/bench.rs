@@ -10,6 +10,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, bail};
+    use hext_capture::PixelFormat;
     use hext_codec::{EncoderPreference, EncoderSettings};
 
     hext_capture::preflight()?;
@@ -35,32 +36,47 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     };
     let (width, height) = (frame.width, frame.height);
     println!(
-        "{width}x{height}, {} quadros por configuração a {} fps, {} Mbps; \
+        "{width}x{height} ({:?}), {} quadros por configuração a {} fps, {} Mbps; \
          a imagem da tela rola 8 linhas por quadro.\n",
-        args.frames, args.fps, args.bitrate_mbps
+        frame.format, args.frames, args.fps, args.bitrate_mbps
     );
 
-    // Frame t: the screenshot scrolled up by 8 rows per frame, wrapping around.
-    let row = width as usize * 4;
-    let rows = height as usize;
+    // Frame t: the screenshot scrolled up by 8 rows per frame, wrapping
+    // around (in NV12 each plane scrolls on its own: 8 Y rows, 4 UV rows).
+    let (w, h) = (width as usize, height as usize);
+    let (format, planes) = match frame.format {
+        PixelFormat::Bgra => (
+            hext_codec::PixelFormat::Bgra,
+            vec![(0..w * h * 4, w * 4, 8)],
+        ),
+        PixelFormat::Nv12 => (
+            hext_codec::PixelFormat::Nv12,
+            vec![(0..w * h, w, 8), (w * h..w * h * 3 / 2, w, 4)],
+        ),
+    };
     let image_at = |t: u32, out: &mut Vec<u8>| {
-        let offset = (t as usize * 8 % rows) * row;
         out.clear();
-        out.extend_from_slice(&frame.data[offset..]);
-        out.extend_from_slice(&frame.data[..offset]);
+        for (range, row, step) in &planes {
+            let plane = &frame.data[range.clone()];
+            let offset = (t as usize * step * row) % plane.len();
+            out.extend_from_slice(&plane[offset..]);
+            out.extend_from_slice(&plane[..offset]);
+        }
     };
 
     println!(
-        "{:<42} {:>9} {:>9} {:>10}",
+        "{:<44} {:>9} {:>9} {:>10}",
         "configuração", "média", "p95", "KB/quadro"
     );
-    for (label, stats) in hext_codec::benchmark(settings, width, height, args.frames, image_at) {
+    for (label, stats) in
+        hext_codec::benchmark(settings, width, height, format, args.frames, image_at)
+    {
         match stats {
             Ok(s) => println!(
-                "{label:<42} {:>6.2} ms {:>6.2} ms {:>10.1}",
+                "{label:<44} {:>6.2} ms {:>6.2} ms {:>10.1}",
                 s.avg_ms, s.p95_ms, s.avg_kb
             ),
-            Err(e) => println!("{label:<42} falhou: {e}"),
+            Err(e) => println!("{label:<44} falhou: {e}"),
         }
     }
     Ok(())

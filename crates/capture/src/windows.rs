@@ -29,7 +29,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::core::Interface;
 
-use crate::{CaptureError, Capturer, Frame, Rect, even};
+use crate::{CaptureError, Capturer, Frame, PixelFormat, Rect, even};
 
 fn platform(e: windows::core::Error) -> CaptureError {
     CaptureError::Platform(e.to_string())
@@ -150,6 +150,7 @@ impl DxgiCapturer {
         let frame = self.frame.get_or_insert_with(|| Frame {
             width: 0,
             height: 0,
+            format: PixelFormat::Bgra,
             data: Vec::new(),
         });
         frame.width = width;

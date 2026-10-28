@@ -51,7 +51,8 @@ use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 use crate::h264::{self, PROFILE_BASELINE};
 use crate::nv12::bgra_to_nv12;
 use crate::{
-    CodecError, Encoded, EncoderSettings, VideoEncoder, check_frame, merge, profile_error,
+    CodecError, Encoded, EncoderSettings, Image, PixelFormat, VideoEncoder, check_frame, merge,
+    profile_error,
 };
 
 /// Longest wait for the encoder to ask for input or deliver output.
@@ -244,23 +245,26 @@ impl MfEncoder {
 }
 
 impl VideoEncoder for MfEncoder {
-    fn encode(
-        &mut self,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<Option<Encoded>, CodecError> {
-        check_frame(width, height, bgra)?;
+    fn encode(&mut self, image: &Image<'_>) -> Result<Option<Encoded>, CodecError> {
+        check_frame(image)?;
+        let (width, height) = (image.width, image.height);
         if !matches!(&self.session, Some(s) if (s.width, s.height) == (width, height)) {
             self.session = None;
             self.session = Some(self.open_session(width, height)?);
             self.frame_index = 0;
         }
 
-        bgra_to_nv12(width, height, bgra, &mut self.yuv, &mut self.nv12);
+        // The transform takes NV12; BGRA is converted on the CPU first.
+        let nv12 = match image.format {
+            PixelFormat::Nv12 => image.data,
+            PixelFormat::Bgra => {
+                bgra_to_nv12(width, height, image.data, &mut self.yuv, &mut self.nv12);
+                &self.nv12
+            }
+        };
         let fps = i64::from(self.settings.max_fps.round().max(1.0) as u32);
         let duration = HNS_PER_SEC / fps;
-        let sample = memory_sample(&self.nv12, self.frame_index * duration, duration)?;
+        let sample = memory_sample(nv12, self.frame_index * duration, duration)?;
         self.frame_index += 1;
 
         if std::mem::take(&mut self.force_keyframe) {

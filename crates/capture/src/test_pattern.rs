@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{CaptureError, Capturer, Frame, Rect, even};
+use crate::{CaptureError, Capturer, Frame, PixelFormat, Rect, even};
 
 /// Synthetic animated screen: a gradient background with a moving square.
 ///
@@ -21,6 +21,7 @@ impl TestPattern {
             frame: Frame {
                 width,
                 height,
+                format: PixelFormat::Bgra,
                 data: vec![0; (width * height * 4) as usize],
             },
             interval: Duration::from_secs(1) / fps.max(1),

@@ -1,11 +1,12 @@
 //! Hardware H.264 encoding through VideoToolbox (macOS).
 //!
 //! A `VTCompressionSession` runs on the Mac's media engine (Apple silicon, or
-//! the Intel GPU / T2 chip on Intel Macs). Frames go in as BGRA, copied once
-//! into an IOSurface-backed pixel buffer from the session's own pool; the
-//! media engine converts them to YUV itself, so the CPU does no colour
-//! conversion. Handing over the captured IOSurface directly (zero-copy) can
-//! come later.
+//! the Intel GPU / T2 chip on Intel Macs). Frames are copied once into an
+//! IOSurface-backed pixel buffer from the session's own pool. NV12, as the
+//! macOS capture delivers it, goes straight to the media engine; BGRA is
+//! also accepted, but VideoToolbox's own conversion of it costs ~4.5 ms per
+//! 1080p frame on a Mac mini (`hext bench`). Handing over the captured
+//! IOSurface directly (zero-copy) can come later.
 //!
 //! Low-latency rate control (macOS 11.3+) is requested when available: no
 //! frame reordering and each frame's output right after its input, which
@@ -46,21 +47,18 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxFrameDelayCount,
-    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-    kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
-    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Baseline_AutoLevel,
-    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
+    kVTCompressionPropertyKey_YCbCrMatrix, kVTEncodeFrameOptionKey_ForceKeyFrame,
+    kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
 use crate::h264::{self, PROFILE_BASELINE};
-use crate::nv12::bgra_to_nv12;
 use crate::{
-    CodecError, Encoded, EncoderSettings, SoftwareEncoder, VideoEncoder, check_frame, merge,
-    profile_error,
+    CodecError, Encoded, EncoderSettings, Image, PixelFormat, SoftwareEncoder, VideoEncoder,
+    check_frame, merge, profile_error,
 };
 
 /// A keyframe at least every minute (frames are only encoded when the screen
@@ -77,27 +75,6 @@ const PROBE_SIZE: (u32, u32) = (640, 480);
 
 fn status_error(context: &str, status: i32) -> CodecError {
     CodecError::Hardware(format!("{context}: OSStatus {status}"))
-}
-
-/// Session options that trade speed against other things; the host uses
-/// [`Tuning::HOST`], and [`benchmark`] compares the alternatives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Tuning {
-    /// Low-latency rate control.
-    low_latency: bool,
-    /// Input in NV12 (converted beforehand) instead of BGRA (converted by
-    /// VideoToolbox).
-    nv12: bool,
-    /// `PrioritizeEncodingSpeedOverQuality`.
-    speed: bool,
-}
-
-impl Tuning {
-    const HOST: Self = Self {
-        low_latency: true,
-        nv12: false,
-        speed: false,
-    };
 }
 
 pub struct VtEncoder {
@@ -171,8 +148,7 @@ impl Timings {
 struct Session {
     width: u32,
     height: u32,
-    /// Input is NV12 rather than BGRA.
-    nv12: bool,
+    format: PixelFormat,
     session: CFRetained<VTCompressionSession>,
     /// Shared with the output callback through its refcon pointer: boxed so
     /// its address is stable, and outlives the session (see `Drop`).
@@ -190,7 +166,9 @@ impl VtEncoder {
         // Fails right away (so `Auto` picks software) if there is no
         // hardware encoder or it refuses the settings.
         let (width, height) = PROBE_SIZE;
-        let (session, low_latency) = Session::open_best(&settings, width, height)?;
+        // NV12, what the macOS capture delivers, so the session is reused.
+        let (session, low_latency) =
+            Session::open_best(&settings, width, height, PixelFormat::Nv12)?;
         let encoder = Self {
             settings,
             low_latency,
@@ -211,25 +189,22 @@ impl VtEncoder {
 }
 
 impl VideoEncoder for VtEncoder {
-    fn encode(
-        &mut self,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<Option<Encoded>, CodecError> {
-        check_frame(width, height, bgra)?;
-        if !matches!(&self.session, Some(s) if (s.width, s.height) == (width, height)) {
+    fn encode(&mut self, image: &Image<'_>) -> Result<Option<Encoded>, CodecError> {
+        check_frame(image)?;
+        let (width, height, format) = (image.width, image.height, image.format);
+        if !matches!(&self.session, Some(s) if (s.width, s.height, s.format) == (width, height, format))
+        {
             self.session = None;
             // A new session starts with a keyframe anyway.
             self.force_keyframe = false;
-            let (session, low_latency) = Session::open_best(&self.settings, width, height)?;
+            let (session, low_latency) = Session::open_best(&self.settings, width, height, format)?;
             self.session = Some(session);
             self.low_latency = low_latency;
         }
 
         let keyframe = std::mem::take(&mut self.force_keyframe);
         let session = self.session.as_mut().expect("session opened above");
-        let result = session.encode(bgra, keyframe);
+        let result = session.encode(image.data, keyframe);
         match &result {
             // Start over (with a keyframe) if the caller keeps using us.
             Err(_) => self.session = None,
@@ -263,16 +238,13 @@ impl Session {
         settings: &EncoderSettings,
         width: u32,
         height: u32,
+        format: PixelFormat,
     ) -> Result<(Self, bool), CodecError> {
-        match Self::open(settings, width, height, Tuning::HOST) {
+        match Self::open(settings, width, height, format, true) {
             Ok(session) => Ok((session, true)),
             Err(e) => {
                 tracing::debug!("VideoToolbox sem baixa latência em {width}x{height}: {e}");
-                let tuning = Tuning {
-                    low_latency: false,
-                    ..Tuning::HOST
-                };
-                Ok((Self::open(settings, width, height, tuning)?, false))
+                Ok((Self::open(settings, width, height, format, false)?, false))
             }
         }
     }
@@ -281,14 +253,15 @@ impl Session {
         settings: &EncoderSettings,
         width: u32,
         height: u32,
-        tuning: Tuning,
+        format: PixelFormat,
+        low_latency: bool,
     ) -> Result<Self, CodecError> {
         let outputs: Box<Outputs> = Box::default();
         let yes: &CFType = CFBoolean::new(true);
 
         let mut spec_keys =
             vec![unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder }];
-        if tuning.low_latency {
+        if low_latency {
             spec_keys.push(unsafe { kVTVideoEncoderSpecification_EnableLowLatencyRateControl });
         }
         let spec_values = vec![yes; spec_keys.len()];
@@ -296,12 +269,11 @@ impl Session {
 
         // The pool hands out IOSurface-backed buffers the media engine reads
         // directly.
-        let pixel_format = if tuning.nv12 {
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        } else {
-            kCVPixelFormatType_32BGRA
+        let pixel_format = match format {
+            PixelFormat::Nv12 => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            PixelFormat::Bgra => kCVPixelFormatType_32BGRA,
         };
-        let format = CFNumber::new_i32(pixel_format as i32);
+        let pixel_format = CFNumber::new_i32(pixel_format as i32);
         let (w, h) = (
             CFNumber::new_i32(width as i32),
             CFNumber::new_i32(height as i32),
@@ -315,7 +287,7 @@ impl Session {
                     kCVPixelBufferHeightKey,
                     kCVPixelBufferIOSurfacePropertiesKey,
                 ],
-                &[&format, &w, &h, &iosurface],
+                &[&pixel_format, &w, &h, &iosurface],
             )
         };
 
@@ -350,7 +322,7 @@ impl Session {
         let this = Self {
             width,
             height,
-            nv12: tuning.nv12,
+            format,
             session,
             outputs,
             started: Instant::now(),
@@ -359,12 +331,6 @@ impl Session {
             timings: Timings::default(),
         };
         this.configure(settings, fps)?;
-        if tuning.speed {
-            this.set(
-                unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
-                CFBoolean::new(true),
-            );
-        }
         let status = unsafe { this.session.prepare_to_encode_frames() };
         if status != 0 {
             return Err(status_error("PrepareToEncodeFrames", status));
@@ -437,12 +403,18 @@ impl Session {
         status == 0
     }
 
-    /// Encodes one image: BGRA, or NV12 if the session was opened for it.
+    /// Encodes one image, in the format the session was opened for.
     fn encode(&mut self, image: &[u8], keyframe: bool) -> Result<Option<Encoded>, CodecError> {
         let started = Instant::now();
         let pixels = self.pixel_buffer()?;
         let buffered = Instant::now();
-        copy_into(&pixels, self.width, self.height, image, self.nv12)?;
+        copy_into(
+            &pixels,
+            self.width,
+            self.height,
+            image,
+            self.format == PixelFormat::Nv12,
+        )?;
         let copied = Instant::now();
 
         let pts = unsafe { CMTime::new(self.next_pts(), TIMESCALE) };
@@ -727,71 +699,61 @@ pub struct BenchStats {
 /// first keyframe, and the media engine ramping up its clock).
 const BENCH_WARMUP: u32 = 10;
 
-/// Encodes the same images with OpenH264 and with each VideoToolbox
-/// configuration, paced at `settings.max_fps` like the host, and reports
-/// how long one `encode` takes in each.
+/// Encodes the same images with OpenH264 and with VideoToolbox (with and
+/// without low-latency rate control), paced at `settings.max_fps` like the
+/// host, and reports how long one `encode` takes in each.
 ///
-/// `image_at(t, buffer)` writes frame `t` (tightly packed BGRA) into
-/// `buffer`; producing it, and the NV12 conversion where needed, are not
-/// counted.
+/// `image_at(t, buffer)` writes frame `t` (in `format`) into `buffer`;
+/// producing it is not counted.
 pub fn benchmark(
     settings: EncoderSettings,
     width: u32,
     height: u32,
+    format: PixelFormat,
     frames: u32,
     mut image_at: impl FnMut(u32, &mut Vec<u8>),
 ) -> Vec<(String, Result<BenchStats, CodecError>)> {
     let mut results = Vec::new();
-    let mut bgra = Vec::new();
-    let mut nv12 = Vec::new();
-    let mut yuv = None;
+    let mut data = Vec::new();
     let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
+    let input = match format {
+        PixelFormat::Bgra => "BGRA",
+        PixelFormat::Nv12 => "NV12",
+    };
 
     let mut software = SoftwareEncoder::new(settings);
     let stats = measure(frames, interval, |t| {
-        image_at(t, &mut bgra);
+        image_at(t, &mut data);
         let started = Instant::now();
-        let encoded = software.encode(width, height, &bgra)?;
+        let encoded = software.encode(&Image {
+            width,
+            height,
+            format,
+            data: &data,
+        })?;
         Ok((started.elapsed(), encoded))
     });
-    results.push(("CPU (OpenH264), BGRA".to_owned(), stats));
+    results.push((format!("CPU (OpenH264), {input}"), stats));
 
     for low_latency in [true, false] {
-        for nv12_input in [false, true] {
-            for speed in [false, true] {
-                let tuning = Tuning {
-                    low_latency,
-                    nv12: nv12_input,
-                    speed,
-                };
-                let label = format!(
-                    "GPU, {}, {}{}",
-                    if nv12_input { "NV12" } else { "BGRA" },
-                    if low_latency {
-                        "baixa latência"
-                    } else {
-                        "normal"
-                    },
-                    if speed { ", velocidade" } else { "" },
-                );
-                let stats =
-                    Session::open(&settings, width, height, tuning).and_then(|mut session| {
-                        measure(frames, interval, |t| {
-                            image_at(t, &mut bgra);
-                            let image = if nv12_input {
-                                bgra_to_nv12(width, height, &bgra, &mut yuv, &mut nv12);
-                                &nv12
-                            } else {
-                                &bgra
-                            };
-                            let started = Instant::now();
-                            let encoded = session.encode(image, t == 0)?;
-                            Ok((started.elapsed(), encoded))
-                        })
-                    });
-                results.push((label, stats));
+        let label = format!(
+            "GPU (VideoToolbox), {input}, {}",
+            if low_latency {
+                "baixa latência"
+            } else {
+                "normal"
             }
-        }
+        );
+        let stats =
+            Session::open(&settings, width, height, format, low_latency).and_then(|mut session| {
+                measure(frames, interval, |t| {
+                    image_at(t, &mut data);
+                    let started = Instant::now();
+                    let encoded = session.encode(&data, t == 0)?;
+                    Ok((started.elapsed(), encoded))
+                })
+            });
+        results.push((label, stats));
     }
     results
 }
@@ -862,7 +824,7 @@ mod tests {
             if t == 10 {
                 encoder.force_keyframe();
             }
-            let Some(encoded) = encoder.encode(w, h, &image(w, h, t)).unwrap() else {
+            let Some(encoded) = encoder.encode(&Image::bgra(w, h, &image(w, h, t))).unwrap() else {
                 continue; // dropped by rate control
             };
             if t == 0 || t == 10 {
@@ -883,11 +845,42 @@ mod tests {
 
         // A new size starts a new stream with a keyframe.
         let encoded = encoder
-            .encode(320, 240, &image(320, 240, 0))
+            .encode(&Image::bgra(320, 240, &image(320, 240, 0)))
             .unwrap()
             .unwrap();
         assert!(encoded.keyframe);
         assert!(h264::scan(&encoded.data).has_sps);
+    }
+
+    /// The macOS capture's format: NV12 straight to the media engine.
+    #[test]
+    fn hardware_takes_nv12() {
+        let Some(mut encoder) = encoder() else {
+            return;
+        };
+        let mut decoder = H264Decoder::new().unwrap();
+        let (w, h) = (640, 360);
+        let mut decoded = 0;
+        for t in 0..10 {
+            let nv12 = crate::tests::nv12_image(w, h, t);
+            let Some(encoded) = encoder.encode(&Image::nv12(w, h, &nv12)).unwrap() else {
+                continue;
+            };
+            if t == 0 {
+                assert!(encoded.keyframe);
+            }
+            if let Some(frame) = decoder.decode(&encoded.data).unwrap() {
+                // Background 40 → ~51 in BT.601 limited range, unchanged.
+                let corner = frame.y[(h as usize - 1) * w as usize];
+                assert!((45..=58).contains(&corner), "luma {corner}");
+                decoded += 1;
+            }
+        }
+        assert!(decoded >= 8, "decoded {decoded} of 10");
+        // Switching format restarts the stream with a keyframe.
+        let bgra = image(w, h, 0);
+        let encoded = encoder.encode(&Image::bgra(w, h, &bgra)).unwrap().unwrap();
+        assert!(encoded.keyframe);
     }
 
     #[test]
@@ -897,7 +890,7 @@ mod tests {
         };
         let (w, h) = (320, 240);
         let red: Vec<u8> = [0, 0, 255, 255].repeat((w * h) as usize);
-        let encoded = encoder.encode(w, h, &red).unwrap().unwrap();
+        let encoded = encoder.encode(&Image::bgra(w, h, &red)).unwrap().unwrap();
         let frame = H264Decoder::new()
             .unwrap()
             .decode(&encoded.data)
@@ -917,7 +910,11 @@ mod tests {
         let Some(mut encoder) = encoder() else {
             return;
         };
-        assert!(encoder.encode(63, 64, &[0; 63 * 64 * 4]).is_err());
-        assert!(encoder.encode(64, 64, &[0; 10]).is_err());
+        assert!(
+            encoder
+                .encode(&Image::bgra(63, 64, &[0; 63 * 64 * 4]))
+                .is_err()
+        );
+        assert!(encoder.encode(&Image::bgra(64, 64, &[0; 10])).is_err());
     }
 }
