@@ -13,7 +13,7 @@ use hext_net::{HostPin, Identity, NetError};
 use hext_proto::{Hello, PeerInfo, RejectReason};
 use hext_session::host::HostConfig;
 use hext_session::{SessionCodes, SessionError, client, host};
-use hext_signal::{Client, ClientMsg, ServerMsg};
+use hext_signal::{Client, ClientMsg, Role, ServerMsg};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn accepted_by_id_then_streams() {
@@ -50,7 +50,7 @@ async fn accepted_by_id_then_streams() {
             });
         }
     });
-    let mut host_signal = Client::connect(&server, &host_key, "Host", "test")
+    let mut host_signal = Client::connect(&server, &host_key, "Host", "test", Role::Host)
         .await
         .unwrap();
     let host_id = host_signal.id();
@@ -76,7 +76,7 @@ async fn accepted_by_id_then_streams() {
 
     // The viewer asks by ID.
     let viewer_key = DeviceKey::generate().unwrap();
-    let mut viewer_signal = Client::connect(&server, &viewer_key, "Técnico", "test")
+    let mut viewer_signal = Client::connect(&server, &viewer_key, "Técnico", "test", Role::Viewer)
         .await
         .unwrap();
     let access = viewer_signal

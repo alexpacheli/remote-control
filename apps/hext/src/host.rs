@@ -41,7 +41,13 @@ pub async fn run(args: HostArgs) -> Result<()> {
     }
 
     let port = endpoint.local_addr()?.port();
-    let ip = local_ip().map_or_else(|| "<IP-deste-PC>".to_owned(), |ip| ip.to_string());
+    // Where other machines reach this one: the address listened on, or the
+    // LAN address when listening on all.
+    let reachable = match args.listen.ip() {
+        ip if ip.is_unspecified() => local_ip(),
+        ip => Some(ip),
+    };
+    let ip = reachable.map_or_else(|| "<IP-deste-PC>".to_owned(), |ip| ip.to_string());
     println!();
     println!("  Hext Remote — aguardando conexão");
     println!("  Endereço:          {ip}:{port}");
@@ -84,11 +90,11 @@ pub async fn run(args: HostArgs) -> Result<()> {
     let slot = Arc::new(Semaphore::new(1));
 
     if let Some(server) = args.server.clone() {
-        // Viewers accepted through the server connect to this address: the
-        // one listened on, or this machine's LAN address when listening on all.
-        let ip = match args.listen.ip() {
-            ip if ip.is_unspecified() => local_ip().unwrap_or(ip),
-            ip => ip,
+        // Viewers accepted through the server connect to this address.
+        let Some(ip) = reachable else {
+            anyhow::bail!(
+                "não foi possível descobrir o IP deste computador na rede; informe-o com --listen <IP>:{port}"
+            );
         };
         let addr = SocketAddr::new(ip, port);
         tokio::spawn(crate::signaling::host(

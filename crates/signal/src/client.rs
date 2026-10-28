@@ -46,6 +46,15 @@ pub struct Client {
     next_request: u64,
 }
 
+/// How a device logs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Takes requests for its ID (one host login per device).
+    Host,
+    /// Only makes requests; does not disturb a host on the same device.
+    Viewer,
+}
+
 /// A host's yes: what to expect and how to get in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Access {
@@ -65,6 +74,7 @@ impl Client {
         key: &DeviceKey,
         device_name: &str,
         app_version: &str,
+        role: Role,
     ) -> Result<Self> {
         let url = format!("{}{SIGNAL_PATH}", server.trim_end_matches('/'));
         let login = async {
@@ -98,6 +108,7 @@ impl Client {
                     signature: key.sign(&auth_message(&nonce)),
                     device_name: device_name.to_owned(),
                     app_version: app_version.to_owned(),
+                    accepts_requests: role == Role::Host,
                 })
                 .await?;
             match client.recv().await? {

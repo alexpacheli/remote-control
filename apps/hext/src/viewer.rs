@@ -15,7 +15,7 @@ use hext_proto::Os;
 use hext_proto::{Hello, InputEvent, MouseButton, PeerInfo};
 use hext_render::Renderer;
 use hext_session::client::{self, ClientHandle};
-use hext_signal::DeviceId;
+use hext_signal::{DeviceId, KnownHosts};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -279,14 +279,26 @@ impl ApplicationHandler<UserEvent> for Viewer {
 /// Connects to the host: by ID through the server (`--server`), or by IP
 /// with the access code. Returns the code to present to the host.
 async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
-    if let Ok(id) = args.target.parse::<DeviceId>() {
+    // An address first: "192.168.0.10" must never be taken for an ID.
+    let addr = parse_addr(&args.target);
+    if let (Err(_), Ok(id)) = (&addr, args.target.parse::<DeviceId>()) {
         let Some(server) = &args.server else {
             bail!("para conectar pelo ID, informe o servidor com --server");
         };
+        if args.code.is_some() || args.fingerprint.is_some() {
+            warn!(
+                "pelo ID, --code e --fingerprint não são usados: o host aceita o pedido e a chave dele vem do servidor"
+            );
+        }
         let key = crate::device_key(args.device_key.as_deref())?;
-        return crate::signaling::connect(server, &key, &device_name(), id).await;
+        // Next to the key, so each key (profile) has its own.
+        let known = match &args.device_key {
+            Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
+            None => KnownHosts::default_location()?,
+        };
+        return crate::signaling::connect(server, &key, &device_name(), id, &known).await;
     }
-    let addr = parse_addr(&args.target)?;
+    let addr = addr?;
     let Some(code) = args.code.clone() else {
         bail!("para conectar pelo IP, informe o código de acesso com --code");
     };

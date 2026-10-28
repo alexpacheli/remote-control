@@ -42,10 +42,11 @@ impl SessionCodes {
         // Compare against every code (constant time each), then remove.
         let found = codes
             .iter()
-            .map(|(code, _)| codes_match(code, given))
-            .collect::<Vec<_>>()
-            .iter()
-            .position(|&m| m);
+            .enumerate()
+            .fold(None, |found, (i, (code, _))| {
+                let matched = codes_match(code, given);
+                found.or(matched.then_some(i))
+            });
         found.map(|i| codes.remove(i)).is_some()
     }
 }

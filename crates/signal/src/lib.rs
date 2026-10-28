@@ -15,12 +15,12 @@ mod known_hosts;
 use hext_crypto::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
-pub use client::{Access, Client, ClientError};
+pub use client::{Access, Client, ClientError, Role};
 pub use id::{DeviceId, ParseDeviceIdError};
 pub use known_hosts::{Check, KnownHosts};
 
 /// Signaling protocol version: both sides must speak the same one.
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 
 /// Path of the WebSocket endpoint on the server.
 pub const SIGNAL_PATH: &str = "/v1/signal";
@@ -93,6 +93,9 @@ pub enum ClientMsg {
         signature: Signature,
         device_name: String,
         app_version: String,
+        /// A host, which takes requests (one login per device: a new one
+        /// replaces the old). A viewer only makes them.
+        accepts_requests: bool,
     },
     /// Ask to connect to device `to`. `request` is chosen by the viewer and
     /// comes back in the answer.
@@ -198,6 +201,7 @@ mod tests {
                 signature: key.sign(b"x"),
                 device_name: "PC".into(),
                 app_version: "0.1.0".into(),
+                accepts_requests: true,
             },
             ClientMsg::Connect { request: 7, to: id },
             ClientMsg::Accept {

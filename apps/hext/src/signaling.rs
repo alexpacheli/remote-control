@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use hext_crypto::DeviceKey;
 use hext_net::{Connection, Endpoint, HostPin};
 use hext_session::SessionCodes;
-use hext_signal::{Check, Client, ClientMsg, DeviceId, KnownHosts, Rejection, ServerMsg};
+use hext_signal::{Check, Client, ClientMsg, DeviceId, KnownHosts, Rejection, Role, ServerMsg};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
@@ -42,7 +42,7 @@ pub async fn host(
     let mut retry = RETRY_FIRST;
     let mut shown: Option<DeviceId> = None;
     loop {
-        match Client::connect(&server, &key, &name, APP_VERSION).await {
+        match Client::connect(&server, &key, &name, APP_VERSION, Role::Host).await {
             Ok(mut client) => {
                 retry = RETRY_FIRST;
                 if shown != Some(client.id()) {
@@ -91,6 +91,9 @@ async fn serve(
         println!();
         println!("  \"{from_name}\" (ID {from}) quer acessar este computador.");
         println!("  Aceitar? [s/N]");
+        // One deadline for the question, whatever else arrives meanwhile.
+        let deadline = tokio::time::sleep(ANSWER_TIME);
+        tokio::pin!(deadline);
         let accepted = loop {
             tokio::select! {
                 line = answers.recv() => {
@@ -108,13 +111,18 @@ async fn serve(
                     }
                     _ => {}
                 },
-                _ = tokio::time::sleep(ANSWER_TIME) => {
+                _ = &mut deadline => {
                     println!("  Sem resposta: recusado.");
                     break false;
                 }
             }
         };
-        let answer = if accepted {
+        // A session may have started (by IP) while the user decided.
+        let busy = slot.available_permits() == 0;
+        if accepted && busy {
+            println!("  Já existe uma sessão: o pedido foi recusado.");
+        }
+        let answer = if accepted && !busy {
             println!("  Aceito: conectando...");
             ClientMsg::Accept {
                 request,
@@ -150,8 +158,9 @@ pub async fn connect(
     key: &DeviceKey,
     name: &str,
     id: DeviceId,
+    known: &KnownHosts,
 ) -> Result<(Endpoint, Connection, String)> {
-    let mut client = Client::connect(server, key, name, APP_VERSION)
+    let mut client = Client::connect(server, key, name, APP_VERSION, Role::Viewer)
         .await
         .context("servidor de sinalização")?;
     println!("Pedindo acesso a {id}... aguardando o outro computador aceitar.");
@@ -161,7 +170,6 @@ pub async fn connect(
     };
     let _ = client.close().await;
 
-    let known = KnownHosts::default_location()?;
     let check = known
         .check(id, &access.host_key)
         .with_context(|| known.path().display().to_string())?;

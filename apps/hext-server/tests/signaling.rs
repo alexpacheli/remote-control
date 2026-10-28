@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use hext_crypto::DeviceKey;
 use hext_server::{Config, Db, State};
-use hext_signal::{Client, ClientError, ClientMsg, DeviceId, PROTOCOL, Rejection, ServerMsg};
+use hext_signal::{Client, ClientError, ClientMsg, DeviceId, PROTOCOL, Rejection, Role, ServerMsg};
 
 /// A server on a random local port.
 async fn server() -> (String, Arc<State>) {
@@ -21,7 +21,9 @@ async fn server() -> (String, Arc<State>) {
 }
 
 async fn login(url: &str, key: &DeviceKey, name: &str) -> Client {
-    Client::connect(url, key, name, "0.1.0").await.unwrap()
+    Client::connect(url, key, name, "0.1.0", Role::Host)
+        .await
+        .unwrap()
 }
 
 async fn recv(client: &mut Client) -> ServerMsg {
@@ -265,7 +267,14 @@ async fn new_devices_per_address_are_limited() {
     for _ in 0..9 {
         login(&url, &DeviceKey::generate().unwrap(), "N").await;
     }
-    let refused = Client::connect(&url, &DeviceKey::generate().unwrap(), "N", "0.1.0").await;
+    let refused = Client::connect(
+        &url,
+        &DeviceKey::generate().unwrap(),
+        "N",
+        "0.1.0",
+        Role::Host,
+    )
+    .await;
     assert!(
         matches!(refused, Err(ClientError::Server(_))),
         "{:?}",
@@ -368,6 +377,59 @@ async fn only_the_host_can_answer() {
 }
 
 #[tokio::test]
+async fn a_viewer_with_the_same_key_leaves_the_host_alone() {
+    let (url, state) = server().await;
+    let key = DeviceKey::generate().unwrap();
+    let mut host = login(&url, &key, "PC").await;
+    let mut viewer = Client::connect(&url, &key, "PC", "0.1.0", Role::Viewer)
+        .await
+        .unwrap();
+    assert_eq!(viewer.id(), host.id());
+    wait_online(&state, 2).await;
+
+    // Requests for the ID still reach the host…
+    let mut other = login(&url, &DeviceKey::generate().unwrap(), "X").await;
+    other
+        .send(&ClientMsg::Connect {
+            request: 1,
+            to: host.id(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut host).await, ServerMsg::Request { .. }));
+    // …and the viewer can still ask.
+    let to = other.id();
+    viewer
+        .send(&ClientMsg::Connect { request: 2, to })
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut other).await, ServerMsg::Request { .. }));
+
+    // A device logged in only as a viewer takes no requests.
+    let lone = Client::connect(
+        &url,
+        &DeviceKey::generate().unwrap(),
+        "V",
+        "0.1.0",
+        Role::Viewer,
+    )
+    .await
+    .unwrap();
+    let to = lone.id();
+    other
+        .send(&ClientMsg::Connect { request: 3, to })
+        .await
+        .unwrap();
+    assert_eq!(
+        recv(&mut other).await,
+        ServerMsg::Rejected {
+            request: 3,
+            reason: Rejection::Offline
+        }
+    );
+}
+
+#[tokio::test]
 async fn logging_in_again_replaces_the_old_connection() {
     let (url, state) = server().await;
     let key = DeviceKey::generate().unwrap();
@@ -428,6 +490,7 @@ async fn a_wrong_signature_is_refused() {
         signature: key.sign(&hext_signal::auth_message(&other)),
         device_name: "X".into(),
         app_version: "0".into(),
+        accepts_requests: true,
     };
     raw::send_text(&mut ws, hello.to_json()).await;
     let reply: ServerMsg = serde_json::from_str(&raw::recv_text(&mut ws).await.unwrap()).unwrap();

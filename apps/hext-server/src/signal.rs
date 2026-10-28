@@ -47,7 +47,10 @@ const NEW_DEVICE_WINDOW: Duration = Duration::from_secs(3600);
 /// Who is online, which requests are waiting, and the rate limits.
 pub struct State {
     pub db: Arc<Db>,
-    peers: Mutex<HashMap<DeviceId, Peer>>,
+    /// Hosts online, by ID: where requests for that ID go.
+    hosts: Mutex<HashMap<DeviceId, HostLogin>>,
+    /// Every login (hosts and viewers), by session.
+    outboxes: Mutex<HashMap<u64, mpsc::Sender<ServerMsg>>>,
     pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
     rng: SystemRandom,
@@ -58,12 +61,12 @@ pub struct State {
     new_devices_by_ip: RateLimiter<IpAddr>,
 }
 
-/// A logged-in device.
-struct Peer {
+/// A device logged in as a host (it takes requests).
+struct HostLogin {
     /// Tells this login apart from a newer one of the same device.
     session: u64,
-    outbox: mpsc::Sender<ServerMsg>,
-    /// Dropped when a newer login replaces this one, which ends it.
+    /// Dropped when a newer host login of the same device replaces this
+    /// one, which ends it.
     _kick: oneshot::Sender<()>,
 }
 
@@ -93,7 +96,8 @@ impl State {
         });
         Self {
             db,
-            peers: Mutex::default(),
+            hosts: Mutex::default(),
+            outboxes: Mutex::default(),
             pending: Mutex::default(),
             next_id: AtomicU64::new(1),
             rng: SystemRandom::new(),
@@ -105,9 +109,9 @@ impl State {
         }
     }
 
-    /// Number of devices online.
+    /// Number of logins (hosts and viewers).
     pub fn online(&self) -> usize {
-        self.peers.lock().expect("lock").len()
+        self.outboxes.lock().expect("lock").len()
     }
 
     fn next_id(&self) -> u64 {
@@ -129,15 +133,11 @@ impl State {
         let _ = self.audit.send((from, to, event));
     }
 
-    /// Delivers `msg` to `id`'s login `session`; false if it is not online
-    /// (or so stuck it cannot take messages).
-    async fn send_to(&self, id: DeviceId, session: u64, msg: ServerMsg) -> bool {
-        let outbox = {
-            let peers = self.peers.lock().expect("lock");
-            match peers.get(&id) {
-                Some(peer) if peer.session == session => peer.outbox.clone(),
-                _ => return false,
-            }
+    /// Delivers `msg` to login `session` (of device `_id`); false if it is
+    /// gone (or so stuck it cannot take messages).
+    async fn send_to(&self, _id: DeviceId, session: u64, msg: ServerMsg) -> bool {
+        let Some(outbox) = self.outboxes.lock().expect("lock").get(&session).cloned() else {
+            return false;
         };
         matches!(
             tokio::time::timeout(OUTBOX_WAIT, outbox.send(msg)).await,
@@ -180,10 +180,11 @@ impl State {
 
     /// A login ended: forget it and the requests it was part of.
     async fn leave(&self, id: DeviceId, session: u64) {
+        self.outboxes.lock().expect("lock").remove(&session);
         {
-            let mut peers = self.peers.lock().expect("lock");
-            if peers.get(&id).is_some_and(|p| p.session == session) {
-                peers.remove(&id);
+            let mut hosts = self.hosts.lock().expect("lock");
+            if hosts.get(&id).is_some_and(|h| h.session == session) {
+                hosts.remove(&id);
             }
         }
         let gone = self.take_pending(|p| {
@@ -261,6 +262,7 @@ pub async fn handle(socket: WebSocket, state: &State, ip: IpAddr) {
         signature,
         device_name,
         app_version,
+        accepts_requests,
     }))) = hello
     else {
         // Silence, garbage or another message first: no login.
@@ -290,17 +292,22 @@ pub async fn handle(socket: WebSocket, state: &State, ip: IpAddr) {
     let session = state.next_id();
     let (outbox, mut inbox) = mpsc::channel(OUTBOX);
     let (kick, mut kicked) = oneshot::channel::<()>();
-    // A newer login of the same device (it reconnected) replaces this one:
-    // dropping the old entry drops its `_kick`, which ends it.
-    state.peers.lock().expect("lock").insert(
-        id,
-        Peer {
+    state.outboxes.lock().expect("lock").insert(session, outbox);
+    // A viewer on the same device (same key) does not disturb its host.
+    let mut _not_a_host = None;
+    if accepts_requests {
+        // A newer host login of the same device (it reconnected) replaces
+        // this one: dropping the old entry drops its `_kick`, which ends it.
+        let host = HostLogin {
             session,
-            outbox,
             _kick: kick,
-        },
-    );
-    info!("online: {id} ({name}, {version})");
+        };
+        state.hosts.lock().expect("lock").insert(id, host);
+    } else {
+        _not_a_host = Some(kick);
+    }
+    let role = if accepts_requests { "host" } else { "técnico" };
+    info!("online: {id} ({name}, {version}, {role})");
 
     let mut me = Session {
         id,
@@ -449,11 +456,11 @@ async fn connect(
         return Err(Rejection::SelfConnect);
     }
     let host_session = state
-        .peers
+        .hosts
         .lock()
         .expect("lock")
         .get(&to)
-        .map(|p| p.session);
+        .map(|h| h.session);
     let Some(host_session) = host_session else {
         state.audit(me.id, to, "offline");
         return Err(Rejection::Offline);

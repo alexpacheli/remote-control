@@ -61,9 +61,11 @@ impl KnownHosts {
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             fs::create_dir_all(dir)?;
         }
-        // Whole file at once: a crash keeps the old one.
+        // Whole file at once: a crash keeps the old one. (Two viewers adding
+        // hosts at the same instant may lose one entry; it is re-learned on
+        // the next connection.)
         let mut tmp = self.path.as_os_str().to_owned();
-        tmp.push(".tmp");
+        tmp.push(format!(".{}.tmp", std::process::id()));
         fs::write(&tmp, text)?;
         fs::rename(&tmp, &self.path)
     }

@@ -62,16 +62,13 @@ impl fmt::Debug for DeviceId {
 #[error("ID inválido: são 9 dígitos, como 482 913 557")]
 pub struct ParseDeviceIdError;
 
-/// Accepts spaces, dashes and dots between digits: `482913557`,
-/// `482 913 557`, `482-913-557`.
+/// Accepts spaces and dashes between digits: `482913557`, `482 913 557`,
+/// `482-913-557` (not dots: `192.168.0.10` is an address, not an ID).
 impl FromStr for DeviceId {
     type Err = ParseDeviceIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let digits: String = s
-            .chars()
-            .filter(|c| !matches!(c, ' ' | '-' | '.'))
-            .collect();
+        let digits: String = s.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
         if digits.len() != 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return Err(ParseDeviceIdError);
         }
@@ -91,7 +88,7 @@ mod tests {
     fn display_and_parse() {
         let id = DeviceId::new(482_913_557).unwrap();
         assert_eq!(id.to_string(), "482 913 557");
-        for text in ["482913557", "482 913 557", "482-913-557", " 482.913.557 "] {
+        for text in ["482913557", "482 913 557", "482-913-557", " 482 913-557 "] {
             assert_eq!(text.parse::<DeviceId>(), Ok(id), "{text}");
         }
         assert_eq!(
@@ -109,6 +106,8 @@ mod tests {
             "012345678",
             "48291355a",
             "+48291355",
+            "192.168.0.10",
+            "482.913.557",
         ] {
             assert!(text.parse::<DeviceId>().is_err(), "{text}");
         }
