@@ -4,7 +4,7 @@
 //! turn pacing into bursts; asking for 1 ms (for this process, since
 //! Windows 10 2004) keeps packets spread. Elsewhere timers are already fine.
 
-/// Holds the finer timer resolution while it lives.
+/// Holds the finer timer resolution while it lives (keep one while pacing).
 pub struct FineTimers {
     #[cfg(windows)]
     active: bool,
@@ -62,5 +62,11 @@ mod imp {
 impl FineTimers {
     pub fn new() -> Self {
         Self {}
+    }
+}
+
+impl Default for FineTimers {
+    fn default() -> Self {
+        Self::new()
     }
 }
