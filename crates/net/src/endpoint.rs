@@ -1,19 +1,11 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::crypto::CryptoProvider;
+use hext_crypto::{DeviceKey, PublicKey};
+use iroh::endpoint::{IdleTimeout, QuicTransportConfig, presets};
+use iroh::{EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
-use crate::verify::{HostPin, PinnedVerifier};
-use crate::{Connection, Endpoint, Identity, NetError, Result};
-
-/// SNI sent by clients. Hosts are authenticated by fingerprint, not by name.
-const SERVER_NAME: &str = "hext";
-
-fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
-}
+use crate::{Connection, Endpoint, NetError, Result};
 
 /// Video datagrams waiting to be read: room for a few large keyframes.
 const DATAGRAM_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
@@ -23,59 +15,140 @@ const DATAGRAM_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
 /// queueing seconds of video: ~200 ms at 10 Mbps.
 const DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
 
-fn transport() -> Arc<quinn::TransportConfig> {
-    let mut t = quinn::TransportConfig::default();
-    t.keep_alive_interval(Some(Duration::from_secs(2)));
-    t.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(10)).expect("10s fits a VarInt"),
-    ));
-    t.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
-    t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
-    Arc::new(t)
+/// A peer silent this long (keep-alives included) is gone.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How an endpoint reaches and is reached by others.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointConfig {
+    /// Relay for when no direct path opens (and to coordinate opening one).
+    /// `None`: direct only (LAN, tests).
+    pub relay: Option<RelayUrl>,
+    /// Local address to listen on (e.g. a fixed port for connecting by IP);
+    /// `None`: every interface, a random port.
+    pub bind: Option<SocketAddr>,
+    /// Accept sessions (a host). A viewer only connects.
+    pub accept: bool,
 }
 
-/// Endpoint that accepts sessions, bound to `bind`.
-pub fn host_endpoint(bind: SocketAddr, identity: &Identity) -> Result<Endpoint> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_single_cert(vec![identity.cert.clone()], identity.key_der())?;
-    tls.alpn_protocols = vec![hext_proto::ALPN.to_vec()];
-
-    let crypto =
-        QuicServerConfig::try_from(tls).map_err(|e| NetError::Unexpected(e.to_string()))?;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(transport());
-    Ok(Endpoint::server(config, bind)?)
+/// An endpoint whose identity is this device's key: peers authenticate it
+/// by that key (its ID in `iroh`), and it authenticates them by theirs.
+pub async fn bind(key: &DeviceKey, config: &EndpointConfig) -> Result<Endpoint> {
+    let transport = QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(IDLE_TIMEOUT).expect("10 s fits a VarInt"),
+        ))
+        .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER))
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER)
+        .build();
+    // Minimal: no address lookup through third parties; peers learn each
+    // other's addresses from our own signaling.
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(key.seed()))
+        .transport_config(transport)
+        .relay_mode(match &config.relay {
+            Some(relay) => RelayMode::custom([relay.clone()]),
+            None => RelayMode::Disabled,
+        });
+    if config.accept {
+        builder = builder.alpns(vec![hext_proto::ALPN.to_vec()]);
+    }
+    if let Some(bind) = config.bind {
+        builder = builder
+            .bind_addr(bind)
+            .map_err(|e| NetError::Unexpected(format!("endereço {bind}: {e}")))?;
+    }
+    builder
+        .bind()
+        .await
+        .map_err(|e| NetError::Bind(e.to_string()))
 }
 
-/// Endpoint for outgoing sessions to `remote`, on an ephemeral port of the
-/// same address family (dual-stack sockets are not the default everywhere).
-pub fn client_endpoint(remote: SocketAddr) -> Result<Endpoint> {
-    let bind: SocketAddr = match remote {
-        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-    };
-    Ok(Endpoint::client(bind)?)
+/// Connects to the host `addr`, which must prove it holds the key in it.
+pub async fn connect(endpoint: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
+    endpoint
+        .connect(addr, hext_proto::ALPN)
+        .await
+        .map_err(|e| NetError::Connect(e.to_string()))
 }
 
-/// Connects to a host, accepting it only if its certificate matches `pin`.
-pub async fn connect(
-    endpoint: &Endpoint,
-    addr: SocketAddr,
-    pin: impl Into<HostPin>,
-) -> Result<Connection> {
-    let provider = provider();
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedVerifier::new(pin.into(), provider)))
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![hext_proto::ALPN.to_vec()];
+/// The device key a connection's peer proved it holds.
+pub fn remote_key(conn: &Connection) -> PublicKey {
+    PublicKey::from_bytes(*conn.remote_id().as_bytes())
+}
 
-    let crypto =
-        QuicClientConfig::try_from(tls).map_err(|e| NetError::Unexpected(e.to_string()))?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(transport());
-    Ok(endpoint.connect_with(config, addr, SERVER_NAME)?.await?)
+/// The `iroh` ID of a device key.
+pub fn endpoint_id(key: &PublicKey) -> Result<EndpointId> {
+    EndpointId::from_bytes(key.as_bytes())
+        .map_err(|_| NetError::Connect("chave do host inválida".into()))
+}
+
+/// Most entries [`addr_to_strings`] gives, and the longest one: what the
+/// signaling server passes on.
+const MAX_ENTRIES: usize = 32;
+const MAX_ENTRY_LEN: usize = 256;
+
+/// Where a host can be reached, as text for signaling: `relay <url>` and
+/// `ip <addr>` entries, within the server's limits. Relays come first (the
+/// fallback), then public addresses (for hole punching), then local ones.
+pub fn addr_to_strings(addr: &EndpointAddr) -> Vec<String> {
+    let relays = addr.relay_urls().map(|url| format!("relay {url}"));
+    let mut ips: Vec<&SocketAddr> = addr.ip_addrs().collect();
+    ips.sort_by_key(|ip| is_local(ip));
+    let ips = ips.into_iter().map(|ip| format!("ip {ip}"));
+    relays
+        .chain(ips)
+        .filter(|entry| entry.len() <= MAX_ENTRY_LEN)
+        .take(MAX_ENTRIES)
+        .collect()
+}
+
+/// A private, loopback or link-local address (only reachable nearby).
+fn is_local(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local()
+        }
+    }
+}
+
+/// The host with `key` at the addresses from [`addr_to_strings`] (unknown
+/// entries are skipped).
+pub fn addr_from_strings(key: &PublicKey, entries: &[String]) -> Result<EndpointAddr> {
+    let mut addr = EndpointAddr::new(endpoint_id(key)?);
+    for entry in entries {
+        match entry.split_once(' ') {
+            Some(("relay", url)) => {
+                if let Ok(url) = url.parse::<RelayUrl>() {
+                    addr = addr.with_relay_url(url);
+                }
+            }
+            Some(("ip", ip)) => {
+                if let Ok(ip) = ip.parse::<SocketAddr>() {
+                    addr = addr.with_ip_addr(ip);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(addr)
+}
+
+/// The path a connection is using right now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathInfo {
+    /// Through the relay (otherwise direct, peer to peer).
+    pub relay: bool,
+    pub rtt: Duration,
+}
+
+/// The connection's selected path, if one is.
+pub fn path(conn: &Connection) -> Option<PathInfo> {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected())?;
+    Some(PathInfo {
+        relay: selected.is_relay(),
+        rtt: selected.rtt(),
+    })
 }

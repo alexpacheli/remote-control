@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use hext_codec::{DecoderPreference, YuvFrame};
 use hext_input::keymap::{self, CommandKey};
-use hext_net::{Connection, Endpoint};
+use hext_net::{Connection, Endpoint, EndpointConfig};
 use hext_proto::Os;
 use hext_proto::{Hello, InputEvent, MouseButton, PeerInfo};
 use hext_render::Renderer;
@@ -62,8 +62,6 @@ pub fn run(args: ViewArgs) -> Result<()> {
             watch.closed().await;
             let _ = closed_proxy.send_event(UserEvent::SessionEnded);
         });
-        // Keep the endpoint alive as long as the runtime.
-        tokio::spawn(async move { endpoint.wait_idle().await });
         anyhow::Ok(session)
     })?;
     info!(
@@ -75,6 +73,7 @@ pub fn run(args: ViewArgs) -> Result<()> {
     let mut app = Viewer {
         runtime,
         session: Some(session),
+        endpoint: Some(endpoint),
         latest,
         window: None,
         renderer: None,
@@ -96,6 +95,8 @@ pub fn run(args: ViewArgs) -> Result<()> {
 struct Viewer {
     runtime: tokio::runtime::Runtime,
     session: Option<ClientHandle>,
+    /// Closed (gracefully, relay included) when the window closes.
+    endpoint: Option<Endpoint>,
     latest: Arc<Mutex<Option<YuvFrame>>>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -143,7 +144,8 @@ impl Viewer {
             return;
         };
         let mut stats = session.stats.lock().expect("lock");
-        let mut title = format!("Hext Remote — {}", session.host.device_name);
+        let path = path_label(session);
+        let mut title = format!("Hext Remote — {}{path}", session.host.device_name);
         if let Some(snapshot) = stats.snapshot() {
             title += &format!(
                 " — {}x{} | {snapshot} | RTT {:.1} ms",
@@ -273,43 +275,86 @@ impl ApplicationHandler<UserEvent> for Viewer {
         {
             warn!("encerrando: {e}");
         }
+        if let Some(endpoint) = self.endpoint.take() {
+            self.runtime.block_on(endpoint.close());
+        }
     }
 }
 
 /// Connects to the host: by ID through the server (`--server`), or by IP
-/// with the access code. Returns the code to present to the host.
+/// with the access code and the host's key. Returns the code to present to
+/// the host.
 async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
+    // The arguments first, before any network.
+    let target = target(args)?;
+    let relay = crate::relay(&args.relay)?;
+
+    let key = crate::device_key(args.device_key.as_deref())?;
+    let endpoint = hext_net::bind(
+        &key,
+        &EndpointConfig {
+            relay,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let connected = match target {
+        Target::Id { id, server } => {
+            // Next to the key, so each key (profile) has its own.
+            let known = match &args.device_key {
+                Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
+                None => KnownHosts::default_location()?,
+            };
+            crate::signaling::connect(server, &key, &device_name(), id, &known, &endpoint).await
+        }
+        Target::Ip { addr, host, code } => hext_net::connect(&endpoint, host)
+            .await
+            .with_context(|| format!("falha ao conectar em {addr}"))
+            .map(|conn| (conn, code)),
+    };
+    match connected {
+        Ok((conn, code)) => Ok((endpoint, conn, code)),
+        Err(e) => {
+            endpoint.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Who to connect to, and how.
+enum Target<'a> {
+    /// By ID, through the signaling server.
+    Id { id: DeviceId, server: &'a str },
+    /// By IP, with the access code and the host's key.
+    Ip {
+        addr: std::net::SocketAddr,
+        host: hext_net::EndpointAddr,
+        code: String,
+    },
+}
+
+fn target(args: &ViewArgs) -> Result<Target<'_>> {
     // An address first: "192.168.0.10" must never be taken for an ID.
     let addr = parse_addr(&args.target);
     if let (Err(_), Ok(id)) = (&addr, args.target.parse::<DeviceId>()) {
         let Some(server) = &args.server else {
             bail!("para conectar pelo ID, informe o servidor com --server");
         };
-        if args.code.is_some() || args.fingerprint.is_some() {
+        if args.code.is_some() || args.key.is_some() {
             warn!(
-                "pelo ID, --code e --fingerprint não são usados: o host aceita o pedido e a chave dele vem do servidor"
+                "pelo ID, --code e --key não são usados: o host aceita o pedido e a chave dele vem do servidor"
             );
         }
-        let key = crate::device_key(args.device_key.as_deref())?;
-        // Next to the key, so each key (profile) has its own.
-        let known = match &args.device_key {
-            Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
-            None => KnownHosts::default_location()?,
-        };
-        return crate::signaling::connect(server, &key, &device_name(), id, &known).await;
+        return Ok(Target::Id { id, server });
     }
     let addr = addr?;
-    let Some(code) = args.code.clone() else {
-        bail!("para conectar pelo IP, informe o código de acesso com --code");
+    let (Some(code), Some(host_key)) = (args.code.clone(), args.key) else {
+        bail!(
+            "para conectar pelo IP, informe o código de acesso (--code) e a chave do host (--key), mostrados por ele"
+        );
     };
-    if args.fingerprint.is_none() {
-        warn!("sem --fingerprint: a conexão é cifrada, mas a identidade do host NÃO é verificada");
-    }
-    let endpoint = hext_net::client_endpoint(addr)?;
-    let conn = hext_net::connect(&endpoint, addr, args.fingerprint)
-        .await
-        .with_context(|| format!("falha ao conectar em {addr}"))?;
-    Ok((endpoint, conn, code))
+    let host = hext_net::EndpointAddr::new(hext_net::endpoint_id(&host_key)?).with_ip_addr(addr);
+    Ok(Target::Ip { addr, host, code })
 }
 
 /// Receives and decodes without a window, printing stats every second.
@@ -334,14 +379,24 @@ async fn headless(
         let (w, h) = (stats.width, stats.height);
         if let Some(snapshot) = stats.snapshot() {
             println!(
-                "{w}x{h} | {snapshot} | RTT {:.1} ms",
-                session.rtt().as_secs_f64() * 1000.0
+                "{w}x{h} | {snapshot} | RTT {:.1} ms{}",
+                session.rtt().as_secs_f64() * 1000.0,
+                path_label(&session)
             );
         }
     }
     session.close().await?;
-    endpoint.wait_idle().await;
+    endpoint.close().await;
     Ok(())
+}
+
+/// " (P2P)" or " (relay)": the path the session is using now.
+fn path_label(session: &ClientHandle) -> &'static str {
+    match session.path() {
+        Some(p) if p.relay => " (relay)",
+        Some(_) => " (P2P)",
+        None => "",
+    }
 }
 
 fn decoder(choice: CodecChoice) -> DecoderPreference {

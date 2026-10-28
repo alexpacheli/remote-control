@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+hext-crypto.workspace = true
 ring.workspace = true
 hext-capture.workspace = true
 hext-codec.workspace = true
@@ -19,7 +20,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-hext-crypto.workspace = true
 hext-server.workspace = true
 hext-signal.workspace = true
 

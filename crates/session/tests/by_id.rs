@@ -2,14 +2,13 @@
 //! that accepts through it, and a viewer that pins the host's device key and
 //! opens a session with the one-time code.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hext_codec::{DecoderPreference, EncoderSettings};
 use hext_crypto::DeviceKey;
-use hext_net::{HostPin, Identity, NetError};
+use hext_net::{EndpointConfig, NetError};
 use hext_proto::{Hello, PeerInfo, RejectReason};
 use hext_session::host::HostConfig;
 use hext_session::{SessionCodes, SessionError, client, host};
@@ -27,10 +26,12 @@ async fn accepted_by_id_then_streams() {
 
     // The host: a QUIC endpoint with its device identity, logged in.
     let host_key = DeviceKey::generate().unwrap();
-    let identity = Identity::from_device_key(&host_key).unwrap();
-    let endpoint =
-        hext_net::host_endpoint(SocketAddr::from(([127, 0, 0, 1], 0)), &identity).unwrap();
-    let host_addr = endpoint.local_addr().unwrap();
+    let config = EndpointConfig {
+        accept: true,
+        ..Default::default()
+    };
+    let endpoint = hext_net::bind(&host_key, &config).await.unwrap();
+    let host_addrs = hext_net::addr_to_strings(&endpoint.addr());
     let codes = SessionCodes::default();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
@@ -57,7 +58,10 @@ async fn accepted_by_id_then_streams() {
     // The host's user says yes.
     let answering = tokio::spawn(async move {
         let ServerMsg::Request {
-            request, from_name, ..
+            request,
+            from_name,
+            from_key,
+            ..
         } = host_signal.recv().await.unwrap()
         else {
             panic!("expected a request");
@@ -66,8 +70,8 @@ async fn accepted_by_id_then_streams() {
         host_signal
             .send(&ClientMsg::Accept {
                 request,
-                addrs: vec![host_addr.to_string()],
-                session_code: codes.issue(),
+                addrs: host_addrs,
+                session_code: codes.issue(from_key),
             })
             .await
             .unwrap();
@@ -86,14 +90,16 @@ async fn accepted_by_id_then_streams() {
         .unwrap();
     let _host_signal = answering.await.unwrap();
     assert_eq!(access.host_key, host_key.public_key());
-    let addr: SocketAddr = access.addrs[0].parse().unwrap();
+    let addr = hext_net::addr_from_strings(&access.host_key, &access.addrs).unwrap();
 
     let hello = |code: &str| Hello {
         peer: PeerInfo::local("test", "viewer"),
         access_code: code.to_owned(),
     };
-    let client_endpoint = hext_net::client_endpoint(addr).unwrap();
-    let conn = hext_net::connect(&client_endpoint, addr, HostPin::Key(access.host_key))
+    let client_endpoint = hext_net::bind(&viewer_key, &EndpointConfig::default())
+        .await
+        .unwrap();
+    let conn = hext_net::connect(&client_endpoint, addr.clone())
         .await
         .unwrap();
     let decoded = Arc::new(AtomicU32::new(0));
@@ -116,7 +122,7 @@ async fn accepted_by_id_then_streams() {
     session.close().await.unwrap();
 
     // The code opened one session only.
-    let conn = hext_net::connect(&client_endpoint, addr, HostPin::Key(access.host_key))
+    let conn = hext_net::connect(&client_endpoint, addr.clone())
         .await
         .unwrap();
     let again = client::start(
@@ -139,9 +145,12 @@ async fn accepted_by_id_then_streams() {
 
     // And a viewer told someone else's key would not connect.
     let impostor = DeviceKey::generate().unwrap().public_key();
-    assert!(
-        hext_net::connect(&client_endpoint, addr, HostPin::Key(impostor))
-            .await
-            .is_err()
-    );
+    let wrong = hext_net::addr_from_strings(&impostor, &access.addrs).unwrap();
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(15),
+        hext_net::connect(&client_endpoint, wrong),
+    )
+    .await;
+    // Refused in the handshake, not left hanging.
+    assert!(matches!(attempt, Ok(Err(_))));
 }

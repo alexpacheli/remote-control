@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use hext_proto::{Datagram, MAX_VIDEO_FRAME_LEN, VideoFrame, VideoPacket};
-use quinn::{Connection, SendDatagramError};
+use iroh::endpoint::{Connection, SendDatagramError};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::{NetError, Result};
@@ -79,6 +79,13 @@ const MIN_SHARD: usize = 64;
 
 /// Bytes a [`VideoPacket`] adds to its shard once serialized, at most.
 const PACKET_OVERHEAD: usize = 32;
+
+/// Largest video datagram sent. A connection can have several paths (relay
+/// and direct, Tailscale's MTU of 1280…) and the reported maximum may be a
+/// larger path's: datagrams too big for the path in use are dropped
+/// silently (seen in the `iroh` spike). Every QUIC path carries 1200-byte
+/// packets, so this always fits.
+pub const MAX_DATAGRAM: usize = 1100;
 
 /// Parity shards for a block of `k` data shards.
 fn parity_for(k: usize, keyframe: bool) -> usize {
@@ -237,7 +244,7 @@ impl VideoSender {
         let max = conn
             .max_datagram_size()
             .ok_or_else(|| NetError::Unexpected("o outro lado não aceita datagramas".into()))?;
-        let shard = max.saturating_sub(PACKET_OVERHEAD);
+        let shard = max.min(MAX_DATAGRAM).saturating_sub(PACKET_OVERHEAD);
         self.last_frame = Some(frame.seq);
         let packets = self
             .packetizer

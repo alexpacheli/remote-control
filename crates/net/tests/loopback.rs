@@ -1,8 +1,9 @@
-use std::net::SocketAddr;
+use std::time::Duration;
 
+use hext_crypto::DeviceKey;
 use hext_net::{
-    Endpoint, Identity, NetError, client_endpoint, client_handshake, connect, host_endpoint,
-    host_handshake, recv_datagram, send_datagram,
+    Endpoint, EndpointAddr, EndpointConfig, NetError, bind, client_handshake, connect,
+    host_handshake, recv_datagram, remote_key, send_datagram,
 };
 use hext_proto::{
     Control, Datagram, Hello, PROTOCOL_VERSION, PeerInfo, RejectReason, decode_preamble,
@@ -26,11 +27,22 @@ fn check_code(hello: &Hello) -> Result<(), RejectReason> {
     }
 }
 
-fn local_host() -> (Endpoint, SocketAddr, Identity) {
-    let identity = Identity::generate().unwrap();
-    let endpoint = host_endpoint(SocketAddr::from(([127, 0, 0, 1], 0)), &identity).unwrap();
-    let addr = endpoint.local_addr().unwrap();
-    (endpoint, addr, identity)
+/// A host on this machine (direct only, no relay) and its address.
+async fn local_host() -> (Endpoint, EndpointAddr) {
+    let key = DeviceKey::generate().unwrap();
+    let config = EndpointConfig {
+        accept: true,
+        ..Default::default()
+    };
+    let endpoint = bind(&key, &config).await.unwrap();
+    let addr = endpoint.addr();
+    (endpoint, addr)
+}
+
+/// A viewer's endpoint, and its key.
+async fn viewer() -> (Endpoint, DeviceKey) {
+    let key = DeviceKey::generate().unwrap();
+    (bind(&key, &EndpointConfig::default()).await.unwrap(), key)
 }
 
 /// Accepts one session and echoes pings until the client says bye.
@@ -56,13 +68,14 @@ async fn serve_one(endpoint: Endpoint) -> Result<PeerInfo, NetError> {
 
 #[tokio::test]
 async fn handshake_ping_and_bye() {
-    let (host, addr, identity) = local_host();
+    let (host, addr) = local_host().await;
+    let host_key = hext_crypto::PublicKey::from_bytes(*addr.id.as_bytes());
     let server = tokio::spawn(serve_one(host));
 
-    let client = client_endpoint(addr).unwrap();
-    let conn = connect(&client, addr, Some(identity.fingerprint()))
-        .await
-        .unwrap();
+    let (client, _) = viewer().await;
+    let conn = connect(&client, addr).await.unwrap();
+    // The host proved it holds the key we dialed.
+    assert_eq!(remote_key(&conn), host_key);
     let (control, host_info) = client_handshake(&conn, hello(CODE)).await.unwrap();
     assert_eq!(host_info.device_name, "host");
 
@@ -94,29 +107,62 @@ async fn handshake_ping_and_bye() {
 }
 
 #[tokio::test]
-async fn wrong_fingerprint_is_refused() {
-    let (host, addr, _identity) = local_host();
+async fn a_host_without_the_expected_key_is_refused() {
+    let (host, addr) = local_host().await;
     tokio::spawn(async move {
         if let Some(incoming) = host.accept().await {
             let _ = incoming.await;
         }
     });
 
-    let other = Identity::generate().unwrap().fingerprint();
-    let client = client_endpoint(addr).unwrap();
-    let result = connect(&client, addr, Some(other)).await;
-    assert!(matches!(result, Err(NetError::Connection(_))), "{result:?}");
+    // The host's addresses, but someone else's key: an impostor there.
+    let other = DeviceKey::generate().unwrap().public_key();
+    let wrong = hext_net::addr_from_strings(&other, &hext_net::addr_to_strings(&addr)).unwrap();
+    let (client, _) = viewer().await;
+    let result = tokio::time::timeout(Duration::from_secs(15), connect(&client, wrong)).await;
+    // Refused in the handshake, not left hanging.
+    assert!(matches!(result, Ok(Err(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn the_host_sees_the_viewers_key() {
+    let (host, addr) = local_host().await;
+    let seen = tokio::spawn(async move {
+        let conn = host.accept().await.unwrap().await.unwrap();
+        remote_key(&conn)
+    });
+    let (client, key) = viewer().await;
+    let _conn = connect(&client, addr).await.unwrap();
+    assert_eq!(seen.await.unwrap(), key.public_key());
+}
+
+#[test]
+fn addresses_travel_as_text() {
+    let key = DeviceKey::generate().unwrap().public_key();
+    let entries = vec![
+        "relay https://relay.example.com/".to_owned(),
+        "ip 192.168.0.10:7420".to_owned(),
+        "ip [2001:db8::1]:7420".to_owned(),
+        "something new".to_owned(),
+    ];
+    let addr = hext_net::addr_from_strings(&key, &entries).unwrap();
+    assert_eq!(addr.ip_addrs().count(), 2);
+    assert_eq!(addr.relay_urls().count(), 1);
+    let mut back = hext_net::addr_to_strings(&addr);
+    back.sort();
+    let mut expected = entries[..3].to_vec();
+    expected.sort();
+    assert_eq!(back, expected);
+    assert!(back.iter().all(|e| e.len() <= 64));
 }
 
 #[tokio::test]
 async fn incompatible_version_is_reported() {
-    let (host, addr, identity) = local_host();
+    let (host, addr) = local_host().await;
     let server = tokio::spawn(serve_one(host));
 
-    let client = client_endpoint(addr).unwrap();
-    let conn = connect(&client, addr, Some(identity.fingerprint()))
-        .await
-        .unwrap();
+    let (client, _) = viewer().await;
+    let conn = connect(&client, addr).await.unwrap();
     // Speak as a future client: only the preamble layout is shared.
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(&encode_preamble(999)).await.unwrap();
@@ -133,13 +179,11 @@ async fn incompatible_version_is_reported() {
 
 #[tokio::test]
 async fn wrong_access_code_is_rejected() {
-    let (host, addr, identity) = local_host();
+    let (host, addr) = local_host().await;
     let server = tokio::spawn(serve_one(host));
 
-    let client = client_endpoint(addr).unwrap();
-    let conn = connect(&client, addr, Some(identity.fingerprint()))
-        .await
-        .unwrap();
+    let (client, _) = viewer().await;
+    let conn = connect(&client, addr).await.unwrap();
     let result = client_handshake(&conn, hello("000000000")).await;
     assert!(
         matches!(result, Err(NetError::Rejected(RejectReason::WrongCode))),

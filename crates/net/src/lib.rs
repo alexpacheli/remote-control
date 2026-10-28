@@ -1,52 +1,53 @@
-//! Hext Remote transport over QUIC.
+//! Hext Remote transport, over [`iroh`] (QUIC).
 //!
-//! The host presents a self-signed certificate derived from its device key
-//! (`hext_crypto`), so it is the same on every run; the client
-//! authenticates it by pinning the certificate's SHA-256 [`Fingerprint`].
-//! For now the host shows the fingerprint and it is typed into the client;
-//! in F3 it will come from the signaling server.
+//! Each endpoint's identity is its device key: a viewer connects to a host
+//! by the host's key (and its addresses), and both ends prove they hold
+//! their keys in the handshake. `iroh` opens a direct path when the
+//! networks allow it (hole punching) and otherwise goes through the relay;
+//! either way the session is end-to-end encrypted between the two devices.
 
 mod endpoint;
-mod identity;
 mod session;
 pub mod timer;
-mod verify;
 pub mod video;
 
-pub use endpoint::{client_endpoint, connect, host_endpoint};
-pub use identity::{Fingerprint, Identity};
+pub use endpoint::{
+    EndpointConfig, PathInfo, addr_from_strings, addr_to_strings, bind, connect, endpoint_id, path,
+    remote_key,
+};
 pub use session::{
     ControlStream, FramedRecv, FramedSend, accept_uni, client_handshake, host_handshake, open_uni,
     recv_datagram, send_datagram,
 };
-pub use verify::HostPin;
 
-pub use quinn::{Connection, ConnectionError, Endpoint, Incoming, VarInt};
+pub use iroh::endpoint::{Connection, ConnectionError, Incoming, VarInt};
+pub use iroh::{Endpoint, EndpointAddr, RelayUrl};
 
 use hext_proto::{CodecError, RejectReason};
+use iroh::endpoint::{ReadError, SendDatagramError, WriteError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("TLS: {0}")]
-    Tls(#[from] rustls::Error),
-    #[error("certificate generation: {0}")]
-    Certificate(#[from] rcgen::Error),
-    #[error("device key: {0}")]
-    DeviceKey(#[from] hext_crypto::CryptoError),
-    #[error("connect: {0}")]
-    Connect(#[from] quinn::ConnectError),
+    #[error("abrir a conexão de rede: {0}")]
+    Bind(String),
+    #[error("conectar: {0}")]
+    Connect(String),
     #[error("connection: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] ConnectionError),
+    #[error("handshake: {0}")]
+    Handshake(#[from] iroh::endpoint::ConnectingError),
     #[error("write: {0}")]
-    Write(#[from] quinn::WriteError),
+    Write(#[from] WriteError),
     #[error("read: {0}")]
-    Read(#[from] quinn::ReadError),
+    Read(#[from] ReadError),
     #[error("datagram: {0}")]
-    Datagram(#[from] quinn::SendDatagramError),
+    Datagram(#[from] SendDatagramError),
     #[error("protocol: {0}")]
     Codec(#[from] CodecError),
+    #[error("device key: {0}")]
+    DeviceKey(#[from] hext_crypto::CryptoError),
     #[error("session rejected by host: {0:?}")]
     Rejected(RejectReason),
     #[error("incompatible protocol version: ours is {local}, the peer's is {remote}")]
@@ -63,7 +64,6 @@ impl NetError {
     /// The peer ended the session on purpose (closed the connection or its
     /// streams), as opposed to a failure.
     pub fn is_peer_closed(&self) -> bool {
-        use quinn::{ConnectionError, ReadError, SendDatagramError, WriteError};
         let closed = |e: &ConnectionError| matches!(e, ConnectionError::ApplicationClosed(_));
         match self {
             NetError::StreamClosed => true,

@@ -225,11 +225,12 @@ A latência é **medida desde a F1**: um overlay de estatísticas mostra captura
 
 ## 6. Rede
 
-### 6.1 Transporte: QUIC (`quinn`)
+### 6.1 Transporte: QUIC (`iroh`)
 
 - **Datagramas QUIC** (não confiáveis) para vídeo, cursor e input. Um pacote perdido não bloqueia os seguintes.
 - **Streams QUIC** (confiáveis) para controle, clipboard, arquivos e chat.
-- O TLS 1.3 é embutido. Os certificados são derivados das chaves dos dispositivos (seção 7).
+- O TLS 1.3 é embutido. Cada endpoint é a própria chave do dispositivo (seção 7): os dois lados provam que têm suas chaves no handshake.
+- *(F3, marco 4)* O transporte é o [`iroh`](https://iroh.computer): ele abre o caminho direto quando as redes permitem (hole punching) e senão passa pelo nosso relay (`iroh-relay`, HTTPS/443). Os endereços (relay e IPs diretos) viajam pela sinalização; nenhum serviço de terceiros é usado para achar os computadores. A decisão e as medições estão no relatório do spike (branch `spike/iroh`).
 - Serialização: `serde` + `postcard`, com versão de protocolo negociada no handshake.
 
 ### 6.2 Resiliência
@@ -391,7 +392,7 @@ docs/
 
 | Área | Crate |
 |---|---|
-| Async e rede | `tokio`, `quinn`, `rustls` |
+| Async e rede | `tokio`, `iroh` (QUIC), `rustls` |
 | Windows | `windows` (windows-rs) |
 | macOS | `objc2` + `objc2-screen-capture-kit`, `objc2-video-toolbox`, `core-graphics` |
 | Render e janela | `wgpu`, `winit` |

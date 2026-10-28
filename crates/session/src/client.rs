@@ -27,6 +27,8 @@ pub struct ClientHandle {
     input: mpsc::UnboundedSender<InputEvent>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
+    /// The last round-trip time seen, for while paths change.
+    last_rtt: Mutex<Duration>,
 }
 
 impl ClientHandle {
@@ -35,9 +37,19 @@ impl ClientHandle {
         let _ = self.input.send(event);
     }
 
-    /// Current round-trip time estimate of the connection.
+    /// Current round-trip time estimate of the connection (the last one
+    /// known while no path is selected, e.g. switching relay → direct).
     pub fn rtt(&self) -> Duration {
-        self.conn.rtt()
+        let mut last = self.last_rtt.lock().expect("lock");
+        if let Some(path) = self.path() {
+            *last = path.rtt;
+        }
+        *last
+    }
+
+    /// The path in use: direct (peer to peer) or through the relay.
+    pub fn path(&self) -> Option<hext_net::PathInfo> {
+        hext_net::path(&self.conn)
     }
 
     /// `true` once the session ended (host left, network lost or closed).
@@ -99,6 +111,7 @@ pub async fn start(
         input: input_tx,
         shutdown: Some(shutdown_tx),
         task,
+        last_rtt: Mutex::new(Duration::ZERO),
     })
 }
 

@@ -5,13 +5,12 @@
 //! connect and a one-time session code. The viewer pins the host's device
 //! key, remembered per ID (trust on first use).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hext_crypto::DeviceKey;
-use hext_net::{Connection, Endpoint, HostPin};
+use hext_net::{Connection, Endpoint};
 use hext_session::SessionCodes;
 use hext_signal::{Check, Client, ClientMsg, DeviceId, KnownHosts, Rejection, Role, ServerMsg};
 use tokio::sync::{Semaphore, mpsc};
@@ -24,17 +23,20 @@ const ANSWER_TIME: Duration = Duration::from_secs(55);
 /// Waits between attempts to reach the server, doubling up to the last.
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
-/// How long to try each of the host's addresses.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the host waits for its relay before answering a request.
+const RELAY_WAIT: Duration = Duration::from_secs(5);
+/// How long to try reaching the host (directly or through the relay).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Host side: stays logged in to `server` (reconnecting when it drops)
-/// and asks the user about each request. `addr` is where viewers reach
+/// and asks the user about each request. Viewers it accepts get
+/// `endpoint`'s addresses (relay and direct) to reach it;
 /// this host; `slot` is free while no session runs.
 pub async fn host(
     server: String,
     key: Arc<DeviceKey>,
     name: String,
-    addr: SocketAddr,
+    (endpoint, has_relay): (Endpoint, bool),
     codes: SessionCodes,
     slot: Arc<Semaphore>,
 ) {
@@ -52,7 +54,15 @@ pub async fn host(
                 } else {
                     info!("reconectado ao servidor");
                 }
-                if let Err(e) = serve(&mut client, &mut answers, addr, &codes, &slot).await {
+                if let Err(e) = serve(
+                    &mut client,
+                    &mut answers,
+                    (&endpoint, has_relay),
+                    &codes,
+                    &slot,
+                )
+                .await
+                {
                     warn!("servidor de sinalização: {e}");
                 }
             }
@@ -67,7 +77,7 @@ pub async fn host(
 async fn serve(
     client: &mut Client,
     answers: &mut mpsc::UnboundedReceiver<String>,
-    addr: SocketAddr,
+    (endpoint, has_relay): (&Endpoint, bool),
     codes: &SessionCodes,
     slot: &Semaphore,
 ) -> Result<(), hext_signal::ClientError> {
@@ -75,8 +85,8 @@ async fn serve(
         let ServerMsg::Request {
             request,
             from,
+            from_key,
             from_name,
-            ..
         } = client.recv().await?
         else {
             continue;
@@ -124,10 +134,17 @@ async fn serve(
         }
         let answer = if accepted && !busy {
             println!("  Aceito: conectando...");
+            // The relay must be among the addresses: without it, a viewer
+            // on another network has nothing to fall back on. Right after
+            // starting (or a network change) it may still be connecting.
+            if has_relay && endpoint.addr().relay_urls().next().is_none() {
+                let _ = tokio::time::timeout(RELAY_WAIT, endpoint.online()).await;
+            }
             ClientMsg::Accept {
                 request,
-                addrs: vec![addr.to_string()],
-                session_code: codes.issue(),
+                addrs: hext_net::addr_to_strings(&endpoint.addr()),
+                // Good only from the device that asked.
+                session_code: codes.issue(from_key),
             }
         } else {
             ClientMsg::Reject { request }
@@ -151,15 +168,17 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
 }
 
 /// Viewer side: asks host `id` for access through `server`, checks its key
-/// against the one remembered for that ID, and connects. Returns the
-/// connection, its endpoint and the one-time code to present.
+/// against the one remembered for that ID, and connects from `endpoint`
+/// (directly or through the relay). Returns the connection and the
+/// one-time code to present.
 pub async fn connect(
     server: &str,
     key: &DeviceKey,
     name: &str,
     id: DeviceId,
     known: &KnownHosts,
-) -> Result<(Endpoint, Connection, String)> {
+    endpoint: &Endpoint,
+) -> Result<(Connection, String)> {
     let mut client = Client::connect(server, key, name, APP_VERSION, Role::Viewer)
         .await
         .context("servidor de sinalização")?;
@@ -184,35 +203,23 @@ pub async fn connect(
         );
     }
 
-    let mut last_error = None;
-    for addr in &access.addrs {
-        let Ok(addr) = addr.parse::<SocketAddr>() else {
-            continue;
-        };
-        let attempt = async {
-            let endpoint = hext_net::client_endpoint(addr)?;
-            let conn = hext_net::connect(&endpoint, addr, HostPin::Key(access.host_key)).await?;
-            anyhow::Ok((endpoint, conn))
-        };
-        match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
-            Ok(Ok((endpoint, conn))) => {
-                // The handshake proved the host holds that key.
-                if check == Check::New {
-                    known
-                        .remember(id, &access.host_key)
-                        .with_context(|| known.path().display().to_string())?;
-                    info!("primeira conexão com {id}: chave guardada");
-                }
-                return Ok((endpoint, conn, access.session_code));
-            }
-            Ok(Err(e)) => last_error = Some(format!("{addr}: {e}")),
-            Err(_) => last_error = Some(format!("{addr}: sem resposta")),
+    let addr = hext_net::addr_from_strings(&access.host_key, &access.addrs)?;
+    let conn = match tokio::time::timeout(CONNECT_TIMEOUT, hext_net::connect(endpoint, addr)).await
+    {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => bail!("o outro computador aceitou, mas não foi possível conectar nele: {e}"),
+        Err(_) => {
+            bail!("o outro computador aceitou, mas não respondeu (nem direto nem pelo relay)")
         }
+    };
+    // The handshake proved the host holds that key.
+    if check == Check::New {
+        known
+            .remember(id, &access.host_key)
+            .with_context(|| known.path().display().to_string())?;
+        info!("primeira conexão com {id}: chave guardada");
     }
-    bail!(
-        "o outro computador aceitou, mas não foi possível conectar nele ({})",
-        last_error.unwrap_or_else(|| "nenhum endereço".to_owned())
-    )
+    Ok((conn, access.session_code))
 }
 
 fn rejection(reason: Rejection) -> &'static str {
