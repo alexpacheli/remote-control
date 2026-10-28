@@ -12,7 +12,7 @@ Acesso e suporte remoto para Windows, macOS e Linux, focado em fluidez.
 | `crates/proto` | Mensagens do protocolo: handshake, vídeo, input |
 | `crates/net` | QUIC, verificação do host por impressão digital, streams |
 | `crates/capture` | Captura de tela (DXGI no Windows, ScreenCaptureKit no macOS) e imagem de teste |
-| `crates/codec` | H.264: placa de vídeo (Media Foundation no Windows, VideoToolbox no Mac) ou OpenH264 em software |
+| `crates/codec` | H.264 (codificar e decodificar): placa de vídeo (Media Foundation no Windows, VideoToolbox no Mac) ou OpenH264 em software |
 | `crates/input` | Mapa de teclas e injeção de mouse/teclado (SendInput no Windows, CGEvent no macOS) |
 | `crates/render` | Renderização na GPU (wgpu), YUV → RGB no shader |
 | `crates/session` | Pipelines do host e do cliente |
@@ -64,6 +64,8 @@ Os binários ainda não são assinados (isso entra na F6):
 
    Abre uma janela com a tela do Windows. Mouse e teclado da janela controlam o Windows.
    O título da janela mostra fps, banda, tempos de captura/encode/decode e a latência (RTT).
+   O visualizador decodifica na placa de vídeo quando pode (`(GPU)` ao lado do decode);
+   `view ... --decoder software` força o processador.
 
 - **Tecla Command:** por padrão funciona como Ctrl (Cmd+C copia no Windows). Use `--cmd-key win` para que ela seja a tecla Windows.
 - **Fora de casa:** sem servidor (F3), os dois precisam estar na mesma rede, ou use o [Tailscale](https://tailscale.com) nos dois e o IP `100.x.y.z` dele.

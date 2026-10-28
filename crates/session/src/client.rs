@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hext_codec::{H264Decoder, YuvFrame};
+use hext_codec::{DecoderPreference, YuvFrame};
 use hext_net::{Connection, ControlStream, FramedRecv, FramedSend};
 use hext_proto::{Control, Hello, InputEvent, PeerInfo, StreamKind, VideoFrame};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{Result, SessionError, Stats};
 
@@ -60,6 +60,7 @@ impl ClientHandle {
 pub async fn start(
     conn: Connection,
     hello: Hello,
+    decoder: DecoderPreference,
     on_frame: impl FnMut(DecodedFrame) + Send + 'static,
 ) -> Result<ClientHandle> {
     let (control, host) = hext_net::client_handshake(&conn, hello).await?;
@@ -74,6 +75,7 @@ pub async fn start(
     let stats = Arc::new(Mutex::new(Stats::default()));
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(run(
         conn.clone(),
         control,
@@ -82,8 +84,20 @@ pub async fn start(
         input_rx,
         shutdown_rx,
         stats.clone(),
+        decoder,
+        ready_tx,
         on_frame,
     ));
+    // A decoder that cannot open (e.g. `Hardware` without hardware) fails
+    // the session here instead of leaving it without a picture.
+    let ready = ready_rx
+        .await
+        .unwrap_or_else(|_| Err(SessionError::Protocol("decoder thread died".into())));
+    if let Err(e) = ready {
+        task.abort();
+        conn.close(1u32.into(), b"decoder unavailable");
+        return Err(e);
+    }
     Ok(ClientHandle {
         host,
         stats,
@@ -103,6 +117,8 @@ async fn run(
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
     mut shutdown: oneshot::Receiver<()>,
     stats: Arc<Mutex<Stats>>,
+    decoder: DecoderPreference,
+    ready: oneshot::Sender<Result<()>>,
     on_frame: impl FnMut(DecodedFrame) + Send + 'static,
 ) -> Result<()> {
     // Decoding is CPU-bound, so it gets its own thread. The short queue makes
@@ -112,7 +128,16 @@ async fn run(
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<()>();
     let decoder = std::thread::Builder::new()
         .name("hext-decode".into())
-        .spawn(move || decode_loop(&mut frames_rx, &keyframe_tx, &stats, on_frame))
+        .spawn(move || {
+            decode_loop(
+                &mut frames_rx,
+                &keyframe_tx,
+                &stats,
+                decoder,
+                ready,
+                on_frame,
+            )
+        })
         .map_err(|e| SessionError::Protocol(format!("decoder thread: {e}")))?;
     let mut receiver = tokio::spawn(async move {
         loop {
@@ -198,15 +223,22 @@ fn decode_loop(
     frames: &mut mpsc::Receiver<VideoFrame>,
     keyframe: &mpsc::UnboundedSender<()>,
     stats: &Mutex<Stats>,
+    preference: DecoderPreference,
+    ready: oneshot::Sender<Result<()>>,
     mut on_frame: impl FnMut(DecodedFrame),
 ) {
-    let mut decoder = match H264Decoder::new() {
-        Ok(decoder) => decoder,
+    // Opened on this thread: platform decoders (COM) stay on their thread.
+    let mut decoder = match hext_codec::open_decoder(preference) {
+        Ok(decoder) => {
+            let _ = ready.send(Ok(()));
+            decoder
+        }
         Err(e) => {
-            warn!("decoder: {e}");
+            let _ = ready.send(Err(e.into()));
             return;
         }
     };
+    info!("decodificador: {}", decoder.name());
     // After an error, ignore frames until a keyframe resynchronizes the stream.
     let mut waiting_for_keyframe = false;
     while let Some(frame) = frames.blocking_recv() {
@@ -227,6 +259,7 @@ fn decode_loop(
                         Duration::from_micros(frame.encode_micros.into()),
                         started.elapsed(),
                         frame.hardware,
+                        decoder.is_hardware(),
                     );
                 }
                 on_frame(DecodedFrame {

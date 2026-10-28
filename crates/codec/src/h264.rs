@@ -3,8 +3,11 @@
 /// `profile_idc` of the Baseline profile, the only one the decoder supports.
 pub const PROFILE_BASELINE: u8 = 66;
 
-const NAL_IDR: u8 = 5;
-const NAL_SPS: u8 = 7;
+pub const NAL_IDR: u8 = 5;
+pub const NAL_SPS: u8 = 7;
+pub const NAL_PPS: u8 = 8;
+/// Access unit delimiter.
+pub const NAL_AUD: u8 = 9;
 
 /// NAL units of an Annex-B stream (start codes removed).
 pub fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -35,7 +38,8 @@ pub fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(|(start, end)| &data[start..end])
 }
 
-fn nal_type(nal: &[u8]) -> Option<u8> {
+/// `nal_unit_type` of a NAL unit (start code removed).
+pub fn nal_type(nal: &[u8]) -> Option<u8> {
     nal.first().map(|b| b & 0x1F)
 }
 
