@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use hext_codec::EncoderSettings;
+use hext_codec::{DecoderPreference, EncoderSettings};
 use hext_net::Identity;
 use hext_proto::{Hello, InputEvent, PeerInfo};
 use hext_session::host::HostConfig;
@@ -54,6 +54,8 @@ async fn streams_and_decodes_video() {
             peer: PeerInfo::local("test", "client"),
             access_code: "111 222 333".into(),
         },
+        // Hardware where the machine has it (CI Macs may), else OpenH264.
+        DecoderPreference::Auto,
         move |frame| {
             assert_eq!((frame.yuv.width, frame.yuv.height), (1280, 720));
             counter.fetch_add(1, Ordering::Relaxed);
@@ -114,6 +116,7 @@ async fn host_ending_the_session_is_not_an_error() {
             peer: PeerInfo::local("test", "client"),
             access_code: CODE.into(),
         },
+        DecoderPreference::Software,
         |_| {},
     )
     .await

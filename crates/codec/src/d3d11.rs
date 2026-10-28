@@ -1,6 +1,7 @@
-//! Reading an NV12 D3D11 texture back into system memory, for encoders that
+//! Reading an NV12 D3D11 texture back into system memory: for encoders that
 //! cannot take it on the GPU (OpenH264, or a Media Foundation transform on
-//! another adapter or without Direct3D 11 support).
+//! another adapter or without Direct3D 11 support), and for the frames the
+//! hardware decoder outputs.
 
 // Direct3D 11 calls are unsafe by nature; each block below is a plain API call.
 #![allow(unsafe_code)]
@@ -15,6 +16,14 @@ use crate::CodecError;
 
 fn d3d(context: &str, e: windows::core::Error) -> CodecError {
     CodecError::Hardware(format!("{context}: {e}"))
+}
+
+/// The planes of a mapped NV12 texture: `stride` bytes per row, the Y
+/// plane's `rows` rows followed by `rows / 2` interleaved U/V rows.
+pub(crate) struct Nv12Planes<'a> {
+    pub y: &'a [u8],
+    pub uv: &'a [u8],
+    pub stride: usize,
 }
 
 /// Reads NV12 textures back, reusing one staging texture.
@@ -33,6 +42,29 @@ impl Readback {
         height: u32,
         out: &mut Vec<u8>,
     ) -> Result<(), CodecError> {
+        let (w, h) = (width as usize, height as usize);
+        self.map(texture, 0, width, height, |planes| {
+            out.clear();
+            out.reserve(w * h * 3 / 2);
+            for (plane, rows) in [(planes.y, h), (planes.uv, h / 2)] {
+                for row in plane.chunks(planes.stride).take(rows) {
+                    out.extend_from_slice(&row[..w]);
+                }
+            }
+        })
+    }
+
+    /// Copies one subresource of an NV12 `texture` (an array slice, for
+    /// decoder output) to CPU memory and gives its planes to `f`. The texture
+    /// must be at least `width`x`height`.
+    pub fn map<R>(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+        width: u32,
+        height: u32,
+        f: impl FnOnce(Nv12Planes<'_>) -> R,
+    ) -> Result<R, CodecError> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
         if desc.Format != DXGI_FORMAT_NV12 || desc.Width < width || desc.Height < height {
@@ -48,29 +80,26 @@ impl Readback {
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
-            context.CopyResource(&staging, texture);
+            context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, subresource, None);
             context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|e| d3d("Map", e))?;
         }
-        let pitch = mapped.RowPitch as usize;
-        let base = mapped.pData.cast::<u8>().cast_const();
-        let (w, h) = (width as usize, height as usize);
-        out.clear();
-        out.reserve(w * h * 3 / 2);
+        let stride = mapped.RowPitch as usize;
         // The UV plane starts right after the texture's full Y plane.
-        let uv_offset = pitch * desc.Height as usize;
-        for (offset, rows) in [(0, h), (uv_offset, h / 2)] {
-            for y in 0..rows {
-                // SAFETY: the mapped NV12 staging texture holds `desc.Height`
-                // Y rows then `desc.Height / 2` UV rows, each `RowPitch >= w`
-                // bytes, and stays mapped until the Unmap below.
-                let row = unsafe { std::slice::from_raw_parts(base.add(offset + y * pitch), w) };
-                out.extend_from_slice(row);
-            }
-        }
+        let rows = desc.Height as usize;
+        // SAFETY: the mapped NV12 staging texture holds `rows` Y rows then
+        // `rows / 2` UV rows of `RowPitch` bytes, mapped until the Unmap below.
+        let all = unsafe {
+            std::slice::from_raw_parts(
+                mapped.pData.cast::<u8>().cast_const(),
+                stride * rows * 3 / 2,
+            )
+        };
+        let (y, uv) = all.split_at(stride * rows);
+        let result = f(Nv12Planes { y, uv, stride });
         unsafe { context.Unmap(&staging, 0) };
-        Ok(())
+        Ok(result)
     }
 
     fn staging(
@@ -84,7 +113,10 @@ impl Readback {
         {
             return Ok(texture.clone());
         }
+        // One plain texture, even when the source is an array (decoder output).
         let desc = D3D11_TEXTURE2D_DESC {
+            MipLevels: 1,
+            ArraySize: 1,
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
             CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,

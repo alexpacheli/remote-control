@@ -75,12 +75,13 @@ struct HostArgs {
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
     /// Codificador de vídeo.
-    #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
-    encoder: EncoderChoice,
+    #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
+    encoder: CodecChoice,
 }
 
+/// Which encoder (host) or decoder (viewer) to use.
 #[derive(Clone, Copy, ValueEnum)]
-enum EncoderChoice {
+enum CodecChoice {
     /// Placa de vídeo se houver; senão, ou se ela falhar, o processador.
     Auto,
     /// Sempre o processador (OpenH264).
@@ -111,6 +112,9 @@ struct ViewArgs {
     /// No modo --headless, por quantos segundos receber.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     seconds: u64,
+    /// Decodificador de vídeo.
+    #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
+    decoder: CodecChoice,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]

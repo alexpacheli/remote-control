@@ -7,9 +7,13 @@
 //! - a hardware encoder on macOS (VideoToolbox, on the Mac's media engine).
 //!
 //! [`open_encoder`] picks one; in `Auto` mode a failing hardware encoder is
-//! replaced by the software one on the fly. Decoding is OpenH264 everywhere,
-//! which only understands the Baseline profile: hardware encoders are
-//! configured (and checked) to produce it.
+//! replaced by the software one on the fly. Hardware encoders are configured
+//! (and checked) to produce the Baseline profile, the only one OpenH264
+//! decodes.
+//!
+//! Decoders sit behind [`VideoDecoder`]: [`H264Decoder`] (OpenH264), or the
+//! GPU's (VideoToolbox on macOS, Media Foundation with Direct3D 11 on
+//! Windows), chosen by [`open_decoder`] the same way.
 
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
@@ -19,10 +23,14 @@ mod d3d11;
 pub mod h264;
 #[cfg(windows)]
 mod mf;
+#[cfg(windows)]
+mod mf_decode;
 mod nv12;
 mod software;
 #[cfg(target_os = "macos")]
 mod vt;
+#[cfg(target_os = "macos")]
+mod vt_decode;
 
 pub use nv12::{bgra_to_nv12, split_uv};
 pub use software::SoftwareEncoder;
@@ -316,6 +324,106 @@ fn check_frame(image: &Image<'_>) -> Result<(), CodecError> {
     Ok(())
 }
 
+pub trait VideoDecoder {
+    /// Decodes one Annex-B access unit. `None` means more data is needed.
+    /// After an error, feed a keyframe next.
+    fn decode(&mut self, data: &[u8]) -> Result<Option<YuvFrame>, CodecError>;
+
+    /// Human-readable description, e.g. "GPU (VideoToolbox)".
+    fn name(&self) -> String;
+
+    /// Whether frames are decoded by the GPU.
+    fn is_hardware(&self) -> bool;
+}
+
+/// Which decoder to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecoderPreference {
+    /// Hardware when available, software otherwise or after a failure.
+    #[default]
+    Auto,
+    Software,
+    /// Hardware only; fails if there is none.
+    Hardware,
+}
+
+/// Opens the decoder chosen by `preference`.
+pub fn open_decoder(preference: DecoderPreference) -> Result<Box<dyn VideoDecoder>, CodecError> {
+    match preference {
+        DecoderPreference::Software => Ok(Box::new(H264Decoder::new()?)),
+        DecoderPreference::Hardware => hardware_decoder(),
+        DecoderPreference::Auto => {
+            let hardware = hardware_decoder()
+                .inspect_err(|e| tracing::info!("sem decodificação por hardware: {e}"))
+                .ok();
+            let software = match hardware {
+                Some(_) => None,
+                None => Some(H264Decoder::new()?),
+            };
+            Ok(Box::new(AutoDecoder { hardware, software }))
+        }
+    }
+}
+
+fn hardware_decoder() -> Result<Box<dyn VideoDecoder>, CodecError> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(vt_decode::VtDecoder::new()?))
+    }
+    #[cfg(windows)]
+    {
+        Ok(Box::new(mf_decode::MfDecoder::new()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err(CodecError::NoHardware)
+    }
+}
+
+/// Hardware decoder with a software fallback.
+struct AutoDecoder {
+    hardware: Option<Box<dyn VideoDecoder>>,
+    /// Created when the hardware is missing or gives up.
+    software: Option<H264Decoder>,
+}
+
+impl VideoDecoder for AutoDecoder {
+    fn decode(&mut self, data: &[u8]) -> Result<Option<YuvFrame>, CodecError> {
+        if let Some(hardware) = &mut self.hardware {
+            return match hardware.decode(data) {
+                // A broken stream (a lost reference, a frame before the first
+                // keyframe) fails on any decoder: the caller asks for a
+                // keyframe. Only a keyframe failing means the hardware
+                // cannot decode this stream.
+                Err(e) if h264::has_idr(data) => {
+                    tracing::warn!("decodificação por hardware falhou ({e}); usando software");
+                    self.hardware = None;
+                    self.software = Some(H264Decoder::new()?);
+                    Err(e)
+                }
+                result => result,
+            };
+        }
+        let software = match &mut self.software {
+            Some(software) => software,
+            None => self.software.insert(H264Decoder::new()?),
+        };
+        software.decode(data)
+    }
+
+    fn name(&self) -> String {
+        match &self.hardware {
+            Some(hardware) => hardware.name(),
+            None => "CPU (OpenH264)".to_owned(),
+        }
+    }
+
+    fn is_hardware(&self) -> bool {
+        self.hardware.is_some()
+    }
+}
+
+/// OpenH264 on the CPU.
 pub struct H264Decoder {
     inner: Decoder,
 }
@@ -341,6 +449,60 @@ impl H264Decoder {
             u: pack(picture.u(), u_stride, w / 2, h / 2),
             v: pack(picture.v(), v_stride, w / 2, h / 2),
         }))
+    }
+}
+
+impl VideoDecoder for H264Decoder {
+    fn decode(&mut self, data: &[u8]) -> Result<Option<YuvFrame>, CodecError> {
+        H264Decoder::decode(self, data)
+    }
+
+    fn name(&self) -> String {
+        "CPU (OpenH264)".to_owned()
+    }
+
+    fn is_hardware(&self) -> bool {
+        false
+    }
+}
+
+impl YuvFrame {
+    /// Builds an I420 frame from NV12 planes with row strides, as hardware
+    /// decoders output them: the Y rows are copied and the interleaved U/V
+    /// rows split.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn from_nv12(
+        width: u32,
+        height: u32,
+        y: &[u8],
+        y_stride: usize,
+        uv: &[u8],
+        uv_stride: usize,
+    ) -> Result<Self, CodecError> {
+        let (w, h) = (width as usize, height as usize);
+        let fits = |plane: &[u8], stride: usize, rows: usize| {
+            rows == 0 || (stride >= w && plane.len() >= stride * (rows - 1) + w)
+        };
+        if w % 2 != 0 || h % 2 != 0 || !fits(y, y_stride, h) || !fits(uv, uv_stride, h / 2) {
+            return Err(CodecError::InvalidFrame(format!(
+                "planos NV12 pequenos demais para {width}x{height}"
+            )));
+        }
+        let mut u = Vec::with_capacity(w * h / 4);
+        let mut v = Vec::with_capacity(w * h / 4);
+        for row in uv.chunks(uv_stride).take(h / 2) {
+            for pair in row[..w].chunks_exact(2) {
+                u.push(pair[0]);
+                v.push(pair[1]);
+            }
+        }
+        Ok(Self {
+            width,
+            height,
+            y: pack(y, y_stride, w, h),
+            u,
+            v,
+        })
     }
 }
 
@@ -375,6 +537,21 @@ pub(crate) mod tests {
         let mut nv12 = Vec::new();
         bgra_to_nv12(w, h, &image(w, h, t), &mut None, &mut nv12);
         nv12
+    }
+
+    /// Hardware decoders hand out NV12 planes with padded rows.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn i420_from_strided_nv12() {
+        // 4x2 image, rows padded to 6 bytes: Y = 1..8, U/V pairs (10,20), (30,40).
+        let y = [1, 2, 3, 4, 0, 0, 5, 6, 7, 8, 0, 0];
+        let uv = [10, 20, 30, 40, 0, 0];
+        let frame = YuvFrame::from_nv12(4, 2, &y, 6, &uv, 6).unwrap();
+        assert_eq!(frame.y, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!((frame.u, frame.v), (vec![10, 30], vec![20, 40]));
+        // Planes too small for the size are an error, not a panic.
+        assert!(YuvFrame::from_nv12(8, 2, &y, 6, &uv, 6).is_err());
+        assert!(YuvFrame::from_nv12(4, 4, &y, 6, &uv, 6).is_err());
     }
 
     #[test]

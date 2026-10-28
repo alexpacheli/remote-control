@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use hext_codec::YuvFrame;
+use hext_codec::{DecoderPreference, YuvFrame};
 use hext_input::keymap::{self, CommandKey};
 use hext_proto::Os;
 use hext_proto::{Hello, InputEvent, MouseButton, PeerInfo};
@@ -22,7 +22,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-use crate::{APP_VERSION, CmdKey, CtrlKey, ViewArgs, device_name, parse_addr};
+use crate::{APP_VERSION, CmdKey, CodecChoice, CtrlKey, ViewArgs, device_name, parse_addr};
 
 /// Trackpad scrolling arrives in pixels; this many make one wheel notch.
 const PIXELS_PER_NOTCH: f64 = 50.0;
@@ -58,7 +58,7 @@ pub fn run(args: ViewArgs) -> Result<()> {
             .await
             .with_context(|| format!("falha ao conectar em {addr}"))?;
         let watch = conn.clone();
-        let session = client::start(conn, hello, move |frame| {
+        let session = client::start(conn, hello, decoder(args.decoder), move |frame| {
             *handle.lock().expect("lock") = Some(frame.yuv);
             let _ = proxy.send_event(UserEvent::Frame);
         })
@@ -287,7 +287,7 @@ async fn headless(addr: std::net::SocketAddr, args: ViewArgs, hello: Hello) -> R
     let conn = hext_net::connect(&endpoint, addr, args.fingerprint)
         .await
         .with_context(|| format!("falha ao conectar em {addr}"))?;
-    let session = client::start(conn, hello, |_| {}).await?;
+    let session = client::start(conn, hello, decoder(args.decoder), |_| {}).await?;
     println!(
         "Conectado a {} ({:?}, v{})",
         session.host.device_name, session.host.os, session.host.app_version
@@ -310,4 +310,12 @@ async fn headless(addr: std::net::SocketAddr, args: ViewArgs, hello: Hello) -> R
     session.close().await?;
     endpoint.wait_idle().await;
     Ok(())
+}
+
+fn decoder(choice: CodecChoice) -> DecoderPreference {
+    match choice {
+        CodecChoice::Auto => DecoderPreference::Auto,
+        CodecChoice::Software => DecoderPreference::Software,
+        CodecChoice::Hardware => DecoderPreference::Hardware,
+    }
 }

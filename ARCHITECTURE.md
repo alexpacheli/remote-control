@@ -177,7 +177,7 @@ Captura (GPU) ─► [mudou?] ─► Encode HW ─► Empacota + FEC ─► Rede
 
 ### 4.4 Decodificação e render
 
-- Decode por hardware: D3D11VA / Media Foundation no Windows, VideoToolbox no macOS, VAAPI no Linux, e software como fallback.
+- Decode por hardware: Media Foundation com Direct3D 11 (DXVA) no Windows e VideoToolbox no macOS (implementados), VAAPI no Linux, e OpenH264 como fallback. Por enquanto o quadro decodificado volta para a memória e é enviado ao `wgpu` como I420; mostrar a textura decodificada direto (sem essa volta) fica para depois.
 - Render com `wgpu` (D3D12/D3D11, Metal ou Vulkan).
 - O quadro é apresentado **assim que é decodificado**, sem fila. Modo de baixa latência com tearing é opcional.
 - Escalas disponíveis: ajustar à janela, 1:1 e resolução adaptativa.

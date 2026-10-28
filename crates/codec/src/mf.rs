@@ -74,13 +74,13 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 const DRAIN_WAIT: Duration = Duration::from_millis(30);
 
 /// Hundreds of nanoseconds per second (Media Foundation time unit).
-const HNS_PER_SEC: i64 = 10_000_000;
+pub(crate) const HNS_PER_SEC: i64 = 10_000_000;
 
 /// A keyframe at least every minute, so a lost one can never stall the
 /// picture for long even if the viewer's request goes missing.
 const GOP_FRAMES: u32 = 60 * 60;
 
-fn hw(context: &str, e: windows::core::Error) -> CodecError {
+pub(crate) fn hw(context: &str, e: windows::core::Error) -> CodecError {
     CodecError::Hardware(format!("{context}: {e}"))
 }
 
@@ -854,7 +854,11 @@ fn texture_sample(
 }
 
 /// A sample holding a copy of `data` in system memory.
-fn memory_sample(data: &[u8], time: i64, duration: i64) -> Result<IMFSample, CodecError> {
+pub(crate) fn memory_sample(
+    data: &[u8],
+    time: i64,
+    duration: i64,
+) -> Result<IMFSample, CodecError> {
     unsafe {
         let buffer =
             MFCreateMemoryBuffer(data.len() as u32).map_err(|e| hw("MFCreateMemoryBuffer", e))?;
@@ -907,7 +911,7 @@ fn blob(media_type: &IMFMediaType, key: &GUID) -> Option<Vec<u8>> {
 }
 
 /// Applies an encoder setting; returns whether the driver accepted it.
-fn set(codec: &ICodecAPI, api: &GUID, value: VARIANT) -> bool {
+pub(crate) fn set(codec: &ICodecAPI, api: &GUID, value: VARIANT) -> bool {
     match unsafe { codec.SetValue(api, &value) } {
         Ok(()) => true,
         Err(e) => {
@@ -935,7 +939,7 @@ fn u32_variant(value: u32) -> VARIANT {
     variant(VT_UI4, VARIANT_0_0_0 { ulVal: value })
 }
 
-fn bool_variant() -> VARIANT {
+pub(crate) fn bool_variant() -> VARIANT {
     variant(
         VT_BOOL,
         VARIANT_0_0_0 {
