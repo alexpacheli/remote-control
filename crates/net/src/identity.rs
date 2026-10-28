@@ -88,8 +88,7 @@ impl Identity {
 
     /// A throwaway identity (a new random key), for tests.
     pub fn generate() -> Result<Self> {
-        let key = DeviceKey::generate().map_err(|e| crate::NetError::Unexpected(e.to_string()))?;
-        Self::from_device_key(&key)
+        Self::from_device_key(&DeviceKey::generate()?)
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -129,6 +128,24 @@ mod tests {
         assert_eq!(first.cert, again.cert);
         let other = Identity::generate().unwrap();
         assert_ne!(first.fingerprint(), other.fingerprint());
+    }
+
+    /// The fingerprint viewers pin must not change when a dependency (rcgen,
+    /// ring) changes how it builds the certificate: a change here means
+    /// every host's fingerprint changed.
+    #[test]
+    fn fingerprint_is_stable_across_versions() {
+        // RFC 8032, section 7.1, TEST 1.
+        let seed: [u8; 32] =
+            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let identity = Identity::from_device_key(&DeviceKey::from_seed(&seed).unwrap()).unwrap();
+        assert_eq!(
+            identity.fingerprint().to_string(),
+            "1662:BCF0:87A5:D082:154A:120D:3358:A6EC:A1D3:116B:0907:AD3F:1427:84BD:3418:442A"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Where the device key lives between runs.
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
@@ -88,15 +88,26 @@ impl FileKeyStore {
 
 impl KeyStore for FileKeyStore {
     fn load(&self) -> Result<Option<DeviceKey>> {
-        match fs::read(&self.path) {
-            Ok(bytes) => self.parse(&Zeroizing::new(bytes)).map(Some),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(self.io(e)),
-        }
+        let mut file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.io(e)),
+        };
+        // A file restored or copied with loose permissions is made private.
+        #[cfg(unix)]
+        restrict(&file).map_err(|e| self.io(e))?;
+        // Read no more than a key file can hold (not a huge file by mistake).
+        let mut bytes = Zeroizing::new(Vec::with_capacity(FILE_LEN + 1));
+        (&mut file)
+            .take(FILE_LEN as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| self.io(e))?;
+        self.parse(&bytes).map(Some)
     }
 
     fn create(&self, key: DeviceKey) -> Result<DeviceKey> {
-        if let Some(dir) = self.path.parent() {
+        let dir = self.path.parent().filter(|d| !d.as_os_str().is_empty());
+        if let Some(dir) = dir {
             create_private_dir(dir).map_err(|e| self.io(e))?;
         }
         let mut contents = Zeroizing::new(Vec::with_capacity(FILE_LEN));
@@ -104,34 +115,83 @@ impl KeyStore for FileKeyStore {
         contents.extend_from_slice(key.seed());
         contents.extend_from_slice(key.public_key().as_bytes());
 
-        // Written whole to a temporary file, then linked into place only if
-        // no key exists: a crash leaves no half-written key, and of two
-        // processes starting at once both end up with the same key.
+        // A key that vanishes right after another process created it (the
+        // user deleted it) is created again, a few times at most.
+        for _ in 0..3 {
+            match self.place(&contents) {
+                Ok(()) => {
+                    // The new name must survive a power cut, or the next run
+                    // would create a different identity.
+                    #[cfg(unix)]
+                    if let Some(dir) = dir {
+                        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+                    }
+                    return Ok(key);
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if let Some(stored) = self.load()? {
+                        return Ok(stored);
+                    }
+                }
+                Err(e) => return Err(self.io(e)),
+            }
+        }
+        Err(CryptoError::Corrupt(self.path.clone()))
+    }
+}
+
+impl FileKeyStore {
+    /// Puts `contents` at the key's path unless a file is there
+    /// (`AlreadyExists`).
+    ///
+    /// Written whole to a temporary file, then linked into place: a crash
+    /// leaves no half-written key, and of two processes starting at once
+    /// both end up with the same key. Where hard links are not supported
+    /// (FAT, some network shares) the file is created in place instead.
+    fn place(&self, contents: &[u8]) -> std::io::Result<()> {
         let mut tmp_name = self.path.as_os_str().to_owned();
         tmp_name.push(format!(".{}.tmp", std::process::id()));
         let tmp = PathBuf::from(tmp_name);
-        let written = write_private(&tmp, &contents);
-        let placed = written.and_then(|()| fs::hard_link(&tmp, &self.path));
+        let linked =
+            write_private(&tmp, contents, false).and_then(|()| fs::hard_link(&tmp, &self.path));
         let _ = fs::remove_file(&tmp);
-        match placed {
-            Ok(()) => Ok(key),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => self
-                .load()?
-                .ok_or_else(|| CryptoError::Corrupt(self.path.clone())),
-            Err(e) => Err(self.io(e)),
+        match linked {
+            Err(e) if e.kind() != ErrorKind::AlreadyExists => {
+                write_private(&self.path, contents, true).inspect_err(|e| {
+                    if e.kind() != ErrorKind::AlreadyExists {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                })
+            }
+            other => other,
         }
     }
 }
 
-/// A new file readable only by this user.
-fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// A file readable only by this user (`exclusive`: fails if it exists).
+fn write_private(path: &Path, contents: &[u8], exclusive: bool) -> std::io::Result<()> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true);
+    if exclusive {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path)?;
     file.write_all(contents)?;
     file.sync_all()
+}
+
+#[cfg(unix)]
+fn restrict(file: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = file.metadata()?.permissions().mode();
+    if mode & 0o077 != 0 {
+        file.set_permissions(fs::Permissions::from_mode(mode & 0o700))?;
+    }
+    Ok(())
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -229,9 +289,39 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_key_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("loose");
+        let store = FileKeyStore::new(dir.join("device.key"));
+        let key = store.create(DeviceKey::generate().unwrap()).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap().public_key(),
+            key.public_key()
+        );
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_huge_file_is_not_read_whole() {
+        let dir = temp_dir("huge");
+        fs::create_dir_all(&dir).unwrap();
+        let store = FileKeyStore::new(dir.join("device.key"));
+        fs::write(store.path(), vec![0u8; 1 << 20]).unwrap();
+        assert!(matches!(store.load(), Err(CryptoError::Corrupt(_))));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn default_location_is_per_user() {
-        let store = FileKeyStore::default_location().unwrap();
-        assert!(store.path().ends_with("device.key"));
+        match FileKeyStore::default_location() {
+            Ok(store) => assert!(store.path().ends_with("device.key")),
+            // No HOME/APPDATA (a bare environment): that is reported.
+            Err(e) => assert!(matches!(e, CryptoError::NoConfigDir(_))),
+        }
     }
 }

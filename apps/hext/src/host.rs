@@ -110,7 +110,6 @@ pub async fn run(args: HostArgs) -> Result<()> {
     Ok(())
 }
 
-/// A random 9-digit code, like "482913557".
 /// The TLS identity from this computer's key, created on first run. The
 /// fingerprint stays the same between runs, so viewers can keep it.
 fn device_identity(path: Option<&std::path::Path>) -> Result<Identity> {
@@ -128,6 +127,7 @@ fn device_identity(path: Option<&std::path::Path>) -> Result<Identity> {
     Ok(Identity::from_device_key(&key)?)
 }
 
+/// A random 9-digit code, like "482913557".
 fn random_code() -> Result<String> {
     let mut bytes = [0u8; 8];
     SystemRandom::new()

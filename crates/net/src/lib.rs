@@ -32,6 +32,8 @@ pub enum NetError {
     Tls(#[from] rustls::Error),
     #[error("certificate generation: {0}")]
     Certificate(#[from] rcgen::Error),
+    #[error("device key: {0}")]
+    DeviceKey(#[from] hext_crypto::CryptoError),
     #[error("connect: {0}")]
     Connect(#[from] quinn::ConnectError),
     #[error("connection: {0}")]
