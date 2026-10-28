@@ -80,7 +80,7 @@ pub fn remote_key(conn: &Connection) -> PublicKey {
 /// The `iroh` ID of a device key.
 pub fn endpoint_id(key: &PublicKey) -> Result<EndpointId> {
     EndpointId::from_bytes(key.as_bytes())
-        .map_err(|_| NetError::Unexpected("chave inválida".into()))
+        .map_err(|_| NetError::Connect("a chave informada não é uma chave válida".into()))
 }
 
 /// Where a host can be reached, as text for signaling: `relay <url>` and
