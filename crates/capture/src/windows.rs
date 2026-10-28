@@ -1,8 +1,12 @@
 //! DXGI Desktop Duplication capture.
 //!
-//! The duplication hands out a GPU texture per desktop update; it is copied
-//! to a CPU-readable staging texture and packed into a [`Frame`]. The cursor
-//! is not part of the image: the viewer draws its own (zero-latency) cursor.
+//! The duplication hands out a GPU texture per desktop update. The GPU's
+//! video processor converts it to NV12 into a texture the hardware encoder
+//! reads directly ([`Frame::texture`]), so the image never leaves the GPU.
+//! If the driver has no video processor, the texture is instead copied to a
+//! CPU-readable staging texture and packed into a BGRA [`Frame`]. The
+//! cursor is not part of the image: the viewer draws its own (zero-latency)
+//! cursor.
 
 // COM / Direct3D calls are unsafe by nature; each block below is a plain API call.
 #![allow(unsafe_code)]
@@ -12,9 +16,10 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
@@ -29,6 +34,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::core::Interface;
 
+use crate::gpu_nv12::Nv12Converter;
 use crate::{CaptureError, Capturer, Frame, PixelFormat, Rect, even};
 
 fn platform(e: windows::core::Error) -> CaptureError {
@@ -42,6 +48,13 @@ pub struct DxgiCapturer {
     /// `None` while duplication is unavailable (secure desktop, mode change).
     duplication: Option<IDXGIOutputDuplication>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// GPU conversion to NV12, for the current desktop size.
+    converter: Option<Nv12Converter>,
+    /// No video support: always copy through system memory.
+    cpu_only: bool,
+    /// Desktop size at which the GPU conversion failed; it is tried again
+    /// after a size change or a new duplication.
+    gpu_failed_at: Option<(u32, u32)>,
     frame: Option<Frame>,
     rect: Rect,
     copy_time: Duration,
@@ -55,24 +68,23 @@ impl DxgiCapturer {
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
         let (adapter, output) = find_output(index)?;
-        let mut device = None;
-        let mut context = None;
-        unsafe {
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
+        // Video support lets the GPU convert to NV12 and the hardware
+        // encoder use the same device; without it, the CPU path still works.
+        let (device, context, video) = match create_device(
+            &adapter,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        ) {
+            Ok((device, context)) => (device, context, true),
+            Err(e) => {
+                tracing::info!("D3D11 sem suporte a vídeo ({e}); captura pela CPU");
+                let (device, context) = create_device(&adapter, D3D11_CREATE_DEVICE_BGRA_SUPPORT)?;
+                (device, context, false)
+            }
+        };
+        // The encoder uses the device from its own threads.
+        if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
+            let _ = unsafe { multithread.SetMultithreadProtected(true) };
         }
-        .map_err(platform)?;
-        let device = device.ok_or_else(|| CaptureError::Platform("no D3D11 device".into()))?;
-        let context = context.ok_or_else(|| CaptureError::Platform("no D3D11 context".into()))?;
         let output: IDXGIOutput1 = output.cast().map_err(platform)?;
 
         let mut capturer = Self {
@@ -81,6 +93,9 @@ impl DxgiCapturer {
             output,
             duplication: None,
             staging: None,
+            converter: None,
+            cpu_only: !video,
+            gpu_failed_at: None,
             frame: None,
             rect: Rect::default(),
             copy_time: Duration::ZERO,
@@ -99,6 +114,9 @@ impl DxgiCapturer {
             height: (r.bottom - r.top) as u32,
         };
         let duplication = unsafe { self.output.DuplicateOutput(&self.device) }.map_err(platform)?;
+        // A new duplication (mode change, secure desktop over): worth
+        // trying the GPU conversion again.
+        self.gpu_failed_at = None;
         let rotation = unsafe { duplication.GetDesc() }.Rotation;
         if !matches!(
             rotation,
@@ -135,6 +153,18 @@ impl DxgiCapturer {
             )));
         }
 
+        let size = (desc.Width, desc.Height);
+        if !self.cpu_only && self.gpu_failed_at != Some(size) {
+            match self.convert(&texture, &desc) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    tracing::warn!("conversão na GPU indisponível ({e}); captura pela CPU");
+                    self.gpu_failed_at = Some(size);
+                    self.converter = None;
+                }
+            }
+        }
+
         let staging = self.staging_texture(&desc)?;
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
@@ -152,9 +182,12 @@ impl DxgiCapturer {
             height: 0,
             format: PixelFormat::Bgra,
             data: Vec::new(),
+            texture: None,
         });
         frame.width = width;
         frame.height = height;
+        frame.format = PixelFormat::Bgra;
+        frame.texture = None;
         frame.data.resize(row_len * height as usize, 0);
         // SAFETY: the mapped staging texture holds `desc.Height` rows of `RowPitch`
         // bytes, and stays mapped until the Unmap below.
@@ -166,6 +199,39 @@ impl DxgiCapturer {
         }
         unsafe { self.context.Unmap(&staging, 0) };
         Ok(true)
+    }
+
+    /// Converts the desktop texture to NV12 on the GPU into `self.frame`.
+    fn convert(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> Result<(), CaptureError> {
+        let size = (desc.Width, desc.Height);
+        let converter = match &mut self.converter {
+            Some(converter) if converter.source_size() == size => converter,
+            _ => self.converter.insert(Nv12Converter::new(
+                &self.device,
+                &self.context,
+                desc.Format,
+                size,
+            )?),
+        };
+        let nv12 = converter.convert(texture)?;
+        let (width, height) = converter.size();
+        let frame = self.frame.get_or_insert_with(|| Frame {
+            width,
+            height,
+            format: PixelFormat::Nv12,
+            data: Vec::new(),
+            texture: None,
+        });
+        frame.width = width;
+        frame.height = height;
+        frame.format = PixelFormat::Nv12;
+        frame.data.clear();
+        frame.texture = Some(nv12);
+        Ok(())
     }
 
     fn staging_texture(
@@ -246,6 +312,31 @@ impl Capturer for DxgiCapturer {
     fn copy_time(&self) -> Duration {
         self.copy_time
     }
+}
+
+fn create_device(
+    adapter: &IDXGIAdapter1,
+    flags: D3D11_CREATE_DEVICE_FLAG,
+) -> Result<(ID3D11Device, ID3D11DeviceContext), CaptureError> {
+    let mut device = None;
+    let mut context = None;
+    unsafe {
+        D3D11CreateDevice(
+            adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            flags,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+    }
+    .map_err(platform)?;
+    let device = device.ok_or_else(|| CaptureError::Platform("no D3D11 device".into()))?;
+    let context = context.ok_or_else(|| CaptureError::Platform("no D3D11 context".into()))?;
+    Ok((device, context))
 }
 
 /// Finds the `index`-th output across all adapters (0 = first, usually primary).

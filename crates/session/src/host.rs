@@ -293,8 +293,19 @@ fn image(frame: &hext_capture::Frame) -> hext_codec::Image<'_> {
             hext_capture::PixelFormat::Bgra => hext_codec::PixelFormat::Bgra,
             hext_capture::PixelFormat::Nv12 => hext_codec::PixelFormat::Nv12,
         },
-        data: &frame.data,
+        pixels: gpu_texture(frame).unwrap_or(hext_codec::Pixels::Memory(&frame.data)),
     }
+}
+
+/// The frame's GPU texture, where the capture left the image on the GPU.
+#[cfg(windows)]
+fn gpu_texture(frame: &hext_capture::Frame) -> Option<hext_codec::Pixels<'_>> {
+    frame.texture.as_ref().map(hext_codec::Pixels::D3d11)
+}
+
+#[cfg(not(windows))]
+fn gpu_texture(_frame: &hext_capture::Frame) -> Option<hext_codec::Pixels<'_>> {
+    None
 }
 
 /// Hands an encoded frame to the network task; `false` once the session is over.

@@ -5,7 +5,8 @@ use openh264::encoder::{
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSlices};
 
 use crate::{
-    CodecError, Encoded, EncoderSettings, Image, PixelFormat, VideoEncoder, check_frame, split_uv,
+    CodecError, Encoded, EncoderSettings, Image, PixelFormat, Pixels, VideoEncoder, check_frame,
+    split_uv,
 };
 
 /// OpenH264 on the CPU.
@@ -17,6 +18,11 @@ pub struct SoftwareEncoder {
     /// U and V planes split out of NV12 input.
     u: Vec<u8>,
     v: Vec<u8>,
+    /// GPU textures read back into `cpu`.
+    #[cfg(windows)]
+    readback: crate::d3d11::Readback,
+    #[cfg(windows)]
+    cpu: Vec<u8>,
 }
 
 impl SoftwareEncoder {
@@ -27,6 +33,10 @@ impl SoftwareEncoder {
             yuv: None,
             u: Vec::new(),
             v: Vec::new(),
+            #[cfg(windows)]
+            readback: Default::default(),
+            #[cfg(windows)]
+            cpu: Vec::new(),
         }
     }
 }
@@ -54,10 +64,20 @@ impl VideoEncoder for SoftwareEncoder {
         }
 
         let (w, h) = (width as usize, height as usize);
+        // Only Windows has a second variant.
+        #[cfg_attr(not(windows), allow(clippy::infallible_destructuring_match))]
+        let data = match image.pixels {
+            Pixels::Memory(data) => data,
+            #[cfg(windows)]
+            Pixels::D3d11(texture) => {
+                self.readback.read(texture, width, height, &mut self.cpu)?;
+                &self.cpu
+            }
+        };
         let (encoder, ..) = self.inner.as_mut().expect("encoder created above");
         let bitstream = match image.format {
             PixelFormat::Bgra => {
-                let source = BgraSliceU8::new(image.data, (w, h));
+                let source = BgraSliceU8::new(data, (w, h));
                 let yuv = match &mut self.yuv {
                     Some(yuv) => {
                         yuv.read_bgra8(source);
@@ -69,7 +89,7 @@ impl VideoEncoder for SoftwareEncoder {
             }
             PixelFormat::Nv12 => {
                 // OpenH264 takes separate U and V planes (I420).
-                let (y, uv) = image.data.split_at(w * h);
+                let (y, uv) = data.split_at(w * h);
                 split_uv(uv, &mut self.u, &mut self.v);
                 let planes = YUVSlices::new((y, &self.u, &self.v), (w, h), (w, w / 2, w / 2));
                 encoder.encode(&planes)?

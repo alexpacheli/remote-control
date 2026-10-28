@@ -57,8 +57,8 @@ use objc2_video_toolbox::{
 
 use crate::h264::{self, PROFILE_BASELINE};
 use crate::{
-    CodecError, Encoded, EncoderSettings, Image, PixelFormat, SoftwareEncoder, VideoEncoder,
-    check_frame, merge, profile_error,
+    CodecError, Encoded, EncoderSettings, Image, PixelFormat, Pixels, SoftwareEncoder,
+    VideoEncoder, check_frame, merge, profile_error,
 };
 
 /// A keyframe at least every minute (frames are only encoded when the screen
@@ -204,7 +204,11 @@ impl VideoEncoder for VtEncoder {
 
         let keyframe = std::mem::take(&mut self.force_keyframe);
         let session = self.session.as_mut().expect("session opened above");
-        let result = session.encode(image.data, keyframe);
+        // macOS images are always in system memory.
+        let data = image
+            .memory()
+            .ok_or_else(|| CodecError::InvalidFrame("textura de GPU no macOS".into()))?;
+        let result = session.encode(data, keyframe);
         match &result {
             // Start over (with a keyframe) if the caller keeps using us.
             Err(_) => self.session = None,
@@ -729,7 +733,7 @@ pub fn benchmark(
             width,
             height,
             format,
-            data: &data,
+            pixels: Pixels::Memory(&data),
         })?;
         Ok((started.elapsed(), encoded))
     });

@@ -3,8 +3,9 @@
 //! GPU vendors ship their encoders as asynchronous Media Foundation
 //! transforms (MFTs). The transform asks for input (`METransformNeedInput`)
 //! and announces output (`METransformHaveOutput`) through events. Frames go
-//! in as NV12 in system memory; a zero-copy path from the captured GPU
-//! texture can come later.
+//! in as NV12: straight from the capture's GPU texture when the transform
+//! runs on the capture's adapter and supports Direct3D 11 (zero-copy: the
+//! image never leaves the GPU), otherwise from system memory.
 //!
 //! The decoder on the other side only handles the Baseline profile, so the
 //! encoder is asked for it and every keyframe's SPS is checked: an encoder
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 use openh264::formats::YUVBuffer;
 use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::Foundation::VARIANT_TRUE;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
@@ -39,8 +42,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, METransformDrainComplete,
-    MFT_MESSAGE_COMMAND_DRAIN,
+    IMF2DBuffer, IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes,
+    IMFDXGIDeviceManager, METransformDrainComplete, MF_SA_D3D11_AWARE, MFCreateAttributes,
+    MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFT_ENUM_ADAPTER_LUID,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_SET_D3D_MANAGER, MFTEnum2,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::{
@@ -48,12 +53,18 @@ use windows::Win32::System::Variant::{
 };
 use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 
+use crate::d3d11::Readback;
 use crate::h264::{self, PROFILE_BASELINE};
 use crate::nv12::bgra_to_nv12;
 use crate::{
-    CodecError, Encoded, EncoderSettings, Image, PixelFormat, VideoEncoder, check_frame, merge,
-    profile_error,
+    CodecError, Encoded, EncoderSettings, Image, PixelFormat, Pixels, VideoEncoder, check_frame,
+    merge, profile_error,
 };
+
+/// Most GPU-texture frames the transform may hold at once. The capture
+/// reuses a ring of textures (6), so a texture must be encoded before the
+/// capture comes back around to it.
+const MAX_TEXTURES_IN_FLIGHT: u32 = 3;
 
 /// Longest wait for the encoder to ask for input or deliver output.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -82,11 +93,19 @@ pub struct MfEncoder {
     frame_index: i64,
     yuv: Option<YUVBuffer>,
     nv12: Vec<u8>,
+    /// GPU textures the transform cannot take, read back into `nv12`.
+    readback: Readback,
 }
 
 struct Session {
     width: u32,
     height: u32,
+    /// The capture's D3D11 device this session was opened for, if any.
+    device: Option<ID3D11Device>,
+    /// The transform takes textures of `device` directly (zero-copy).
+    gpu_input: bool,
+    /// Keeps the device manager handed to the transform alive.
+    _manager: Option<IMFDXGIDeviceManager>,
     activate: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
@@ -114,7 +133,7 @@ impl MfEncoder {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|e| hw("MFStartup", e))?;
         }
-        let name = match enumerate() {
+        let name = match enumerate(None) {
             Ok(encoders) => encoders.first().map(friendly_name),
             Err(e) => {
                 unsafe {
@@ -138,18 +157,59 @@ impl MfEncoder {
             frame_index: 0,
             yuv: None,
             nv12: Vec::new(),
+            readback: Readback::default(),
         })
     }
 
-    fn open_session(&self, width: u32, height: u32) -> Result<Session, CodecError> {
-        let activate = enumerate()?
-            .into_iter()
-            .next()
-            .ok_or(CodecError::NoHardware)?;
+    /// Replaces the session (the new one starts with a keyframe).
+    fn reopen(
+        &mut self,
+        width: u32,
+        height: u32,
+        device: Option<&ID3D11Device>,
+    ) -> Result<(), CodecError> {
+        self.session = None;
+        let session = self.open_session(width, height, device)?;
+        let name = friendly_name(&session.activate);
+        if name != self.name {
+            tracing::info!("codificador por hardware: {name}");
+            self.name = name;
+        }
+        self.session = Some(session);
+        self.frame_index = 0;
+        Ok(())
+    }
+
+    /// Opens an encoder for `width`x`height` NV12 images. With `device` (the
+    /// capture's), an encoder on the same adapter is preferred, and is given
+    /// the device so it can read the capture's textures directly.
+    fn open_session(
+        &self,
+        width: u32,
+        height: u32,
+        device: Option<&ID3D11Device>,
+    ) -> Result<Session, CodecError> {
+        // An encoder on the capture's adapter, or else any (fed from memory).
+        let on_adapter = device.and_then(|device| {
+            enumerate(Some(device))
+                .inspect_err(|e| tracing::debug!("encoders do adaptador da captura: {e}"))
+                .ok()
+                .and_then(|list| list.into_iter().next())
+        });
+        let same_adapter = on_adapter.is_some();
+        let activate = match on_adapter {
+            Some(activate) => activate,
+            None => enumerate(None)?
+                .into_iter()
+                .next()
+                .ok_or(CodecError::NoHardware)?,
+        };
         let transform: IMFTransform =
             unsafe { activate.ActivateObject() }.map_err(|e| hw("ActivateObject", e))?;
+
         let fps = self.settings.max_fps.round().max(1.0) as u32;
 
+        // An async transform refuses every message until unlocked.
         unsafe {
             let attributes = transform
                 .GetAttributes()
@@ -158,6 +218,19 @@ impl MfEncoder {
                 .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
                 .map_err(|e| hw("async unlock", e))?;
             let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
+        }
+
+        // The device goes in before the media types.
+        let manager = match device {
+            Some(device) if same_adapter => attach_device(&transform, device)
+                .inspect_err(|e| {
+                    tracing::info!("o encoder não lê texturas da GPU ({e}); imagem pela memória");
+                })
+                .ok(),
+            _ => None,
+        };
+        if device.is_some() && !same_adapter {
+            tracing::info!("encoder em outro adaptador que a captura; imagem pela memória");
         }
 
         // Encoder settings are best effort: drivers support different subsets.
@@ -225,6 +298,9 @@ impl MfEncoder {
         let mut session = Session {
             width,
             height,
+            device: device.cloned(),
+            gpu_input: manager.is_some(),
+            _manager: manager,
             activate,
             transform,
             events,
@@ -248,26 +324,28 @@ impl VideoEncoder for MfEncoder {
     fn encode(&mut self, image: &Image<'_>) -> Result<Option<Encoded>, CodecError> {
         check_frame(image)?;
         let (width, height) = (image.width, image.height);
-        if !matches!(&self.session, Some(s) if (s.width, s.height) == (width, height)) {
-            self.session = None;
-            self.session = Some(self.open_session(width, height)?);
-            self.frame_index = 0;
+        let device = match image.pixels {
+            Pixels::D3d11(texture) => {
+                Some(unsafe { texture.GetDevice() }.map_err(|e| hw("GetDevice", e))?)
+            }
+            Pixels::Memory(_) => None,
+        };
+        // A new size, the first texture (or a new capture device), or memory
+        // images after textures: the encoder must be opened for it.
+        let reopen = match &self.session {
+            Some(s) => {
+                (s.width, s.height) != (width, height)
+                    || (device.is_some() && s.device != device)
+                    || (device.is_none() && s.gpu_input)
+            }
+            None => true,
+        };
+        if reopen {
+            self.reopen(width, height, device.as_ref())?;
         }
 
-        // The transform takes NV12; BGRA is converted on the CPU first.
-        let nv12 = match image.format {
-            PixelFormat::Nv12 => image.data,
-            PixelFormat::Bgra => {
-                bgra_to_nv12(width, height, image.data, &mut self.yuv, &mut self.nv12);
-                &self.nv12
-            }
-        };
-        let fps = i64::from(self.settings.max_fps.round().max(1.0) as u32);
-        let duration = HNS_PER_SEC / fps;
-        let sample = memory_sample(nv12, self.frame_index * duration, duration)?;
-        self.frame_index += 1;
-
-        if std::mem::take(&mut self.force_keyframe) {
+        // A session just opened starts with a keyframe anyway.
+        if std::mem::take(&mut self.force_keyframe) && !reopen {
             let session = self.session.as_ref().expect("session opened above");
             let forced = session
                 .codec
@@ -275,10 +353,29 @@ impl VideoEncoder for MfEncoder {
                 .is_some_and(|codec| set(codec, &CODECAPI_AVEncVideoForceKeyFrame, u32_variant(1)));
             if !forced {
                 // The driver cannot force one; a new session starts with a keyframe.
-                self.session = None;
-                self.session = Some(self.open_session(width, height)?);
+                self.reopen(width, height, device.as_ref())?;
             }
         }
+
+        // Built for the session that will take it (after any reopen above).
+        let gpu_input = self.session.as_ref().is_some_and(|s| s.gpu_input);
+        let fps = i64::from(self.settings.max_fps.round().max(1.0) as u32);
+        let duration = HNS_PER_SEC / fps;
+        let time = self.frame_index * duration;
+        let sample = match (image.pixels, image.format) {
+            (Pixels::D3d11(texture), _) if gpu_input => texture_sample(texture, time, duration)?,
+            (Pixels::D3d11(texture), _) => {
+                self.readback.read(texture, width, height, &mut self.nv12)?;
+                memory_sample(&self.nv12, time, duration)?
+            }
+            (Pixels::Memory(data), PixelFormat::Nv12) => memory_sample(data, time, duration)?,
+            // The transform takes NV12; BGRA is converted on the CPU first.
+            (Pixels::Memory(data), PixelFormat::Bgra) => {
+                bgra_to_nv12(width, height, data, &mut self.yuv, &mut self.nv12);
+                memory_sample(&self.nv12, time, duration)?
+            }
+        };
+        self.frame_index += 1;
 
         let session = self.session.as_mut().expect("session opened above");
         let result = session.encode(&sample);
@@ -328,11 +425,12 @@ impl Drop for MfEncoder {
 
 impl Session {
     fn encode(&mut self, sample: &IMFSample) -> Result<Option<Encoded>, CodecError> {
-        // Wait until the transform accepts input. Outputs of earlier frames
-        // that arrive meanwhile are kept: every one of them must be sent.
+        // Wait until the transform accepts input (and, for textures, has few
+        // enough frames in flight). Outputs of earlier frames that arrive
+        // meanwhile are kept: every one of them must be sent.
         let deadline = Instant::now() + EVENT_TIMEOUT;
         let mut ready = None;
-        while self.need_input == 0 {
+        while self.need_input == 0 || (self.gpu_input && self.in_flight >= MAX_TEXTURES_IN_FLIGHT) {
             merge(&mut ready, self.next_event(deadline)?);
         }
         unsafe { self.transform.ProcessInput(0, sample, 0) }.map_err(|e| hw("ProcessInput", e))?;
@@ -555,8 +653,9 @@ impl IMFAsyncCallback_Impl for EventSink_Impl {
     }
 }
 
-/// Hardware H.264 encoders that accept NV12, best first.
-fn enumerate() -> Result<Vec<IMFActivate>, CodecError> {
+/// Hardware H.264 encoders that accept NV12, best first; with `device`,
+/// only those on its adapter.
+fn enumerate(device: Option<&ID3D11Device>) -> Result<Vec<IMFActivate>, CodecError> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -565,24 +664,37 @@ fn enumerate() -> Result<Vec<IMFActivate>, CodecError> {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
     };
+    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
     unsafe {
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            Some(&input),
-            Some(&output),
-            &mut array,
-            &mut count,
-        )
-        .map_err(|e| hw("MFTEnumEx", e))?;
+        match device {
+            Some(device) => MFTEnum2(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                flags,
+                Some(&input),
+                Some(&output),
+                &adapter_filter(device)?,
+                &mut array,
+                &mut count,
+            )
+            .map_err(|e| hw("MFTEnum2", e))?,
+            None => MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                flags,
+                Some(&input),
+                Some(&output),
+                &mut array,
+                &mut count,
+            )
+            .map_err(|e| hw("MFTEnumEx", e))?,
+        }
     }
     if array.is_null() {
         return Ok(Vec::new());
     }
-    // SAFETY: MFTEnumEx returned `count` activation objects in a CoTaskMem
-    // array; each is moved out once, then the array itself is freed.
+    // SAFETY: the enumeration returned `count` activation objects in a
+    // CoTaskMem array; each is moved out once, then the array itself is freed.
     let activates = unsafe {
         let items = (0..count as usize)
             .filter_map(|i| std::ptr::read(array.add(i)))
@@ -591,6 +703,59 @@ fn enumerate() -> Result<Vec<IMFActivate>, CodecError> {
         items
     };
     Ok(activates)
+}
+
+/// Enumeration attributes selecting the adapter `device` runs on.
+fn adapter_filter(device: &ID3D11Device) -> Result<IMFAttributes, CodecError> {
+    unsafe {
+        let luid = device
+            .cast::<IDXGIDevice>()
+            .and_then(|dxgi| dxgi.GetAdapter())
+            .and_then(|adapter| adapter.GetDesc())
+            .map_err(|e| hw("adaptador da captura", e))?
+            .AdapterLuid;
+        let mut attributes = None;
+        MFCreateAttributes(&mut attributes, 1).map_err(|e| hw("MFCreateAttributes", e))?;
+        let attributes =
+            attributes.ok_or_else(|| CodecError::Hardware("MFCreateAttributes".into()))?;
+        // A LUID blob: LowPart, then HighPart, both little-endian.
+        let mut blob = luid.LowPart.to_le_bytes().to_vec();
+        blob.extend_from_slice(&luid.HighPart.to_le_bytes());
+        attributes
+            .SetBlob(&MFT_ENUM_ADAPTER_LUID, &blob)
+            .map_err(|e| hw("MFT_ENUM_ADAPTER_LUID", e))?;
+        Ok(attributes)
+    }
+}
+
+/// Gives the transform the capture's D3D11 device, so it reads the
+/// capture's textures directly. Fails if the transform cannot.
+fn attach_device(
+    transform: &IMFTransform,
+    device: &ID3D11Device,
+) -> Result<IMFDXGIDeviceManager, CodecError> {
+    unsafe {
+        let aware = transform
+            .GetAttributes()
+            .and_then(|attributes| attributes.GetUINT32(&MF_SA_D3D11_AWARE))
+            .unwrap_or(0);
+        if aware == 0 {
+            return Err(CodecError::Hardware("sem suporte a Direct3D 11".into()));
+        }
+        let mut token = 0u32;
+        let mut manager = None;
+        MFCreateDXGIDeviceManager(&mut token, &mut manager)
+            .map_err(|e| hw("MFCreateDXGIDeviceManager", e))?;
+        let manager =
+            manager.ok_or_else(|| CodecError::Hardware("MFCreateDXGIDeviceManager".into()))?;
+        manager
+            .ResetDevice(device, token)
+            .map_err(|e| hw("ResetDevice", e))?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+            .map_err(|e| hw("MFT_MESSAGE_SET_D3D_MANAGER", e))?;
+        Ok(manager)
+    }
 }
 
 fn friendly_name(activate: &IMFActivate) -> String {
@@ -653,6 +818,35 @@ fn empty_sample(size: u32) -> Result<IMFSample, CodecError> {
         let buffer = MFCreateMemoryBuffer(size).map_err(|e| hw("MFCreateMemoryBuffer", e))?;
         let sample = MFCreateSample().map_err(|e| hw("MFCreateSample", e))?;
         sample.AddBuffer(&buffer).map_err(|e| hw("AddBuffer", e))?;
+        Ok(sample)
+    }
+}
+
+/// A sample wrapping an NV12 texture, read by the transform on the GPU.
+fn texture_sample(
+    texture: &ID3D11Texture2D,
+    time: i64,
+    duration: i64,
+) -> Result<IMFSample, CodecError> {
+    unsafe {
+        let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)
+            .map_err(|e| hw("MFCreateDXGISurfaceBuffer", e))?;
+        // Some encoders check the buffer's length even for textures.
+        let length = buffer
+            .cast::<IMF2DBuffer>()
+            .and_then(|buffer| buffer.GetContiguousLength())
+            .map_err(|e| hw("GetContiguousLength", e))?;
+        buffer
+            .SetCurrentLength(length)
+            .map_err(|e| hw("SetCurrentLength", e))?;
+        let sample = MFCreateSample().map_err(|e| hw("MFCreateSample", e))?;
+        sample.AddBuffer(&buffer).map_err(|e| hw("AddBuffer", e))?;
+        sample
+            .SetSampleTime(time)
+            .map_err(|e| hw("SetSampleTime", e))?;
+        sample
+            .SetSampleDuration(duration)
+            .map_err(|e| hw("SetSampleDuration", e))?;
         Ok(sample)
     }
 }
