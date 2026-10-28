@@ -34,6 +34,13 @@ const TAG_KEYFRAME: u8 = 2;
 /// Bytes a video packet adds to its shard (as in `hext_net::video`), plus the tag.
 const OVERHEAD: usize = 33;
 
+/// Largest datagram sent. With several paths (relay and direct), iroh may
+/// report the size of one path while sending on another with a smaller MTU
+/// (e.g. Tailscale's 1280), and it silently drops datagrams that don't fit.
+/// QUIC guarantees 1200-byte packets on every path; this leaves room for
+/// its headers.
+const MAX_DATAGRAM: usize = 1100;
+
 #[derive(Parser)]
 #[command(
     name = "hext-spike",
@@ -253,7 +260,8 @@ async fn host(endpoint: &Endpoint, video: Video, stop_after: Option<Duration>) -
         let encoded = hext_proto::encode(&frame)?;
         let max = conn
             .max_datagram_size()
-            .context("o outro lado não aceita datagramas")?;
+            .context("o outro lado não aceita datagramas")?
+            .min(MAX_DATAGRAM);
         sent_at.lock().await.insert(seq, Instant::now());
         for packet in packetizer.packetize(seq, &encoded, max.saturating_sub(OVERHEAD)) {
             let mut datagram = vec![TAG_VIDEO];
@@ -287,6 +295,9 @@ async fn host(endpoint: &Endpoint, video: Video, stop_after: Option<Duration>) -
                         format!("{:.1} ms", d.as_secs_f64() * 1000.0)
                     })
             };
+            if samples.is_empty() && seq > u64::from(fps) {
+                println!("aviso: nenhuma confirmação do visualizador neste segundo");
+            }
             println!(
                 "{:>5.1} fps | {:>5.1} Mbps | pulados {skipped:>3} | quadro→ack p50 {} p95 {} | {}",
                 f64::from(frames) / secs,
