@@ -4,8 +4,11 @@
 //! host's screen and forwards mouse and keyboard. The desktop UI (Tauri)
 //! replaces the command line later.
 
+#[cfg_attr(not(windows), allow(dead_code))] // the service is Windows-only for now
+mod agent;
 mod bench;
 mod host;
+mod service;
 mod signaling;
 mod viewer;
 
@@ -71,6 +74,35 @@ enum Command {
     View(ViewArgs),
     /// Mede o tempo de codificação de vídeo com uma imagem da tela (macOS).
     Bench(BenchArgs),
+    /// Instala o Hext Remote como serviço do Windows: online com o ID deste
+    /// computador desde o boot, antes de alguém entrar.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// (Interno) Captura e input na sessão do usuário, a pedido do serviço.
+    #[command(hide = true)]
+    Agent {
+        #[arg(long)]
+        pipe: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Instala (ou atualiza) e inicia o serviço. Precisa de administrador.
+    Install,
+    /// Para e remove o serviço. Precisa de administrador.
+    Uninstall {
+        /// Apaga também a identidade deste computador (o ID deixa de valer).
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Mostra se o serviço está rodando e o ID deste computador.
+    Status,
+    /// (Interno) O próprio serviço, iniciado pelo Windows.
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(clap::Args)]
@@ -189,20 +221,35 @@ enum CmdKey {
 }
 
 fn main() -> Result<()> {
+    let command = Cli::parse().command;
+    // The service and its agents have no console: they log to a file.
+    let log_file = match &command {
+        Command::Service {
+            action: ServiceAction::Run,
+        } => service::log_file("service"),
+        Command::Agent { .. } => service::log_file("agent"),
+        _ => None,
+    };
     // noq_udp (iroh's QUIC) warns on every MTU probe that a link (e.g.
     // Tailscale, MTU 1280) cannot carry; it just keeps the smaller size.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,noq_udp=error".into()
-            }),
-        )
-        .init();
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,noq_udp=error".into()),
+    );
+    match log_file {
+        Some(file) => logs
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => logs.init(),
+    }
 
-    match Cli::parse().command {
+    match command {
         Command::Host(args) => tokio::runtime::Runtime::new()?.block_on(host::run(args)),
         Command::View(args) => viewer::run(args),
         Command::Bench(args) => bench::run(&args),
+        Command::Service { action } => service::command(action),
+        Command::Agent { pipe } => service::agent(&pipe),
     }
 }
 

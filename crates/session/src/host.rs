@@ -1,5 +1,7 @@
 //! Host side of a session.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,10 +21,41 @@ const IDLE_NOTICE: Duration = Duration::from_millis(250);
 
 pub struct HostConfig {
     pub peer: PeerInfo,
-    pub access_code: String,
+    /// The code shown to the host's user, good for any number of sessions;
+    /// `None`: sessions only through the server (accepted one by one).
+    pub access_code: Option<String>,
     /// One-time codes given to viewers the host's user accepted (through
     /// the server); each also opens one session.
     pub session_codes: crate::SessionCodes,
+    /// Where the screen comes from and the input goes.
+    pub desktop: Arc<dyn Desktop>,
+}
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Where a session's screen comes from and its input goes: this process
+/// ([`LocalDesktop`]), or another one (the agent of a Windows service).
+pub trait Desktop: Send + Sync {
+    /// Starts streaming the screen, encoded, into `frames`.
+    fn open(&self, frames: mpsc::Sender<VideoFrame>) -> BoxFuture<'_, Result<Box<dyn Screen>>>;
+
+    /// The video's bit rate, for pacing it out.
+    fn bitrate_bps(&self) -> u32;
+}
+
+/// A screen being streamed.
+pub trait Screen: Send {
+    /// The viewer lost video: the next frame must be a keyframe.
+    fn request_keyframe(&self);
+    /// Replays the viewer's input.
+    fn inject(&mut self, event: &InputEvent);
+    /// Stops streaming, releasing any key or button still held.
+    fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
+}
+
+/// The screen of this process's desktop: capture and encoding on a thread
+/// of their own, input injected here.
+pub struct LocalDesktop {
     /// Display index (0 = primary).
     pub display: usize,
     /// Stream a synthetic pattern instead of the real screen.
@@ -30,7 +63,96 @@ pub struct HostConfig {
     pub encoder: EncoderSettings,
 }
 
-/// State shared between the async session and the capture thread.
+impl Desktop for LocalDesktop {
+    fn open(&self, frames: mpsc::Sender<VideoFrame>) -> BoxFuture<'_, Result<Box<dyn Screen>>> {
+        let settings = CaptureSettings {
+            display: self.display,
+            test_pattern: self.test_pattern,
+            encoder: self.encoder,
+        };
+        Box::pin(async move {
+            let shared = Arc::new(Shared {
+                stop: AtomicBool::new(false),
+                keyframe: AtomicBool::new(false),
+                area: Mutex::new(Area::default()),
+            });
+            // Capture and encoding run on their own thread: both are
+            // blocking, and capture objects (COM on Windows) must stay on
+            // the thread that made them. A one-slot channel gives
+            // backpressure: while the network is busy the thread waits, and
+            // the next capture picks up the latest screen.
+            let (started_tx, started_rx) = oneshot::channel();
+            let thread = {
+                let shared = shared.clone();
+                std::thread::Builder::new()
+                    .name("hext-capture".into())
+                    .spawn(move || capture_loop(&settings, &shared, &frames, started_tx))
+                    .map_err(|e| SessionError::Protocol(format!("capture thread: {e}")))?
+            };
+            let started = started_rx
+                .await
+                .map_err(|_| SessionError::Protocol("capture thread died".into()))?;
+            started?;
+            Ok(Box::new(LocalScreen {
+                shared,
+                thread: Some(thread),
+                injector: hext_input::injector(),
+            }) as Box<dyn Screen>)
+        })
+    }
+
+    fn bitrate_bps(&self) -> u32 {
+        self.encoder.bitrate_bps
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CaptureSettings {
+    display: usize,
+    test_pattern: bool,
+    encoder: EncoderSettings,
+}
+
+struct LocalScreen {
+    shared: Arc<Shared>,
+    /// Taken by `close`, which waits for it.
+    thread: Option<std::thread::JoinHandle<()>>,
+    injector: Box<dyn hext_input::Injector>,
+}
+
+/// Also when the session is dropped without `close` (a task cancelled):
+/// never leave keys stuck down on the host, nor the capture running.
+impl Drop for LocalScreen {
+    fn drop(&mut self) {
+        self.injector.release_all();
+        self.shared.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Screen for LocalScreen {
+    fn request_keyframe(&self) {
+        self.shared.keyframe.store(true, Ordering::Relaxed);
+    }
+
+    fn inject(&mut self, event: &InputEvent) {
+        let area = *self.shared.area.lock().expect("lock");
+        self.injector.inject(event, area);
+    }
+
+    fn close(mut self: Box<Self>) -> BoxFuture<'static, ()> {
+        // Releases the keys and stops the capture (`Drop`), then waits for
+        // the capture to let go of the screen and the encoder.
+        let thread = self.thread.take();
+        drop(self);
+        Box::pin(async move {
+            if let Some(thread) = thread {
+                let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            }
+        })
+    }
+}
+
+/// State shared between a [`LocalScreen`] and its capture thread.
 struct Shared {
     stop: AtomicBool,
     keyframe: AtomicBool,
@@ -46,7 +168,8 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
     let viewer = hext_net::remote_key(&conn);
     let (mut control, hello) =
         hext_net::host_handshake(&conn, config.peer.clone(), |hello: &Hello| {
-            if codes_match(&config.access_code, &hello.access_code)
+            let code = config.access_code.as_deref();
+            if code.is_some_and(|code| codes_match(code, &hello.access_code))
                 || config.session_codes.redeem(&hello.access_code, &viewer)
             {
                 Ok(())
@@ -63,36 +186,19 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         client.device_name, client.os, client.app_version,
     );
 
-    let shared = Arc::new(Shared {
-        stop: AtomicBool::new(false),
-        keyframe: AtomicBool::new(false),
-        area: Mutex::new(Area::default()),
-    });
-
-    // Capture and encoding run on their own thread: both are blocking, and
-    // capture objects (COM on Windows) must stay on the thread that made them.
-    // A one-slot channel gives backpressure: while the network is busy the
-    // thread waits, and the next capture picks up the latest screen.
+    // One slot: backpressure from the network back to the capture.
     let (frames_tx, mut frames_rx) = mpsc::channel::<VideoFrame>(1);
-    let (started_tx, started_rx) = oneshot::channel();
-    let capture = {
-        let (shared, config) = (shared.clone(), config.clone());
-        std::thread::Builder::new()
-            .name("hext-capture".into())
-            .spawn(move || capture_loop(&config, &shared, &frames_tx, started_tx))
-            .map_err(|e| SessionError::Protocol(format!("capture thread: {e}")))?
+    let screen = match config.desktop.open(frames_tx).await {
+        Ok(screen) => Arc::new(Mutex::new(Some(screen))),
+        Err(e) => {
+            conn.close(1u32.into(), b"capture unavailable");
+            return Err(e);
+        }
     };
-    let started = started_rx
-        .await
-        .map_err(|_| SessionError::Protocol("capture thread died".into()))?;
-    if let Err(e) = started {
-        conn.close(1u32.into(), b"capture unavailable");
-        return Err(e);
-    }
 
     // Video goes out as datagrams with FEC (see `hext_net::video`).
     let video = conn.clone();
-    let bitrate = config.encoder.bitrate_bps;
+    let bitrate = config.desktop.bitrate_bps();
     let mut writer = tokio::spawn(async move {
         let mut sender = VideoSender::new(bitrate);
         loop {
@@ -104,12 +210,16 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
             }
         }
     });
-    let mut input = tokio::spawn(receive_input(conn.clone(), shared.clone()));
+    let mut input = tokio::spawn(receive_input(conn.clone(), screen.clone()));
 
     let result = loop {
         tokio::select! {
             msg = control.recv() => match msg {
-                Ok(Control::RequestKeyframe) => shared.keyframe.store(true, Ordering::Relaxed),
+                Ok(Control::RequestKeyframe) => {
+                    if let Some(screen) = screen.lock().expect("lock").as_ref() {
+                        screen.request_keyframe();
+                    }
+                }
                 Ok(Control::Bye) => {
                     // Closing here is what lets the client's `bye()` return.
                     conn.close(0u32.into(), b"bye");
@@ -127,22 +237,25 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
         }
     };
 
-    shared.stop.store(true, Ordering::Relaxed);
     writer.abort();
-    // Dropping the input task releases any keys still held. (A finished task
-    // was already awaited by the loop and must not be polled again.)
+    // (A finished task was already awaited by the loop and must not be
+    // polled again.)
     if !input.is_finished() {
         input.abort();
         let _ = (&mut input).await;
     }
     conn.close(0u32.into(), b"session ended");
-    let _ = tokio::task::spawn_blocking(move || capture.join()).await;
+    // Releases any keys still held and stops the capture.
+    let screen = screen.lock().expect("lock").take();
+    if let Some(screen) = screen {
+        screen.close().await;
+    }
     info!("desconectado: {}", client.device_name);
     result.map(|()| client)
 }
 
 fn capture_loop(
-    config: &HostConfig,
+    config: &CaptureSettings,
     shared: &Shared,
     frames: &mpsc::Sender<VideoFrame>,
     started: oneshot::Sender<Result<()>>,
@@ -356,28 +469,21 @@ fn task_end(
     }
 }
 
+type SharedScreen = Arc<Mutex<Option<Box<dyn Screen>>>>;
+
 /// Injects the client's input until the stream or connection ends.
-async fn receive_input(conn: Connection, shared: Arc<Shared>) -> Result<()> {
+async fn receive_input(conn: Connection, screen: SharedScreen) -> Result<()> {
     let (kind, mut stream) = hext_net::accept_uni(&conn).await?;
     if kind != StreamKind::Input {
         return Err(SessionError::Protocol(format!(
             "unexpected {kind:?} stream"
         )));
     }
-    let mut injector = ReleaseOnDrop(hext_input::injector());
     loop {
         let event: InputEvent = stream.recv().await?;
-        let area = *shared.area.lock().expect("lock");
-        injector.0.inject(&event, area);
-    }
-}
-
-/// Never leave keys stuck down on the host when a session ends.
-struct ReleaseOnDrop(Box<dyn hext_input::Injector>);
-
-impl Drop for ReleaseOnDrop {
-    fn drop(&mut self) {
-        self.0.release_all();
+        if let Some(screen) = screen.lock().expect("lock").as_mut() {
+            screen.inject(&event);
+        }
     }
 }
 

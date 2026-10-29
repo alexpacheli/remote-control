@@ -15,7 +15,7 @@ pub const AVAILABLE: bool = cfg!(windows);
 pub use dpapi::{seal, unseal};
 
 #[cfg(not(windows))]
-pub fn seal(_data: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn seal(_data: &[u8], _machine: bool) -> std::io::Result<Vec<u8>> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
@@ -29,7 +29,8 @@ pub fn unseal(_sealed: &[u8]) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
 mod dpapi {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
+        CryptProtectData, CryptUnprotectData,
     };
     use windows::core::PCWSTR;
     use zeroize::{Zeroize, Zeroizing};
@@ -60,7 +61,8 @@ mod dpapi {
         copy
     }
 
-    pub fn seal(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    /// Sealed for this user, or (`machine`) for this computer.
+    pub fn seal(data: &[u8], machine: bool) -> std::io::Result<Vec<u8>> {
         let mut out = CRYPT_INTEGER_BLOB::default();
         let entropy = blob(ENTROPY);
         // SAFETY: the input blobs point to live slices; Windows fills `out`.
@@ -71,7 +73,12 @@ mod dpapi {
                 Some(&entropy),
                 None,
                 None,
-                CRYPTPROTECT_UI_FORBIDDEN,
+                CRYPTPROTECT_UI_FORBIDDEN
+                    | if machine {
+                        CRYPTPROTECT_LOCAL_MACHINE
+                    } else {
+                        0
+                    },
                 &mut out,
             )
         }

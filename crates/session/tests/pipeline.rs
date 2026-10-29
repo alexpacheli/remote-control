@@ -8,7 +8,7 @@ use hext_codec::{DecoderPreference, EncoderSettings};
 use hext_crypto::DeviceKey;
 use hext_net::{EndpointAddr, EndpointConfig};
 use hext_proto::{Hello, InputEvent, PeerInfo};
-use hext_session::host::HostConfig;
+use hext_session::host::{HostConfig, LocalDesktop};
 use hext_session::{SessionError, client, host};
 
 const CODE: &str = "111222333";
@@ -38,11 +38,13 @@ async fn start_host() -> (
     let addr = endpoint.addr();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
-        access_code: CODE.into(),
+        access_code: Some(CODE.into()),
         session_codes: Default::default(),
-        display: 0,
-        test_pattern: true,
-        encoder: EncoderSettings::default(),
+        desktop: Arc::new(LocalDesktop {
+            display: 0,
+            test_pattern: true,
+            encoder: EncoderSettings::default(),
+        }),
     });
     let server = tokio::spawn(async move {
         let conn = endpoint.accept().await.unwrap().await.unwrap();
@@ -103,11 +105,13 @@ async fn host_ending_the_session_is_not_an_error() {
     let addr = endpoint.addr();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
-        access_code: CODE.into(),
+        access_code: Some(CODE.into()),
         session_codes: Default::default(),
-        display: 0,
-        test_pattern: true,
-        encoder: EncoderSettings::default(),
+        desktop: Arc::new(LocalDesktop {
+            display: 0,
+            test_pattern: true,
+            encoder: EncoderSettings::default(),
+        }),
     });
     let host_side = tokio::spawn(async move {
         let conn = endpoint.accept().await.unwrap().await.unwrap();
