@@ -44,6 +44,18 @@ const LOGINS_PER_IP: usize = 30;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const NEW_DEVICES_PER_IP: usize = 10;
 const NEW_DEVICE_WINDOW: Duration = Duration::from_secs(3600);
+/// Requests to one host from devices it has not accepted lately: past this
+/// many in the window (from any number of devices and addresses), the host
+/// is closed to them for [`HOST_LOCKOUT`]. Devices it accepted within
+/// [`TRUSTED_FOR`] still get through, so a flood cannot lock out its usual
+/// technician.
+const HOST_REQUESTS: usize = 10;
+const HOST_WINDOW: Duration = Duration::from_secs(600);
+const HOST_LOCKOUT: Duration = Duration::from_secs(900);
+/// Each of those devices counts at most this many requests to one host in
+/// the window: closing a host takes several devices, not one.
+const STRANGER_REQUESTS: usize = 3;
+const TRUSTED_FOR: Duration = Duration::from_secs(90 * 24 * 3600);
 
 /// Who is online, which requests are waiting, and the rate limits.
 pub struct State {
@@ -60,6 +72,11 @@ pub struct State {
     connects_by_ip: RateLimiter<IpAddr>,
     logins_by_ip: RateLimiter<IpAddr>,
     new_devices_by_ip: RateLimiter<IpAddr>,
+    requests_to_host: RateLimiter<DeviceId>,
+    /// (host, viewer): a stranger's requests to one host.
+    stranger_requests: RateLimiter<(DeviceId, DeviceId)>,
+    /// Hosts closed to devices they never accepted, until when.
+    locked_hosts: Mutex<HashMap<DeviceId, Instant>>,
 }
 
 /// A device logged in as a host (it takes requests).
@@ -107,6 +124,9 @@ impl State {
             connects_by_ip: RateLimiter::new(CONNECTS_PER_IP, CONNECT_WINDOW),
             logins_by_ip: RateLimiter::new(LOGINS_PER_IP, LOGIN_WINDOW),
             new_devices_by_ip: RateLimiter::new(NEW_DEVICES_PER_IP, NEW_DEVICE_WINDOW),
+            requests_to_host: RateLimiter::new(HOST_REQUESTS, HOST_WINDOW),
+            stranger_requests: RateLimiter::new(STRANGER_REQUESTS, HOST_WINDOW),
+            locked_hosts: Mutex::default(),
         }
     }
 
@@ -164,6 +184,44 @@ impl State {
         self.connects_by_ip.prune(now);
         self.logins_by_ip.prune(now);
         self.new_devices_by_ip.prune(now);
+        self.requests_to_host.prune(now);
+        self.stranger_requests.prune(now);
+        self.locked_hosts
+            .lock()
+            .expect("lock")
+            .retain(|_, &mut until| until > now);
+    }
+
+    /// Whether host `to` takes a request from `viewer` now (see
+    /// [`HOST_REQUESTS`]).
+    async fn host_takes(&self, to: DeviceId, viewer: DeviceId, now: Instant) -> bool {
+        let since = TRUSTED_FOR.as_secs() as i64;
+        match self
+            .db(move |db| db.accepted_within(to, viewer, since))
+            .await
+        {
+            Ok(true) => return true,
+            Ok(false) => {}
+            // Treated as a stranger: still within the limit, it gets through.
+            Err(e) => warn!("banco de dados: {e}"),
+        }
+        let mut locked = self.locked_hosts.lock().expect("lock");
+        if locked.get(&to).is_some_and(|&until| until > now) {
+            return false;
+        }
+        // Over its own share, a stranger is refused without adding to the
+        // host's count.
+        if !self.stranger_requests.allow(&(to, viewer), now) {
+            return false;
+        }
+        if self.requests_to_host.allow(&to, now) {
+            return true;
+        }
+        locked.insert(to, now + HOST_LOCKOUT);
+        drop(locked);
+        warn!("{to} recebeu pedidos demais: fechado por {HOST_LOCKOUT:?} para desconhecidos");
+        self.audit(viewer, to, "host_locked");
+        false
     }
 
     /// Removes and returns the waiting requests that match.
@@ -218,6 +276,8 @@ struct Session {
     ip: IpAddr,
     /// Its last request was refused for the rate limit (audited once).
     limited: bool,
+    /// The host whose limit refused its last request (audited once).
+    refused_by: Option<DeviceId>,
 }
 
 type Sink = futures_util::stream::SplitSink<WebSocket, Message>;
@@ -317,6 +377,7 @@ pub async fn handle(socket: WebSocket, state: &State, ip: IpAddr) {
         name,
         ip,
         limited: false,
+        refused_by: None,
     };
     if send(&mut sink, &ServerMsg::Welcome { id }).await {
         let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -414,6 +475,10 @@ async fn on_message(state: &State, me: &mut Session, msg: ClientMsg) -> Option<S
         } => {
             let p = take_mine(state, me, request)?;
             state.audit(p.viewer, p.host, "accepted");
+            let (host, viewer) = (p.host, p.viewer);
+            if let Err(e) = state.db(move |db| db.remember_accepted(host, viewer)).await {
+                warn!("banco de dados: {e}");
+            }
             let accepted = ServerMsg::Accepted {
                 request: p.viewer_request,
                 host_key: me.key,
@@ -470,14 +535,25 @@ async fn connect(
         state.audit(me.id, to, "offline");
         return Err(Rejection::Offline);
     };
+    // Asking again while a request waits is not a new attempt: it does not
+    // count toward the host's limit.
+    if busy(&state.pending.lock().expect("lock"), to, me.id) {
+        state.audit(me.id, to, "busy");
+        return Err(Rejection::Busy);
+    }
+    if !state.host_takes(to, me.id, now).await {
+        if me.refused_by != Some(to) {
+            me.refused_by = Some(to);
+            state.audit(me.id, to, "rate_limited");
+        }
+        return Err(Rejection::TooManyRequests);
+    }
+    me.refused_by = None;
     let server_request = state.next_id();
     {
         let mut pending = state.pending.lock().expect("lock");
-        let waiting = pending.values().filter(|p| p.host == to);
-        let (mine, all) = waiting.fold((0, 0), |(mine, all), p| {
-            (mine + usize::from(p.viewer == me.id), all + 1)
-        });
-        if mine > 0 || all >= MAX_PENDING_PER_HOST {
+        // Others may have asked while this one was checked.
+        if busy(&pending, to, me.id) {
             drop(pending);
             state.audit(me.id, to, "busy");
             return Err(Rejection::Busy);
@@ -508,6 +584,16 @@ async fn connect(
     state.audit(me.id, to, "requested");
     debug!("{} pede para conectar em {to}", me.id);
     Ok(())
+}
+
+/// Whether `viewer` already has a request waiting on host `to`, or the host
+/// has as many as it takes.
+fn busy(pending: &HashMap<u64, Pending>, to: DeviceId, viewer: DeviceId) -> bool {
+    let waiting = pending.values().filter(|p| p.host == to);
+    let (mine, all) = waiting.fold((0, 0), |(mine, all), p| {
+        (mine + usize::from(p.viewer == viewer), all + 1)
+    });
+    mine > 0 || all >= MAX_PENDING_PER_HOST
 }
 
 /// Removes a request addressed to this login (answers to anything else are

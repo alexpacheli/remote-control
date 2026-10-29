@@ -127,7 +127,8 @@ pub enum Rejection {
     Offline,
     /// The host did not answer in time.
     Timeout,
-    /// Too many requests from this device lately.
+    /// Too many requests lately: from this device or its address, or to
+    /// this host from devices it never accepted.
     TooManyRequests,
     /// The host has too many requests waiting.
     Busy,

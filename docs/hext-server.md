@@ -36,12 +36,19 @@ Técnico                  Servidor                   Host
   - pedidos de conexão: até 10 por minuto por computador e 30 por endereço IP (`too_many_requests`). O
     limite não zera ao reconectar;
   - um pedido esperando por técnico e host, e até 5 por host (`busy`);
+  - bloqueio temporário do ID alvo: depois de 10 pedidos em 10 minutos para o mesmo host, vindos de
+    computadores que ele não aceitou nos últimos 90 dias (de quaisquer IPs), ele fica fechado para
+    desconhecidos por 15 minutos (`too_many_requests`). Cada desconhecido conta no máximo 3 pedidos por
+    host nessa janela (os seguintes são recusados só para ele), então um computador sozinho não fecha
+    o host; repetir o pedido enquanto um espera (`busy`) não conta. Quem o host aceitou nos últimos 90
+    dias continua passando, para que uma enxurrada de pedidos não tire o acesso do técnico de sempre. A
+    tabela `accepted` guarda esses pares;
   - logins: até 30 por minuto por endereço IP; computadores novos (IDs entregues): até 10 por hora por IP;
   - ID inexistente responde igual a ID offline, para não dar para sondar quais IDs existem;
   - nomes sem caracteres de controle nem invisíveis (como os que invertem a direção do texto), com até
     64 caracteres, porque o nome do técnico aparece para quem está no host.
 - **Auditoria:** a tabela `audit` registra quem pediu, para qual ID, quando e o resultado (`requested`,
-  `accepted`, `declined`, `timeout`, `cancelled`, `offline`, `busy`, `rate_limited`).
+  `accepted`, `declined`, `timeout`, `cancelled`, `offline`, `busy`, `rate_limited`, `host_locked`).
 - **Conexão viva:** o servidor manda ping a cada 20 s e desconecta quem fica 60 s em silêncio.
 
 ## Rodar

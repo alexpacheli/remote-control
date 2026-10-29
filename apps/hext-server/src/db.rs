@@ -45,7 +45,13 @@ impl Db {
                  from_id INTEGER NOT NULL,
                  to_id INTEGER NOT NULL,
                  event TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS accepted (
+                 host_id INTEGER NOT NULL,
+                 viewer_id INTEGER NOT NULL,
+                 at INTEGER NOT NULL,
+                 PRIMARY KEY (host_id, viewer_id)
+             ) WITHOUT ROWID;",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -113,6 +119,34 @@ impl Db {
             params![now(), from.get(), to.get(), event],
         )?;
         Ok(())
+    }
+
+    /// Remembers that `host` accepted `viewer` (the latest time).
+    pub fn remember_accepted(&self, host: DeviceId, viewer: DeviceId) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("db lock");
+        conn.execute(
+            "INSERT INTO accepted (host_id, viewer_id, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (host_id, viewer_id) DO UPDATE SET at = excluded.at",
+            params![host.get(), viewer.get(), now()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `host` accepted `viewer` within the last `secs` seconds.
+    pub fn accepted_within(
+        &self,
+        host: DeviceId,
+        viewer: DeviceId,
+        secs: i64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().expect("db lock");
+        conn.query_row(
+            "SELECT 1 FROM accepted WHERE host_id = ?1 AND viewer_id = ?2 AND at >= ?3",
+            params![host.get(), viewer.get(), now() - secs],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|found| found.is_some())
     }
 
     /// Audit entries about `to`, oldest first (for tests and support).
@@ -231,6 +265,33 @@ mod tests {
             .unwrap();
         assert!(db.find(&key, "x", "0").is_err());
         assert!(db.register(&key, "x", "0").is_err());
+    }
+
+    #[test]
+    fn accepted_pairs() {
+        let db = Db::in_memory().unwrap();
+        let (host, viewer) = (
+            DeviceId::new(111_111_111).unwrap(),
+            DeviceId::new(222_222_222).unwrap(),
+        );
+        let day = 24 * 3600;
+        assert!(!db.accepted_within(host, viewer, day).unwrap());
+        db.remember_accepted(host, viewer).unwrap();
+        db.remember_accepted(host, viewer).unwrap();
+        assert!(db.accepted_within(host, viewer, day).unwrap());
+        assert!(
+            !db.accepted_within(viewer, host, day).unwrap(),
+            "one way only"
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE accepted SET at = at - 2 * ?1", params![day])
+            .unwrap();
+        assert!(
+            !db.accepted_within(host, viewer, day).unwrap(),
+            "too long ago"
+        );
     }
 
     #[test]

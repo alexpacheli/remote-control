@@ -316,6 +316,111 @@ async fn one_waiting_request_per_viewer_and_host() {
     );
 }
 
+/// Asks `host` from `viewer` and has the host answer; the viewer's answer.
+async fn ask(viewer: &mut Client, host: &mut Client, request: u64, accept: bool) -> ServerMsg {
+    let to = host.id();
+    viewer
+        .send(&ClientMsg::Connect { request, to })
+        .await
+        .unwrap();
+    let ServerMsg::Request { request: asked, .. } = recv(host).await else {
+        panic!("expected a request");
+    };
+    let answer = if accept {
+        ClientMsg::Accept {
+            request: asked,
+            addrs: vec![],
+            session_code: "c".into(),
+        }
+    } else {
+        ClientMsg::Reject { request: asked }
+    };
+    host.send(&answer).await.unwrap();
+    recv(viewer).await
+}
+
+/// Sends a request that the server refuses at once; its reason.
+async fn refused(viewer: &mut Client, to: DeviceId, request: u64) -> Rejection {
+    viewer
+        .send(&ClientMsg::Connect { request, to })
+        .await
+        .unwrap();
+    match recv(viewer).await {
+        ServerMsg::Rejected { reason, .. } => reason,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_flooded_host_closes_to_strangers_only() {
+    let (url, state) = server().await;
+    let mut host = login(&url, &DeviceKey::generate().unwrap(), "H").await;
+    let mut usual = login(&url, &DeviceKey::generate().unwrap(), "Técnico").await;
+    let mut strangers = Vec::new();
+    for name in ["A", "B", "C", "D"] {
+        strangers.push(login(&url, &DeviceKey::generate().unwrap(), name).await);
+    }
+    let to = host.id();
+
+    assert!(matches!(
+        ask(&mut usual, &mut host, 1, true).await,
+        ServerMsg::Accepted { .. }
+    ));
+    // One stranger alone cannot close the host: past its share it is the
+    // only one refused.
+    for request in 0..3 {
+        assert!(matches!(
+            ask(&mut strangers[0], &mut host, request, false).await,
+            ServerMsg::Rejected {
+                reason: Rejection::Declined,
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        refused(&mut strangers[0], to, 3).await,
+        Rejection::TooManyRequests
+    );
+    // Asking again while a request waits does not count either.
+    let mut waiting = strangers.remove(1);
+    waiting
+        .send(&ClientMsg::Connect { request: 0, to })
+        .await
+        .unwrap();
+    let ServerMsg::Request { request: asked, .. } = recv(&mut host).await else {
+        panic!("expected a request");
+    };
+    for request in 1..5 {
+        assert_eq!(refused(&mut waiting, to, request).await, Rejection::Busy);
+    }
+    host.send(&ClientMsg::Reject { request: asked })
+        .await
+        .unwrap();
+    recv(&mut waiting).await;
+    // 10 so far (the usual technician's first request included): the next
+    // stranger closes the host to strangers.
+    for request in 5..7 {
+        ask(&mut waiting, &mut host, request, false).await;
+    }
+    for request in 0..3 {
+        ask(&mut strangers[1], &mut host, request, false).await;
+    }
+    assert_eq!(
+        refused(&mut strangers[2], to, 0).await,
+        Rejection::TooManyRequests
+    );
+    // A device the host accepted before still gets through.
+    assert!(matches!(
+        ask(&mut usual, &mut host, 2, true).await,
+        ServerMsg::Accepted { .. }
+    ));
+    assert!(
+        audit(&state, to, 12)
+            .await
+            .contains(&"host_locked".to_owned())
+    );
+}
+
 #[tokio::test]
 async fn new_devices_per_address_are_limited() {
     let (url, _) = server().await;
