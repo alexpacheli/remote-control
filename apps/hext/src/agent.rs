@@ -118,6 +118,8 @@ impl<T> Drop for Task<T> {
 #[derive(Clone, Default)]
 pub struct AgentHub {
     state: Arc<Mutex<HubState>>,
+    /// Sends Ctrl+Alt+Del, which only the service itself can.
+    secure_attention: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -210,6 +212,14 @@ impl AgentHub {
     fn send(&self, msg: ToAgent) {
         if let Some((_, agent)) = &self.state.lock().expect("lock").agent {
             let _ = agent.send(msg);
+        }
+    }
+
+    /// A hub that sends Ctrl+Alt+Del with `send` (the agents cannot).
+    pub fn with_secure_attention(send: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            secure_attention: Some(Arc::new(send)),
+            ..Self::default()
         }
     }
 
@@ -312,6 +322,12 @@ impl Screen for AgentScreen {
     }
 
     fn inject(&mut self, event: &InputEvent) {
+        if *event == InputEvent::SecureAttention {
+            if let Some(send) = &self.hub.secure_attention {
+                send();
+            }
+            return;
+        }
         self.hub.send(ToAgent::Input(*event));
     }
 
@@ -483,6 +499,21 @@ mod tests {
             }
         };
         assert!(resumed.seq > b.seq);
+        screen.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ctrl_alt_del_is_sent_by_the_service() {
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = sent.clone();
+        let hub = AgentHub::with_secure_attention(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let _agent = agent(&hub);
+        let (tx, _frames) = mpsc::channel(1);
+        let mut screen = hub.desktop(test_stream()).open(tx).await.unwrap();
+        screen.inject(&InputEvent::SecureAttention);
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
         screen.close().await;
     }
 

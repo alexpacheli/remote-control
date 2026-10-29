@@ -19,9 +19,9 @@ use hext_signal::{DeviceId, KnownHosts};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, ModifiersKeyState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::{APP_VERSION, CmdKey, CodecChoice, CtrlKey, ViewArgs, device_name, parse_addr};
@@ -86,6 +86,8 @@ pub fn run(args: ViewArgs) -> Result<()> {
         swap_ctrl_and_super: host_is_mac
             && !cfg!(target_os = "macos")
             && args.ctrl_key == CtrlKey::Cmd,
+        modifiers: Modifiers::default(),
+        secure_attention_key: None,
         last_title: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
@@ -103,10 +105,27 @@ struct Viewer {
     command_key: CommandKey,
     /// Windows/Linux keyboard on a Mac host: Ctrl acts as Command.
     swap_ctrl_and_super: bool,
+    /// Ctrl, Alt... held on this keyboard (for Ctrl+Alt+End).
+    modifiers: Modifiers,
+    /// The End or Delete that sent Ctrl+Alt+Del: its repeats and release
+    /// are not keys for the host.
+    secure_attention_key: Option<KeyCode>,
     last_title: Instant,
 }
 
 impl Viewer {
+    /// Ctrl and the left Alt held: AltGr (right Alt, which Windows reports
+    /// with Ctrl) is a character key on ABNT2 and European keyboards.
+    fn ctrl_alt(&self) -> bool {
+        let state = self.modifiers.state();
+        let pressed = |key| key == ModifiersKeyState::Pressed;
+        // An Alt not reported as the right one (some platforms do not say
+        // which side) counts as the left.
+        let left_alt = pressed(self.modifiers.lalt_state())
+            || (state.alt_key() && !pressed(self.modifiers.ralt_state()));
+        state.control_key() && left_alt
+    }
+
     fn send(&self, event: InputEvent) {
         if let Some(session) = &self.session {
             session.send_input(event);
@@ -246,10 +265,27 @@ impl ApplicationHandler<UserEvent> for Viewer {
                     self.send(InputEvent::Wheel { dx, dy });
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                // Ctrl+Alt+End (or Ctrl+Alt+Delete, where this computer
+                // does not keep it): Ctrl+Alt+Del on the host.
+                if self.secure_attention_key == Some(code) {
+                    if event.state == ElementState::Released {
+                        self.secure_attention_key = None;
+                    }
+                    return;
+                }
+                if event.state == ElementState::Pressed
+                    && matches!(code, KeyCode::End | KeyCode::Delete)
+                    && self.ctrl_alt()
+                {
+                    self.secure_attention_key = Some(code);
+                    self.send(InputEvent::SecureAttention);
+                    return;
+                }
                 // Repeats are forwarded too: injected keys do not auto-repeat.
                 if let Some(mut scancode) = keymap::scancode(code, self.command_key) {
                     if self.swap_ctrl_and_super {

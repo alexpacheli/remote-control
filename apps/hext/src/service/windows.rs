@@ -62,6 +62,11 @@ use crate::signaling::Ask;
 use crate::{APP_VERSION, DEFAULT_RELAY, DEFAULT_SERVER, device_name};
 
 const SERVICE: &str = "HextRemote";
+/// Where the policy that lets services send Ctrl+Alt+Del lives.
+const POLICY_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+const SAS_VALUE: &str = "SoftwareSASGeneration";
+
+windows_core::link!("sas.dll" "system" fn SendSAS(asuser: windows_core::BOOL));
 /// How long the user has to answer a request (the server gives up at 60 s).
 const ANSWER_SECS: u32 = 55;
 
@@ -248,6 +253,9 @@ pub fn install() -> Result<()> {
         "restart/5000/restart/5000/restart/60000",
     ])?;
     sc(&["failureflag", SERVICE, "1"])?;
+    if let Err(e) = allow_secure_attention() {
+        println!("Não deu para liberar o Ctrl+Alt+Del remoto: {e:#}");
+    }
     let _ = std::fs::remove_file(id_file()?);
     sc(&["start", SERVICE])?;
 
@@ -273,11 +281,79 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The policy value that lets programs send Ctrl+Alt+Del (bit 1:
+/// services), if set.
+fn sas_policy() -> Option<u32> {
+    let out = Command::new("reg")
+        .args(["query", POLICY_KEY, "/v", SAS_VALUE])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let hex = text.split_whitespace().find_map(|w| w.strip_prefix("0x"))?;
+    u32::from_str_radix(hex, 16).ok()
+}
+
+fn set_sas_policy(value: Option<u32>) -> Result<()> {
+    let value = value.map(|v| v.to_string());
+    let args: Vec<&str> = match &value {
+        Some(v) => vec![
+            "add",
+            POLICY_KEY,
+            "/v",
+            SAS_VALUE,
+            "/t",
+            "REG_DWORD",
+            "/d",
+            v,
+            "/f",
+        ],
+        None => vec!["delete", POLICY_KEY, "/v", SAS_VALUE, "/f"],
+    };
+    let out = Command::new("reg").args(&args).output().context("reg")?;
+    if !out.status.success() {
+        bail!("reg {}", args.join(" "));
+    }
+    Ok(())
+}
+
+/// Where the policy value from before the install is kept, to put back.
+fn sas_backup() -> Result<PathBuf> {
+    Ok(machine_dir()?.join("sas-policy-before.txt"))
+}
+
+/// Lets services send Ctrl+Alt+Del, keeping what else the policy allowed
+/// (and remembering it, for the uninstall).
+fn allow_secure_attention() -> Result<()> {
+    let before = sas_policy();
+    if before.is_some_and(|v| v & 1 != 0) {
+        return Ok(());
+    }
+    let backup = sas_backup()?;
+    if !backup.exists() {
+        let text = before.map_or_else(|| "none".to_owned(), |v| v.to_string());
+        std::fs::write(&backup, text).with_context(|| backup.display().to_string())?;
+    }
+    set_sas_policy(Some(before.unwrap_or(0) | 1))
+}
+
+/// Puts the policy back as it was before the install.
+fn restore_secure_attention() {
+    let Ok(backup) = sas_backup() else { return };
+    let Ok(text) = std::fs::read_to_string(&backup) else {
+        return; // the install did not change it
+    };
+    let before = text.trim().parse::<u32>().ok();
+    if set_sas_policy(before).is_ok() {
+        let _ = std::fs::remove_file(backup);
+    }
+}
+
 pub fn uninstall(purge: bool) -> Result<()> {
     require_admin()?;
     if exists() {
         stop();
         sc(&["delete", SERVICE])?;
+        restore_secure_attention();
         println!("Serviço removido.");
     } else {
         println!("O serviço não está instalado.");
@@ -435,7 +511,18 @@ async fn serve() -> Result<()> {
     .await?;
     set_state(SERVICE_RUNNING);
 
-    let hub = AgentHub::default();
+    // (An install from before milestone 2 did not turn the policy on.)
+    if let Err(e) = allow_secure_attention() {
+        warn!("Ctrl+Alt+Del remoto: {e:#}");
+    }
+    let hub = AgentHub::with_secure_attention(|| {
+        if sas_policy().is_some_and(|v| v & 1 != 0) {
+            unsafe { SendSAS(false.into()) };
+            info!("Ctrl+Alt+Del enviado");
+        } else {
+            warn!("Ctrl+Alt+Del recusado: a política SoftwareSASGeneration não permite");
+        }
+    });
     tokio::spawn(supervise(hub.clone()));
     let encoder = EncoderSettings::default();
     let session_codes = SessionCodes::default();

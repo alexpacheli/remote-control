@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+windows-core.workspace = true
 windows = { workspace = true, features = [
     "Win32_Security",
     "Win32_Security_Authorization",

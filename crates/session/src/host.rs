@@ -93,10 +93,13 @@ impl Desktop for LocalDesktop {
                 .await
                 .map_err(|_| SessionError::Protocol("capture thread died".into()))?;
             started?;
+            let (input, input_thread) = spawn_input(shared.clone())?;
             Ok(Box::new(LocalScreen {
                 shared,
                 thread: Some(thread),
-                injector: hext_input::injector(),
+                input: Some(input),
+                input_thread: Some(input_thread),
+                input_failed: false,
             }) as Box<dyn Screen>)
         })
     }
@@ -117,16 +120,53 @@ struct LocalScreen {
     shared: Arc<Shared>,
     /// Taken by `close`, which waits for it.
     thread: Option<std::thread::JoinHandle<()>>,
-    injector: Box<dyn hext_input::Injector>,
+    /// The input thread; it releases held keys when this closes.
+    input: Option<std::sync::mpsc::Sender<InputEvent>>,
+    /// Taken by `close`, which waits for it (keys released).
+    input_thread: Option<std::thread::JoinHandle<()>>,
+    /// The input thread is gone (logged once).
+    input_failed: bool,
 }
 
 /// Also when the session is dropped without `close` (a task cancelled):
-/// never leave keys stuck down on the host, nor the capture running.
+/// never leave keys stuck down on the host (the input thread releases them
+/// when its channel closes), nor the capture running.
 impl Drop for LocalScreen {
     fn drop(&mut self) {
-        self.injector.release_all();
         self.shared.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// Injects input on a thread of its own: on Windows it follows the input
+/// desktop (the sign-in screen and UAC prompts, for a SYSTEM agent), which
+/// only works per thread.
+fn spawn_input(
+    shared: Arc<Shared>,
+) -> Result<(
+    std::sync::mpsc::Sender<InputEvent>,
+    std::thread::JoinHandle<()>,
+)> {
+    /// How often to check whether the input desktop changed (not on every
+    /// mouse move).
+    const FOLLOW_EVERY: Duration = Duration::from_millis(200);
+    let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
+    let thread = std::thread::Builder::new()
+        .name("hext-input".into())
+        .spawn(move || {
+            let mut injector = hext_input::injector();
+            let mut followed: Option<Instant> = None;
+            while let Ok(event) = rx.recv() {
+                if followed.is_none_or(|t| t.elapsed() >= FOLLOW_EVERY) {
+                    hext_capture::follow_input_desktop();
+                    followed = Some(Instant::now());
+                }
+                let area = *shared.area.lock().expect("lock");
+                injector.inject(&event, area);
+            }
+            injector.release_all();
+        })
+        .map_err(|e| SessionError::Protocol(format!("input thread: {e}")))?;
+    Ok((tx, thread))
 }
 
 impl Screen for LocalScreen {
@@ -135,19 +175,38 @@ impl Screen for LocalScreen {
     }
 
     fn inject(&mut self, event: &InputEvent) {
-        let area = *self.shared.area.lock().expect("lock");
-        self.injector.inject(event, area);
+        if *event == InputEvent::SecureAttention {
+            // Takes the Windows service (this process is not it).
+            debug!("Ctrl+Alt+Del: só o serviço pode enviar");
+            return;
+        }
+        let sent = self
+            .input
+            .as_ref()
+            .is_some_and(|input| input.send(*event).is_ok());
+        if !sent && !std::mem::replace(&mut self.input_failed, true) {
+            warn!("input: a thread de injeção parou; mouse e teclado não chegam mais");
+        }
     }
 
     fn close(mut self: Box<Self>) -> BoxFuture<'static, ()> {
         // Releases the keys and stops the capture (`Drop`), then waits for
         // the capture to let go of the screen and the encoder.
         let thread = self.thread.take();
+        let input_thread = self.input_thread.take();
+        // Closing its channel makes the input thread release held keys.
+        self.input = None;
         drop(self);
         Box::pin(async move {
-            if let Some(thread) = thread {
-                let _ = tokio::task::spawn_blocking(move || thread.join()).await;
-            }
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(input) = input_thread {
+                    let _ = input.join();
+                }
+                if let Some(thread) = thread {
+                    let _ = thread.join();
+                }
+            })
+            .await;
         })
     }
 }

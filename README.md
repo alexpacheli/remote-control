@@ -118,8 +118,9 @@ Instalado, o computador fica online com o **ID da máquina** desde o boot, sem n
 identidade, e o ID deixa de valer). Os logs ficam em `C:\ProgramData\HextRemote` (`service.log` e
 `agent.log`), uma pasta que só administradores abrem.
 
-Por enquanto, a tela de login, o UAC e o `Ctrl+Alt+Del` ainda não aparecem para o técnico: isso vem no
-marco 2. O acesso pelo IP com código também fica desligado no serviço: só pelo ID, com aceite.
+Com o serviço, o técnico vê e controla também a **tela de login, o bloqueio e os prompts do UAC**, e manda
+`Ctrl+Alt+Del` com **Ctrl+Alt+End** (ou Ctrl+Alt+Delete no Mac). O acesso pelo IP com código fica
+desligado no serviço: só pelo ID, com aceite.
 
 ## Testar: controlar o Mac a partir do Windows
 
