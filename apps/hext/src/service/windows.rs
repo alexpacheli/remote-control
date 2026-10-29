@@ -191,17 +191,22 @@ fn prepare_machine_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&data).with_context(|| data.display().to_string())?;
     let folder = data.display().to_string();
     icacls(&[&folder, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"])?;
-    icacls(&[&folder, "/reset", "/T", "/C", "/Q"])?;
+    // The folder alone: only the system and the administrators, passed on
+    // to what is inside (the inheritance flags mean nothing on a file).
     icacls(&[
         &folder,
         "/inheritance:r",
         "/grant:r",
         "*S-1-5-18:(OI)(CI)F",
         "*S-1-5-32-544:(OI)(CI)F",
-        "/T",
-        "/C",
         "/Q",
     ])?;
+    // What is already inside (the key of an earlier install) inherits
+    // exactly that, and nothing of its own.
+    if std::fs::read_dir(&data)?.next().is_some() {
+        let inside = data.join("*").display().to_string();
+        icacls(&[&inside, "/reset", "/T", "/C", "/Q"])?;
+    }
     Ok(data)
 }
 
@@ -268,7 +273,7 @@ pub fn install() -> Result<()> {
         std::thread::sleep(Duration::from_secs(1));
     }
     println!(
-        "Ainda sem ID: o servidor não respondeu. Veja {}",
+        "Ainda sem ID: o serviço não conseguiu entrar no servidor. Veja {}",
         data.join("service.log").display()
     );
     Ok(())
