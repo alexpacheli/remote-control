@@ -62,6 +62,13 @@ O teste do mouse agora leva o cursor a um ponto exato e confere se ele chegou.
 - **Não testado:** o logoff (a sessão continuou a 1). Fica para o marco 1, em que o agent é relançado
   a cada troca de sessão.
 
+- **As imagens confirmam:**
+  - `03-Default`: a tela de bloqueio, com o relógio;
+  - `04-Winlogon`: o fundo do desbloqueio;
+  - `06-Winlogon`: o fundo escurecido do UAC, no primeiro quadro, antes do diálogo;
+  - `08-Winlogon`: "Preparando as opções de segurança", no começo do `Ctrl+Alt+Del`;
+  - `Winlogon.bmp`: o menu do `Ctrl+Alt+Del`.
+
 ## Conclusão
 
 **O caminho da seção 3.4 do ARCHITECTURE funciona:**
