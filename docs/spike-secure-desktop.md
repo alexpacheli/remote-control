@@ -43,3 +43,38 @@
   mover o cursor para um ponto absoluto e conferir se ele chegou lá.
 - **Ainda não visto:** o prompt do UAC e a tela de bloqueio em imagem, porque só a última imagem de cada
   desktop era salva. Também falta o logoff. A rodada 2 salva a primeira imagem de cada troca.
+
+### Rodada 2 (29/10/2026, mesma máquina)
+
+O teste do mouse agora leva o cursor a um ponto exato e confere se ele chegou.
+
+- **Input no Winlogon:** ✅ Todas as 8 tentativas no Winlogon levaram o cursor ao ponto pedido: na tela
+  de desbloqueio, no prompt do UAC e na tela do `Ctrl+Alt+Del`. Os "NÃO" do log são todos na área de
+  trabalho, depois das 14:26:39, com o cursor a poucos pixels do ponto pedido: era a mão do usuário
+  mexendo no mouse ao mesmo tempo.
+- **Linha do tempo, pelo log:**
+  - 14:24:57: Win+L. O Winlogon aparece por 1 s, e a primeira imagem é preta (a transição).
+  - 14:25:12 a 14:25:17: a tela de bloqueio. No Windows 11, ela é desenhada no desktop `Default`, e a
+    captura continua; a tela está parada, então são 0 quadros novos.
+  - 14:25:20 a 14:25:23: o desbloqueio, com a senha no Winlogon (39 quadros). Captura e input ok.
+  - 14:25:39 a 14:25:44: o prompt do UAC, no Winlogon. Captura e input ok.
+  - 14:26:02: `SendSAS`. A tela do `Ctrl+Alt+Del` fica no Winlogon por 21 s, com captura e input ok.
+- **Não testado:** o logoff (a sessão continuou a 1). Fica para o marco 1, em que o agent é relançado
+  a cada troca de sessão.
+
+## Conclusão
+
+**O caminho da seção 3.4 do ARCHITECTURE funciona:**
+- serviço SYSTEM;
+- agent SYSTEM na sessão do console, lançado com o token do serviço;
+- `OpenInputDesktop` com `SetThreadDesktop` a cada troca;
+- DXGI recriada no `ACCESS_LOST`;
+- `SendInput` no desktop atual;
+- `SendSAS` do serviço com a política `SoftwareSASGeneration`.
+
+Para o produto (marcos 1 e 2):
+- Na troca de desktop, há um quadro preto de transição e o `ACCESS_LOST`. O agent precisa reabrir a
+  captura sem derrubar a sessão e mandar um keyframe.
+- A captura do produto (`hext-capture`) já recria a duplicação no `ACCESS_LOST`. Falta o
+  `SetThreadDesktop` antes, que fica no agent.
+- O `SendInput` do produto precisa rodar numa thread presa ao desktop de entrada atual.
