@@ -61,7 +61,7 @@ pub struct YuvFrame {
 }
 
 /// Which encoder to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EncoderPreference {
     /// Hardware when available, software otherwise or after a failure.
     #[default]
@@ -71,7 +71,7 @@ pub enum EncoderPreference {
     Hardware,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EncoderSettings {
     pub bitrate_bps: u32,
     pub max_fps: f32,

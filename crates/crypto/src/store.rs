@@ -51,11 +51,27 @@ const MAX_FILE_LEN: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct FileKeyStore {
     path: PathBuf,
+    /// Sealed for the machine, not the user (a service's key).
+    machine: bool,
 }
 
 impl FileKeyStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            machine: false,
+        }
+    }
+
+    /// The key of the computer itself, for a service running before anyone
+    /// logs on: sealed for the machine (DPAPI), so any account on it could
+    /// open the file; its folder must be closed to all but the system and
+    /// administrators.
+    pub fn machine(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            machine: true,
+        }
     }
 
     /// The usual place for this user: `%APPDATA%\HextRemote` on Windows,
@@ -142,7 +158,7 @@ impl KeyStore for FileKeyStore {
         if let Some(dir) = dir {
             create_private_dir(dir).map_err(|e| self.io(e))?;
         }
-        let contents = contents(&key);
+        let contents = contents(&key, self.machine);
 
         // A key that vanishes right after another process created it (the
         // user deleted it) is created again, a few times at most.
@@ -172,12 +188,12 @@ impl KeyStore for FileKeyStore {
 /// What the key file holds: the key sealed by the OS where it can, as is
 /// elsewhere (or if sealing fails: a key that is not sealed beats an app
 /// that cannot start; the next run tries again).
-fn contents(key: &DeviceKey) -> Zeroizing<Vec<u8>> {
+fn contents(key: &DeviceKey, machine: bool) -> Zeroizing<Vec<u8>> {
     let mut plain = Zeroizing::new(Vec::with_capacity(KEY_LEN));
     plain.extend_from_slice(key.seed());
     plain.extend_from_slice(key.public_key().as_bytes());
     let mut contents = Zeroizing::new(Vec::with_capacity(MAX_FILE_LEN));
-    match protect::seal(&plain) {
+    match protect::seal(&plain, machine) {
         Ok(sealed) => {
             contents.extend_from_slice(MAGIC_SEALED);
             contents.extend_from_slice(&sealed);
@@ -195,7 +211,7 @@ impl FileKeyStore {
     /// key sealed: written whole to a temporary file, checked, then renamed
     /// over the old one, unless the file changed meanwhile.
     fn seal_in_place(&self, key: &DeviceKey, was: &[u8]) -> Result<()> {
-        let contents = contents(key);
+        let contents = contents(key, self.machine);
         if !contents.starts_with(MAGIC_SEALED) {
             return Ok(()); // sealing failed: stays as is
         }
@@ -283,6 +299,19 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)
+}
+
+/// The computer's folder for the app (a service's key and files):
+/// `%ProgramData%\HextRemote` on Windows; elsewhere, none yet.
+pub fn machine_dir() -> Result<PathBuf> {
+    if cfg!(windows) {
+        let base = std::env::var_os("ProgramData")
+            .filter(|v| !v.is_empty())
+            .ok_or(CryptoError::NoConfigDir("ProgramData"))?;
+        Ok(PathBuf::from(base).join("HextRemote"))
+    } else {
+        Err(CryptoError::NoConfigDir("ProgramData"))
+    }
 }
 
 /// This user's folder for the app's settings (the key and other files).

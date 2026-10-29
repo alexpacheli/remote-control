@@ -10,7 +10,7 @@ use hext_codec::{DecoderPreference, EncoderSettings};
 use hext_crypto::DeviceKey;
 use hext_net::{EndpointConfig, NetError};
 use hext_proto::{Hello, PeerInfo, RejectReason};
-use hext_session::host::HostConfig;
+use hext_session::host::{HostConfig, LocalDesktop};
 use hext_session::{SessionCodes, SessionError, client, host};
 use hext_signal::{Client, ClientMsg, Role, ServerMsg};
 
@@ -35,11 +35,13 @@ async fn accepted_by_id_then_streams() {
     let codes = SessionCodes::default();
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local("test", "host"),
-        access_code: "999888777".into(),
+        access_code: None,
         session_codes: codes.clone(),
-        display: 0,
-        test_pattern: true,
-        encoder: EncoderSettings::default(),
+        desktop: Arc::new(LocalDesktop {
+            display: 0,
+            test_pattern: true,
+            encoder: EncoderSettings::default(),
+        }),
     });
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {

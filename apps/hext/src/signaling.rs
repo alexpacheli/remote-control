@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use hext_crypto::DeviceKey;
 use hext_net::{Connection, Endpoint};
 use hext_session::SessionCodes;
+use hext_session::host::BoxFuture;
 use hext_signal::{Check, Client, ClientMsg, DeviceId, KnownHosts, Rejection, Role, ServerMsg};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
@@ -28,10 +29,50 @@ const RELAY_WAIT: Duration = Duration::from_secs(5);
 /// How long to try reaching the host (directly or through the relay).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Asks the host's user whether a device may connect.
+pub trait Ask: Send {
+    /// The question for `name` (ID `id`); a future dropped before it ends
+    /// (the request was cancelled, or time ran out) is a no.
+    fn ask<'a>(&'a mut self, name: &'a str, id: DeviceId) -> BoxFuture<'a, bool>;
+
+    /// This computer's ID, once the server gave it (or a different one).
+    fn show_id(&mut self, id: DeviceId);
+}
+
+/// Asks on the terminal.
+pub struct Terminal(mpsc::UnboundedReceiver<String>);
+
+impl Terminal {
+    pub fn new() -> Self {
+        Self(stdin_lines())
+    }
+}
+
+impl Ask for Terminal {
+    fn ask<'a>(&'a mut self, name: &'a str, id: DeviceId) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            // Lines typed before the question are not answers to it.
+            while self.0.try_recv().is_ok() {}
+            println!();
+            println!("  \"{name}\" (ID {id}) quer acessar este computador.");
+            println!("  Aceitar? [s/N]");
+            self.0.recv().await.is_some_and(|l| {
+                matches!(l.trim().to_lowercase().as_str(), "s" | "sim" | "y" | "yes")
+            })
+        })
+    }
+
+    fn show_id(&mut self, id: DeviceId) {
+        println!("  Seu ID: {id}");
+        println!();
+    }
+}
+
 /// Host side: stays logged in to `server` (reconnecting when it drops)
-/// and asks the user about each request. Viewers it accepts get
-/// `endpoint`'s addresses (relay and direct) to reach it;
-/// this host; `slot` is free while no session runs.
+/// and asks the user (`ask`) about each request. Viewers it accepts get
+/// `endpoint`'s addresses (relay and direct) to reach it; `slot` is free
+/// while no session runs.
+#[allow(clippy::too_many_arguments)]
 pub async fn host(
     server: String,
     key: Arc<DeviceKey>,
@@ -39,8 +80,8 @@ pub async fn host(
     (endpoint, has_relay): (Endpoint, bool),
     codes: SessionCodes,
     slot: Arc<Semaphore>,
+    mut ask: Box<dyn Ask>,
 ) {
-    let mut answers = stdin_lines();
     let mut retry = RETRY_FIRST;
     let mut shown: Option<DeviceId> = None;
     loop {
@@ -48,15 +89,14 @@ pub async fn host(
             Ok(mut client) => {
                 retry = RETRY_FIRST;
                 if shown != Some(client.id()) {
-                    println!("  Seu ID: {}", client.id());
-                    println!();
+                    ask.show_id(client.id());
                     shown = Some(client.id());
                 } else {
                     info!("reconectado ao servidor");
                 }
                 if let Err(e) = serve(
                     &mut client,
-                    &mut answers,
+                    ask.as_mut(),
                     (&endpoint, has_relay),
                     &codes,
                     &slot,
@@ -76,7 +116,7 @@ pub async fn host(
 /// Answers requests until the connection to the server ends.
 async fn serve(
     client: &mut Client,
-    answers: &mut mpsc::UnboundedReceiver<String>,
+    ask: &mut dyn Ask,
     (endpoint, has_relay): (&Endpoint, bool),
     codes: &SessionCodes,
     slot: &Semaphore,
@@ -96,19 +136,14 @@ async fn serve(
             client.send(&ClientMsg::Reject { request }).await?;
             continue;
         }
-        // Lines typed before the question are not answers to it.
-        while answers.try_recv().is_ok() {}
-        println!();
-        println!("  \"{from_name}\" (ID {from}) quer acessar este computador.");
-        println!("  Aceitar? [s/N]");
         // One deadline for the question, whatever else arrives meanwhile.
         let deadline = tokio::time::sleep(ANSWER_TIME);
         tokio::pin!(deadline);
+        let question = ask.ask(&from_name, from);
+        tokio::pin!(question);
         let accepted = loop {
             tokio::select! {
-                line = answers.recv() => {
-                    break line.is_some_and(|l| matches!(l.trim().to_lowercase().as_str(), "s" | "sim" | "y" | "yes"));
-                }
+                answer = &mut question => break answer,
                 msg = client.recv() => match msg? {
                     ServerMsg::Cancelled { request: r } if r == request => {
                         println!("  O pedido foi cancelado.");

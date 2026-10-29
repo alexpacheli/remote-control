@@ -7,7 +7,7 @@ use anyhow::Result;
 use hext_codec::{EncoderPreference, EncoderSettings};
 use hext_net::{EndpointConfig, NetError};
 use hext_proto::{PeerInfo, RejectReason};
-use hext_session::host::{self, HostConfig};
+use hext_session::host::{self, HostConfig, LocalDesktop};
 use hext_session::{SessionCodes, SessionError};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::Semaphore;
@@ -114,21 +114,24 @@ pub async fn run(args: HostArgs) -> Result<()> {
     println!();
 
     let session_codes = SessionCodes::default();
+    let encoder = EncoderSettings {
+        bitrate_bps: args.bitrate_mbps * 1_000_000,
+        max_fps: args.fps as f32,
+        preference: match args.encoder {
+            CodecChoice::Auto => EncoderPreference::Auto,
+            CodecChoice::Software => EncoderPreference::Software,
+            CodecChoice::Hardware => EncoderPreference::Hardware,
+        },
+    };
     let config = Arc::new(HostConfig {
         peer: PeerInfo::local(APP_VERSION, device_name()),
-        access_code: code,
+        access_code: Some(code),
         session_codes: session_codes.clone(),
-        display: args.display,
-        test_pattern: args.test_pattern,
-        encoder: EncoderSettings {
-            bitrate_bps: args.bitrate_mbps * 1_000_000,
-            max_fps: args.fps as f32,
-            preference: match args.encoder {
-                CodecChoice::Auto => EncoderPreference::Auto,
-                CodecChoice::Software => EncoderPreference::Software,
-                CodecChoice::Hardware => EncoderPreference::Hardware,
-            },
-        },
+        desktop: Arc::new(LocalDesktop {
+            display: args.display,
+            test_pattern: args.test_pattern,
+            encoder,
+        }),
     });
     // One session at a time, handshake included: attempts are serialized,
     // which together with the penalty rate-limits code guessing.
@@ -144,9 +147,24 @@ pub async fn run(args: HostArgs) -> Result<()> {
             (endpoint.clone(), has_relay),
             session_codes,
             slot.clone(),
+            Box::new(crate::signaling::Terminal::new()),
         ));
     }
 
+    accept(&endpoint, config, slot, tokio::signal::ctrl_c()).await;
+    endpoint.close().await;
+    Ok(())
+}
+
+/// Serves the sessions coming to `endpoint`, one at a time (`slot`), until
+/// `until` completes.
+pub async fn accept(
+    endpoint: &hext_net::Endpoint,
+    config: Arc<HostConfig>,
+    slot: Arc<Semaphore>,
+    until: impl std::future::Future,
+) {
+    tokio::pin!(until);
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -174,11 +192,9 @@ pub async fn run(args: HostArgs) -> Result<()> {
                     drop(permit);
                 });
             }
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut until => break,
         }
     }
-    endpoint.close().await;
-    Ok(())
 }
 
 /// A random 9-digit code, like "482913557".

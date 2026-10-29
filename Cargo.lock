@@ -1476,9 +1476,11 @@ dependencies = [
  "hext-session",
  "hext-signal",
  "ring",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "winit",
 ]
 
@@ -1508,6 +1510,7 @@ dependencies = [
  "objc2-core-video",
  "objc2-video-toolbox",
  "openh264",
+ "serde",
  "thiserror 2.0.21",
  "tracing",
  "windows",

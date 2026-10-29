@@ -104,6 +104,23 @@ quando não dá (firewall corporativo, por exemplo), a conexão passa pelo **rel
 (`relay.hext.com.br`). O título da janela mostra `(P2P)` ou `(relay)`. `--relay off` desliga o relay;
 `--relay <url>` usa outro.
 
+## Testar: Hext Remote instalado como serviço (Windows)
+
+Instalado, o computador fica online com o **ID da máquina** desde o boot, sem ninguém abrir o app
+(F4, marco 1; veja [docs/F4.md](docs/F4.md)).
+
+1. **No Windows**, num terminal **como administrador**: `.\HextRemote.exe service install`. Ele copia o
+   app para `C:\Program Files\Hext Remote`, inicia o serviço e mostra o ID deste computador.
+2. **No Mac**: `./HextRemote view <ID>`.
+3. **No Windows**, aparece uma janela perguntando se aceita. Clique em **Sim**.
+
+`service status` mostra o estado e o ID; `service uninstall` remove o serviço (`--purge` apaga também a
+identidade, e o ID deixa de valer). Os logs ficam em `C:\ProgramData\HextRemote` (`service.log` e
+`agent.log`), uma pasta que só administradores abrem.
+
+Por enquanto, a tela de login, o UAC e o `Ctrl+Alt+Del` ainda não aparecem para o técnico: isso vem no
+marco 2. O acesso pelo IP com código também fica desligado no serviço: só pelo ID, com aceite.
+
 ## Testar: controlar o Mac a partir do Windows
 
 1. **No Mac**, no Terminal: `./HextRemote host`.
