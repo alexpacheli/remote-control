@@ -59,9 +59,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo build --release --locked -p hext -p hext-server --target x86_64-pc-windows-msvc
+          cargo build --release --locked -p hext -p hext-server -p hext-desktop-spike --target x86_64-pc-windows-msvc
           mkdir dist
           cp target/x86_64-pc-windows-msvc/release/hext.exe dist/HextRemote.exe
+          cp target/x86_64-pc-windows-msvc/release/hext-desktop-spike.exe dist/hext-desktop-spike.exe
           cp target/x86_64-pc-windows-msvc/release/hext-server.exe dist/hext-server.exe
 
       - name: Build release (macOS universal)

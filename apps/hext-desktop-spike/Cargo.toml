@@ -1,0 +1,19 @@
+[package]
+name = "hext-desktop-spike"
+description = "Spike (F4, milestone 0): capture and control the Windows secure desktop from a SYSTEM service. Not part of the product."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_StationsAndDesktops",
+] }
+
+[lints]
+workspace = true

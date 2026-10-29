@@ -1526,6 +1526,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hext-desktop-spike"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "hext-input"
 version = "0.1.0"
 dependencies = [
