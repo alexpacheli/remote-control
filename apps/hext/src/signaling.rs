@@ -230,7 +230,9 @@ fn rejection(reason: Rejection) -> &'static str {
         Rejection::Declined => "o outro computador recusou o acesso",
         Rejection::Offline => "esse ID não está online",
         Rejection::Timeout => "ninguém respondeu no outro computador a tempo",
-        Rejection::TooManyRequests => "muitas tentativas seguidas; espere um minuto",
+        Rejection::TooManyRequests => {
+            "muitas tentativas seguidas, deste computador ou para esse ID; tente de novo mais tarde"
+        }
         Rejection::Busy => "o outro computador já tem um pedido esperando resposta",
         Rejection::SelfConnect => "esse é o ID deste computador",
     }
