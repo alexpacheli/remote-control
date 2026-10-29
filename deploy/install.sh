@@ -85,13 +85,18 @@ sudo systemctl enable --now iroh-relay
 sudo systemctl restart iroh-relay
 
 step "Checks"
-sleep 5
+# On the first run Caddy needs a moment to get the certificates, and the
+# relay restarts until they exist: retry for up to 90 s.
 check() {
-    if curl -fsS --max-time 10 "$1" >/dev/null; then
-        echo "ok    $1"
-    else
-        echo "FALHA $1"
-    fi
+    for _ in $(seq 18); do
+        if curl -fsS --max-time 10 "$1" >/dev/null 2>&1; then
+            echo "ok    $1"
+            return
+        fi
+        sleep 5
+    done
+    curl -fsS --max-time 10 "$1" >/dev/null || true
+    echo "FALHA $1"
 }
 check https://signal.hext.com.br/health
 check https://relay.hext.com.br/generate_204
