@@ -7,6 +7,7 @@
 //! authenticate the device by a signed challenge, and with `iroh` the key is
 //! the node's ID. The private key never leaves the device.
 
+mod protect;
 mod store;
 
 use std::fmt;
@@ -35,6 +36,17 @@ pub enum CryptoError {
          computador diferente)"
     )]
     Corrupt(std::path::PathBuf),
+    #[error(
+        "{path}: o Windows não abriu a chave deste computador ({source}). Ela só abre para o \
+         usuário do Windows que a criou: se o arquivo veio de outro usuário ou computador, ou se a \
+         senha do Windows foi redefinida, entre com esse usuário ou restaure um backup. Apagar o \
+         arquivo cria uma identidade nova (os outros computadores verão este como um computador \
+         diferente, com outro ID)"
+    )]
+    Sealed {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     #[error("sem pasta para guardar a chave deste computador: defina {0}")]
     NoConfigDir(&'static str),
 }

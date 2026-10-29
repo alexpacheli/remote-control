@@ -258,7 +258,7 @@ A latência é **medida desde a F1**: um overlay de estatísticas mostra captura
 
 ### 7.1 Dispositivo e ID
 
-- Na primeira execução, o app gera um **par de chaves Ed25519**. A chave privada fica protegida pelo SO: DPAPI no Windows, Keychain no macOS.
+- Na primeira execução, o app gera um **par de chaves Ed25519**. A chave privada fica protegida pelo SO: DPAPI no Windows, Keychain no macOS (este quando o app for assinado com Developer ID; até lá, arquivo só do usuário).
 - O servidor registra a chave pública e devolve um **ID de 9 dígitos**, aleatório e nunca sequencial.
 - A autenticação na sinalização é feita assinando um desafio com a chave do dispositivo.
 
