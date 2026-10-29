@@ -1521,6 +1521,7 @@ dependencies = [
  "hex",
  "ring",
  "thiserror 2.0.21",
+ "windows",
  "zeroize",
 ]
 

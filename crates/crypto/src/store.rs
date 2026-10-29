@@ -3,16 +3,16 @@
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zeroize::Zeroizing;
 
-use crate::{CryptoError, DeviceKey, Result, SEED_LEN};
+use crate::{CryptoError, DeviceKey, Result, SEED_LEN, protect};
 
 /// Keeps a device's key between runs.
 ///
-/// For now the key is a file only the user can read ([`FileKeyStore`]);
-/// keys protected by the OS (DPAPI on Windows, Keychain on macOS) will be
-/// other implementations.
+/// The key is a file only the user can read ([`FileKeyStore`]), sealed by
+/// the OS where it can (DPAPI on Windows).
 pub trait KeyStore {
     /// The stored key, or `None` if there is none yet.
     fn load(&self) -> Result<Option<DeviceKey>>;
@@ -35,11 +35,17 @@ pub fn load_or_create(store: &impl KeyStore) -> Result<(DeviceKey, bool)> {
     Ok((stored, created))
 }
 
-/// File header: format and version.
+/// File header: format and version. Version 1 holds the key as is,
+/// version 2 sealed by the OS ([`protect`]).
 const MAGIC: &[u8; 8] = b"HEXTKEY1";
+const MAGIC_SEALED: &[u8; 8] = b"HEXTKEY2";
 
-/// Header, seed, then the public key (which checks the seed).
-const FILE_LEN: usize = MAGIC.len() + SEED_LEN + 32;
+/// The key: the seed, then the public key (which checks the seed).
+const KEY_LEN: usize = SEED_LEN + 32;
+/// Header and key, as is.
+const FILE_LEN: usize = MAGIC.len() + KEY_LEN;
+/// More than any sealed key takes (DPAPI adds a few hundred bytes).
+const MAX_FILE_LEN: usize = 4096;
 
 /// The key in a file only the user can read.
 #[derive(Debug, Clone)]
@@ -70,12 +76,31 @@ impl FileKeyStore {
         }
     }
 
-    fn parse(&self, bytes: &[u8]) -> Result<DeviceKey> {
+    /// The key in a file's contents; whether it is stored as is.
+    fn parse(&self, bytes: &[u8]) -> Result<(DeviceKey, bool)> {
+        if let Some(sealed) = bytes.strip_prefix(MAGIC_SEALED) {
+            if bytes.len() > MAX_FILE_LEN {
+                return Err(CryptoError::Corrupt(self.path.clone()));
+            }
+            let key = protect::unseal(sealed).map_err(|source| CryptoError::Sealed {
+                path: self.path.clone(),
+                source,
+            })?;
+            return Ok((self.key_from(&key)?, false));
+        }
+        match bytes.strip_prefix(MAGIC) {
+            Some(key) if bytes.len() == FILE_LEN => Ok((self.key_from(key)?, true)),
+            _ => Err(CryptoError::Corrupt(self.path.clone())),
+        }
+    }
+
+    /// Seed and public key, as stored.
+    fn key_from(&self, bytes: &[u8]) -> Result<DeviceKey> {
         let corrupt = || CryptoError::Corrupt(self.path.clone());
-        if bytes.len() != FILE_LEN || !bytes.starts_with(MAGIC) {
+        if bytes.len() != KEY_LEN {
             return Err(corrupt());
         }
-        let (seed, public) = bytes[MAGIC.len()..].split_at(SEED_LEN);
+        let (seed, public) = bytes.split_at(SEED_LEN);
         let seed: Zeroizing<[u8; SEED_LEN]> =
             Zeroizing::new(seed.try_into().map_err(|_| corrupt())?);
         let key = DeviceKey::from_seed(&seed).map_err(|_| corrupt())?;
@@ -97,12 +122,19 @@ impl KeyStore for FileKeyStore {
         #[cfg(unix)]
         restrict(&file).map_err(|e| self.io(e))?;
         // Read no more than a key file can hold (not a huge file by mistake).
-        let mut bytes = Zeroizing::new(Vec::with_capacity(FILE_LEN + 1));
+        let mut bytes = Zeroizing::new(Vec::with_capacity(FILE_LEN));
         (&mut file)
-            .take(FILE_LEN as u64 + 1)
+            .take(MAX_FILE_LEN as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| self.io(e))?;
-        self.parse(&bytes).map(Some)
+        drop(file);
+        let (key, plain) = self.parse(&bytes)?;
+        // A key from before sealing (or from where it is not available) is
+        // sealed now, if this OS can: best effort, it stays usable as is.
+        if plain && protect::AVAILABLE {
+            let _ = self.seal_in_place(&key, &bytes);
+        }
+        Ok(Some(key))
     }
 
     fn create(&self, key: DeviceKey) -> Result<DeviceKey> {
@@ -110,10 +142,7 @@ impl KeyStore for FileKeyStore {
         if let Some(dir) = dir {
             create_private_dir(dir).map_err(|e| self.io(e))?;
         }
-        let mut contents = Zeroizing::new(Vec::with_capacity(FILE_LEN));
-        contents.extend_from_slice(MAGIC);
-        contents.extend_from_slice(key.seed());
-        contents.extend_from_slice(key.public_key().as_bytes());
+        let contents = contents(&key);
 
         // A key that vanishes right after another process created it (the
         // user deleted it) is created again, a few times at most.
@@ -140,7 +169,63 @@ impl KeyStore for FileKeyStore {
     }
 }
 
+/// What the key file holds: the key sealed by the OS where it can, as is
+/// elsewhere (or if sealing fails: a key that is not sealed beats an app
+/// that cannot start; the next run tries again).
+fn contents(key: &DeviceKey) -> Zeroizing<Vec<u8>> {
+    let mut plain = Zeroizing::new(Vec::with_capacity(KEY_LEN));
+    plain.extend_from_slice(key.seed());
+    plain.extend_from_slice(key.public_key().as_bytes());
+    let mut contents = Zeroizing::new(Vec::with_capacity(MAX_FILE_LEN));
+    match protect::seal(&plain) {
+        Ok(sealed) => {
+            contents.extend_from_slice(MAGIC_SEALED);
+            contents.extend_from_slice(&sealed);
+        }
+        Err(_) => {
+            contents.extend_from_slice(MAGIC);
+            contents.extend_from_slice(&plain);
+        }
+    }
+    contents
+}
+
 impl FileKeyStore {
+    /// Replaces a key stored as is (`was`, the file as read) with the same
+    /// key sealed: written whole to a temporary file, checked, then renamed
+    /// over the old one, unless the file changed meanwhile.
+    fn seal_in_place(&self, key: &DeviceKey, was: &[u8]) -> Result<()> {
+        let contents = contents(key);
+        if !contents.starts_with(MAGIC_SEALED) {
+            return Ok(()); // sealing failed: stays as is
+        }
+        let (stored, _) = self.parse(&contents)?;
+        if stored.public_key() != key.public_key() {
+            return Err(CryptoError::Corrupt(self.path.clone()));
+        }
+        let tmp = self.tmp_path();
+        let result = write_private(&tmp, &contents, false)
+            .and_then(|()| {
+                let now = Zeroizing::new(fs::read(&self.path)?);
+                if now.as_slice() != was {
+                    return Err(ErrorKind::AlreadyExists.into());
+                }
+                fs::rename(&tmp, &self.path)
+            })
+            .map_err(|e| self.io(e));
+        let _ = fs::remove_file(&tmp);
+        result
+    }
+
+    /// A temporary file next to the key, unique to this call.
+    fn tmp_path(&self) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(format!(".{}-{n}.tmp", std::process::id()));
+        PathBuf::from(name)
+    }
+
     /// Puts `contents` at the key's path unless a file is there
     /// (`AlreadyExists`).
     ///
@@ -149,9 +234,7 @@ impl FileKeyStore {
     /// both end up with the same key. Where hard links are not supported
     /// (FAT, some network shares) the file is created in place instead.
     fn place(&self, contents: &[u8]) -> std::io::Result<()> {
-        let mut tmp_name = self.path.as_os_str().to_owned();
-        tmp_name.push(format!(".{}.tmp", std::process::id()));
-        let tmp = PathBuf::from(tmp_name);
+        let tmp = self.tmp_path();
         let linked =
             write_private(&tmp, contents, false).and_then(|()| fs::hard_link(&tmp, &self.path));
         let _ = fs::remove_file(&tmp);
@@ -240,7 +323,16 @@ mod tests {
         let (again, created) = load_or_create(&store).unwrap();
         assert!(!created);
         assert_eq!(first.public_key(), again.public_key());
-        assert_eq!(fs::read(store.path()).unwrap().len(), FILE_LEN);
+        let stored = fs::read(store.path()).unwrap();
+        if protect::AVAILABLE {
+            assert!(stored.starts_with(MAGIC_SEALED));
+            assert!(
+                !stored.windows(SEED_LEN).any(|w| w == first.seed()),
+                "the seed is not in the file"
+            );
+        } else {
+            assert_eq!(stored.len(), FILE_LEN);
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -265,9 +357,10 @@ mod tests {
         let mut bytes = fs::read(store.path()).unwrap();
         bytes[MAGIC.len()] ^= 1; // the seed no longer matches the public key
         fs::write(store.path(), &bytes).unwrap();
+        // (A damaged sealed key does not open at all.)
         assert!(matches!(
             load_or_create(&store),
-            Err(CryptoError::Corrupt(_))
+            Err(CryptoError::Corrupt(_) | CryptoError::Sealed { .. })
         ));
         fs::write(store.path(), b"short").unwrap();
         assert!(matches!(store.load(), Err(CryptoError::Corrupt(_))));
@@ -303,6 +396,48 @@ mod tests {
         );
         let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_key_from_before_sealing_still_loads_and_gets_sealed() {
+        let dir = temp_dir("plain");
+        fs::create_dir_all(&dir).unwrap();
+        let store = FileKeyStore::new(dir.join("device.key"));
+        let key = DeviceKey::generate().unwrap();
+        let mut plain = MAGIC.to_vec();
+        plain.extend_from_slice(key.seed());
+        plain.extend_from_slice(key.public_key().as_bytes());
+        fs::write(store.path(), &plain).unwrap();
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.public_key(), key.public_key());
+        let stored = fs::read(store.path()).unwrap();
+        let magic = if protect::AVAILABLE {
+            MAGIC_SEALED
+        } else {
+            MAGIC
+        };
+        assert!(stored.starts_with(magic));
+        assert_eq!(
+            store.load().unwrap().unwrap().public_key(),
+            key.public_key()
+        );
+        let leftovers = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary files left behind");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_sealed_key_that_does_not_open_is_reported() {
+        let dir = temp_dir("sealed");
+        fs::create_dir_all(&dir).unwrap();
+        let store = FileKeyStore::new(dir.join("device.key"));
+        let mut bytes = MAGIC_SEALED.to_vec();
+        bytes.extend_from_slice(&[7; 200]);
+        fs::write(store.path(), &bytes).unwrap();
+        assert!(matches!(store.load(), Err(CryptoError::Sealed { .. })));
+        // Left for the user (the right Windows account opens it).
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
         let _ = fs::remove_dir_all(dir);
     }
 
