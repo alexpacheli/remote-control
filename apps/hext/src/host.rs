@@ -20,8 +20,22 @@ const WRONG_CODE_PENALTY: Duration = Duration::from_secs(1);
 
 pub async fn run(args: HostArgs) -> Result<()> {
     let key = Arc::new(crate::device_key(args.device_key.as_deref())?);
-    let relay = crate::relay(&args.relay)?;
+    let server = crate::server(&args.server);
+    let relay = crate::relay_for(&args.relay, server)?;
     let has_relay = relay.is_some();
+    if let (Some(server), true) = (server, has_relay) {
+        // Registered before the endpoint reaches the relay, which serves
+        // only registered devices (a first run would be turned away).
+        let name = device_name();
+        let register = crate::signaling::login(server, &key, &name);
+        match tokio::time::timeout(Duration::from_secs(10), register).await {
+            Ok(Ok(client)) => {
+                let _ = client.close().await;
+            }
+            Ok(Err(e)) => warn!("{e:#}"),
+            Err(_) => warn!("servidor de sinalização: sem resposta"),
+        }
+    }
     let endpoint = hext_net::bind(
         &key,
         &EndpointConfig {
@@ -85,9 +99,15 @@ pub async fn run(args: HostArgs) -> Result<()> {
         exe_name(),
         key.public_key()
     );
-    if let Some(server) = &args.server {
+    if let Some(server) = server {
+        // The server option only when it is not the one `view` assumes.
+        let option = if server == crate::DEFAULT_SERVER {
+            String::new()
+        } else {
+            format!(" --server {server}")
+        };
         println!(
-            "  ou, pelo ID (mostrado abaixo): {} view <ID> --server {server}",
+            "  ou, pelo ID (mostrado abaixo): {} view <ID>{option}",
             exe_name()
         );
     }
@@ -114,7 +134,7 @@ pub async fn run(args: HostArgs) -> Result<()> {
     // which together with the penalty rate-limits code guessing.
     let slot = Arc::new(Semaphore::new(1));
 
-    if let Some(server) = args.server.clone() {
+    if let Some(server) = server.map(str::to_owned) {
         // Viewers accepted through the server get this endpoint's current
         // addresses: the relay and the direct ones `iroh` found.
         tokio::spawn(crate::signaling::host(

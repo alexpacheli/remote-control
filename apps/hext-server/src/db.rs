@@ -72,6 +72,12 @@ impl Db {
         Ok(Some(id))
     }
 
+    /// Whether a device with this key has an ID (logged in at least once).
+    pub fn is_registered(&self, key: &PublicKey) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().expect("db lock");
+        Ok(id_of(&conn, key)?.is_some())
+    }
+
     /// Gives a new device its ID: at random, so IDs say nothing about how
     /// many devices exist or when they joined. (If the key is already
     /// known, its ID.)

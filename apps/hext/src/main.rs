@@ -20,6 +20,27 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Our relay (São Paulo), for when the two computers cannot connect directly.
 const DEFAULT_RELAY: &str = "https://relay.hext.com.br";
 
+/// The relay to use: the `--relay` option, except that our relay serves only
+/// devices registered with our server, so with another server (or none)
+/// the default relay is left out.
+fn relay_for(value: &str, server: Option<&str>) -> Result<Option<hext_net::RelayUrl>> {
+    if value == DEFAULT_RELAY && server != Some(DEFAULT_SERVER) {
+        tracing::info!(
+            "sem relay: o relay padrão só atende computadores registrados no servidor padrão (--relay <url> para usar outro)"
+        );
+        return Ok(None);
+    }
+    relay(value)
+}
+
+/// Our signaling server: IDs, presence and connection requests.
+const DEFAULT_SERVER: &str = "wss://signal.hext.com.br";
+
+/// The `--server` option: a URL, or `off` (no IDs; connecting by IP only).
+fn server(value: &str) -> Option<&str> {
+    (!value.eq_ignore_ascii_case("off")).then_some(value)
+}
+
 /// The `--relay` option: a URL, or `off` for direct connections only.
 fn relay(value: &str) -> Result<Option<hext_net::RelayUrl>> {
     if value.eq_ignore_ascii_case("off") {
@@ -95,10 +116,10 @@ struct HostArgs {
     /// fica na pasta de configurações do usuário.
     #[arg(long)]
     device_key: Option<std::path::PathBuf>,
-    /// Servidor de sinalização (ex.: wss://signal.hext.com.br): mostra o ID deste
-    /// computador e pergunta aqui se aceita cada pedido de acesso.
-    #[arg(long)]
-    server: Option<String>,
+    /// Servidor de sinalização: mostra o ID deste computador e pergunta aqui se
+    /// aceita cada pedido de acesso (`off`: só conexões pelo IP).
+    #[arg(long, default_value = DEFAULT_SERVER)]
+    server: String,
     /// Relay para quando não dá para conectar direto (`off` desliga).
     #[arg(long, default_value = DEFAULT_RELAY)]
     relay: String,
@@ -122,9 +143,9 @@ struct ViewArgs {
     /// Código de acesso mostrado pelo host (para conectar pelo IP).
     #[arg(long)]
     code: Option<String>,
-    /// Servidor de sinalização, para conectar pelo ID (ex.: wss://signal.hext.com.br).
-    #[arg(long)]
-    server: Option<String>,
+    /// Servidor de sinalização, para conectar pelo ID.
+    #[arg(long, default_value = DEFAULT_SERVER)]
+    server: String,
     /// Arquivo da chave deste computador (criado na primeira execução).
     #[arg(long)]
     device_key: Option<std::path::PathBuf>,

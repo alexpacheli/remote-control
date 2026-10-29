@@ -1,0 +1,20 @@
+# iroh-relay behind Caddy: plain HTTP on 127.0.0.1 (Caddy does TLS on 443),
+# and QUIC address discovery on UDP 7842, which needs the certificate: it is
+# read from Caddy's files and reloaded as Caddy renews them.
+
+enable_relay = true
+http_bind_addr = "127.0.0.1:3340"
+enable_quic_addr_discovery = true
+
+[tls]
+cert_mode = "Reloading"
+manual_cert_path = "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.hext.com.br/relay.hext.com.br.crt"
+manual_key_path = "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.hext.com.br/relay.hext.com.br.key"
+quic_bind_addr = "[::]:7842"
+# HTTPS is Caddy's job: the relay serves HTTP only (QUIC keeps its TLS).
+dangerous_http_only = true
+
+# Only devices registered with hext-server may use the relay. The secret is
+# IROH_RELAY_HTTP_BEARER_TOKEN, from /etc/hext/secrets.env.
+[access.http]
+url = "http://127.0.0.1:8080/v1/relay-access"

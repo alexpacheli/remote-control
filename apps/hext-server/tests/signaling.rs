@@ -9,15 +9,72 @@ use hext_signal::{Client, ClientError, ClientMsg, DeviceId, PROTOCOL, Rejection,
 
 /// A server on a random local port.
 async fn server() -> (String, Arc<State>) {
+    server_with(Config::default()).await
+}
+
+async fn server_with(config: Config) -> (String, Arc<State>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let state = Arc::new(State::new(Db::in_memory().unwrap()));
-    tokio::spawn(hext_server::serve(
-        listener,
-        state.clone(),
-        Config::default(),
-    ));
+    tokio::spawn(hext_server::serve(listener, state.clone(), config));
     (url, state)
+}
+
+/// A plain HTTP request to the server; the status code and body.
+async fn http(url: &str, request: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = url.trim_start_matches("ws://");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let status = response[9..12].parse().unwrap();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+    (status, body)
+}
+
+fn relay_question(token: &str, key: &str) -> String {
+    format!(
+        "POST /v1/relay-access HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         Authorization: Bearer {token}\r\nX-Iroh-Endpoint-Id: {key}\r\nContent-Length: 0\r\n\r\n"
+    )
+}
+
+#[tokio::test]
+async fn only_registered_devices_may_use_the_relay() {
+    let config = Config {
+        relay_token: Some("s3cr3t".into()),
+        ..Default::default()
+    };
+    let (url, _) = server_with(config).await;
+    let known = DeviceKey::generate().unwrap();
+    login(&url, &known, "PC").await.close().await.unwrap();
+    let known = known.public_key().to_string();
+    let stranger = DeviceKey::generate().unwrap().public_key().to_string();
+
+    assert_eq!(
+        http(&url, &relay_question("s3cr3t", &known)).await,
+        (200, "true".to_owned())
+    );
+    assert_eq!(
+        http(&url, &relay_question("s3cr3t", &stranger)).await.0,
+        403
+    );
+    // Only the relay (which has the secret) may ask.
+    assert_eq!(http(&url, &relay_question("wrong", &known)).await.0, 401);
+    assert_eq!(
+        http(&url, &relay_question("s3cr3t", "nonsense")).await.0,
+        400
+    );
+}
+
+#[tokio::test]
+async fn without_a_relay_secret_nobody_is_answered() {
+    let (url, _) = server().await;
+    let key = DeviceKey::generate().unwrap();
+    login(&url, &key, "PC").await;
+    let question = relay_question("", &key.public_key().to_string());
+    assert_eq!(http(&url, &question).await.0, 404);
 }
 
 async fn login(url: &str, key: &DeviceKey, name: &str) -> Client {

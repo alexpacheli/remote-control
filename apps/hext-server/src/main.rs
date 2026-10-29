@@ -21,6 +21,10 @@ struct Args {
     /// computador vem do cabeçalho X-Forwarded-For.
     #[arg(long)]
     behind_proxy: bool,
+    /// Segredo que o iroh-relay apresenta para perguntar se um computador pode
+    /// usá-lo (o mesmo do `bearer_token` na configuração dele).
+    #[arg(long, env = "HEXT_RELAY_TOKEN", hide_env_values = true)]
+    relay_token: Option<String>,
 }
 
 #[tokio::main]
@@ -42,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(State::new(db));
     tokio::select! {
-        served = hext_server::serve(listener, state, Config { behind_proxy: args.behind_proxy }) => served?,
+        served = hext_server::serve(listener, state, Config {
+            behind_proxy: args.behind_proxy,
+            relay_token: args.relay_token.filter(|t| !t.is_empty()),
+        }) => served?,
         _ = tokio::signal::ctrl_c() => info!("encerrando"),
     }
     Ok(())

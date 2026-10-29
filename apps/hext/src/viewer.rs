@@ -287,30 +287,30 @@ impl ApplicationHandler<UserEvent> for Viewer {
 async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
     // The arguments first, before any network.
     let target = target(args)?;
-    let relay = crate::relay(&args.relay)?;
-
     let key = crate::device_key(args.device_key.as_deref())?;
-    let endpoint = hext_net::bind(
-        &key,
-        &EndpointConfig {
-            relay,
-            ..Default::default()
-        },
-    )
-    .await?;
-    let connected = match target {
+    let (endpoint, connected) = match target {
         Target::Id { id, server } => {
+            // Logged in (and so registered, which the default relay
+            // requires) before the endpoint reaches the relay.
+            let client = crate::signaling::login(server, &key, &device_name()).await?;
+            let endpoint = bind(&key, crate::relay_for(&args.relay, Some(server))?).await?;
             // Next to the key, so each key (profile) has its own.
             let known = match &args.device_key {
                 Some(path) => KnownHosts::new(path.with_file_name("known_hosts")),
                 None => KnownHosts::default_location()?,
             };
-            crate::signaling::connect(server, &key, &device_name(), id, &known, &endpoint).await
+            let connected = crate::signaling::connect(client, id, &known, &endpoint).await;
+            (endpoint, connected)
         }
-        Target::Ip { addr, host, code } => hext_net::connect(&endpoint, host)
-            .await
-            .with_context(|| format!("falha ao conectar em {addr}"))
-            .map(|conn| (conn, code)),
+        Target::Ip { addr, host, code } => {
+            // Not registered through a server: no default relay.
+            let endpoint = bind(&key, crate::relay_for(&args.relay, None)?).await?;
+            let connected = hext_net::connect(&endpoint, host)
+                .await
+                .with_context(|| format!("falha ao conectar em {addr}"))
+                .map(|conn| (conn, code));
+            (endpoint, connected)
+        }
     };
     match connected {
         Ok((conn, code)) => Ok((endpoint, conn, code)),
@@ -319,6 +319,15 @@ async fn open(args: &ViewArgs) -> Result<(Endpoint, Connection, String)> {
             Err(e)
         }
     }
+}
+
+/// The viewer's endpoint (it connects; it does not accept).
+async fn bind(key: &hext_crypto::DeviceKey, relay: Option<hext_net::RelayUrl>) -> Result<Endpoint> {
+    let config = EndpointConfig {
+        relay,
+        ..Default::default()
+    };
+    Ok(hext_net::bind(key, &config).await?)
 }
 
 /// Who to connect to, and how.
@@ -337,8 +346,8 @@ fn target(args: &ViewArgs) -> Result<Target<'_>> {
     // An address first: "192.168.0.10" must never be taken for an ID.
     let addr = parse_addr(&args.target);
     if let (Err(_), Ok(id)) = (&addr, args.target.parse::<DeviceId>()) {
-        let Some(server) = &args.server else {
-            bail!("para conectar pelo ID, informe o servidor com --server");
+        let Some(server) = crate::server(&args.server) else {
+            bail!("para conectar pelo ID é preciso o servidor de sinalização (--server)");
         };
         if args.code.is_some() || args.key.is_some() {
             warn!(

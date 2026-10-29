@@ -83,15 +83,18 @@ Os binários ainda não são assinados (isso entra na F6):
 ## Testar: conectar pelo ID (servidor de sinalização)
 
 Em vez de IP, código e chave, o técnico digita o **ID de 9 dígitos** do host, e quem está no
-host aceita ou recusa o pedido. Enquanto o servidor não está na VPS (marco 6 da F3), rode o
-`hext-server` (que vem junto nos artefatos) num dos computadores:
+host aceita ou recusa o pedido. O app usa o nosso servidor (`wss://signal.hext.com.br`, veja
+[docs/deploy.md](docs/deploy.md)) por padrão:
 
-1. **No Mac** (ou em qualquer computador da rede), num terminal: `./hext-server --listen 0.0.0.0:8080`.
-2. **No Windows** (host): `.\HextRemote.exe host --server ws://<IP-do-Mac>:8080`. Ele mostra
-   `Seu ID: 482 913 557`.
-3. **No Mac** (técnico), em outro terminal: `./HextRemote view 482913557 --server ws://127.0.0.1:8080`.
-4. **No Windows**, o host pergunta `"Mac" (ID …) quer acessar este computador. Aceitar? [s/N]`. Digite
+1. **No Windows** (host): `.\HextRemote.exe host`. Ele mostra `Seu ID: 482 913 557`.
+2. **No Mac** (técnico): `./HextRemote view 482913557`.
+3. **No Windows**, o host pergunta `"Mac" (ID …) quer acessar este computador. Aceitar? [s/N]`. Digite
    `s` e Enter.
+
+Outro servidor (o `hext-server` vem junto nos artefatos, para testes): `--server ws://<IP>:8080` nos dois;
+`--server off` desliga os IDs (só conexão pelo IP). O nosso relay só atende computadores registrados no
+nosso servidor: com outro servidor, sem servidor ou pelo IP, a conexão é só direta, a não ser que você
+informe outro relay (`--relay <url>`).
 
 Na primeira conexão, o técnico guarda a chave do host (`known_hosts`, na mesma pasta da chave). Se outro
 computador aparecer com o mesmo ID, a conexão é bloqueada com um aviso.
