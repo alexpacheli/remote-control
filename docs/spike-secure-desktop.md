@@ -28,4 +28,18 @@
 
 ## Resultados
 
-*(a preencher com o teste)*
+### Rodada 1 (29/10/2026, Windows 11, 1920×1080)
+
+- **O serviço lança o agent como SYSTEM na sessão do console:** ✅
+- **Captura da área de trabalho (`Default`):** ✅
+- **O agent segue a troca de desktop:** ✅ Ele trocou Default ↔ Winlogon 6 vezes. Na troca, o DXGI devolve
+  `0x887A0026` (`DXGI_ERROR_ACCESS_LOST`, que o Windows traduz errado como "mutex abandonado"); o agent
+  reabre a captura e continua.
+- **Captura do Winlogon:** ✅ A imagem mostra a tela do `Ctrl+Alt+Del` (Bloquear, Trocar usuário, Sair,
+  Gerenciador de Tarefas).
+- **`Ctrl+Alt+Del` remoto (`SendSAS` do serviço):** ✅ Duas vezes, e as duas abriram a tela.
+- **Input no Winlogon:** inconclusivo. O teste movia o cursor 1 pixel de forma relativa, e a aceleração
+  do ponteiro às vezes come esse movimento, até na área de trabalho. Na rodada 2, o teste passou a
+  mover o cursor para um ponto absoluto e conferir se ele chegou lá.
+- **Ainda não visto:** o prompt do UAC e a tela de bloqueio em imagem, porque só a última imagem de cada
+  desktop era salva. Também falta o logoff. A rodada 2 salva a primeira imagem de cada troca.

@@ -41,9 +41,13 @@ use windows::Win32::System::Threading::{
     PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEINPUT, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
+};
 use windows::core::{Interface, PCWSTR, PWSTR, w};
 
 const SERVICE: &str = "HextSpike";
@@ -143,6 +147,7 @@ fn install() {
     if private && policy && created && started {
         println!();
         println!("Instalado. Agora, nesta ordem, anotando o horário de cada passo:");
+        println!("  (nas esperas, não mexa no mouse: o teste move o cursor e confere)");
         println!("  1. espere 10 s;");
         println!("  2. Win+L (bloquear), espere 15 s e desbloqueie;");
         println!("  3. abra algo como administrador (prompt do UAC), espere 15 s e cancele;");
@@ -346,6 +351,9 @@ fn agent() {
     let mut frames = 0u32;
     // None: save the next frame (a still screen sends only one).
     let mut last_save: Option<Instant> = None;
+    // Each visit to a desktop also keeps its first image, numbered.
+    let mut visit = 0u32;
+    let mut first_of_visit = true;
     let mut last_poke = Instant::now();
     let mut last_report = Instant::now();
     loop {
@@ -362,6 +370,8 @@ fn agent() {
                         current = name;
                         frames = 0;
                         last_save = None;
+                        visit += 1;
+                        first_of_visit = true;
                     }
                     Err(e) => {
                         // Stays on the old one, and tries again.
@@ -400,6 +410,10 @@ fn agent() {
                     match image {
                         Some(Ok((width, height, pixels))) => {
                             last_save = Some(Instant::now());
+                            if std::mem::take(&mut first_of_visit) && visit <= 40 {
+                                let path = dir().join(format!("{visit:02}-{current}.bmp"));
+                                let _ = write_bmp(&path, width, height, &pixels);
+                            }
                             let path = dir().join(format!("{current}.bmp"));
                             if let Err(e) = write_bmp(&path, width, height, &pixels) {
                                 log("agent", &format!("salvar {}: {e}", path.display()));
@@ -459,39 +473,56 @@ fn input_desktop() -> windows::core::Result<(HDESK, String)> {
 /// Moves the mouse one pixel right and back; whether the cursor really
 /// moved (a blocked `SendInput` still says it sent).
 fn poke_mouse() -> String {
-    let input = |dx| INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx,
-                dy: 0,
-                dwFlags: MOUSEEVENTF_MOVE,
-                ..Default::default()
-            },
-        },
-    };
     let position = || {
         let mut p = POINT::default();
         unsafe { GetCursorPos(&mut p) }.map(|()| (p.x, p.y)).ok()
     };
-    let before = position();
-    // Away from the edge first, so the move is visible anywhere.
-    let dx = if before.is_some_and(|(x, _)| x > 0) {
-        -1
-    } else {
-        1
+    let Some(before) = position() else {
+        return format!("GetCursorPos falhou ({:?})", unsafe { GetLastError() });
     };
-    let sent = unsafe { SendInput(&[input(dx)], size_of::<INPUT>() as i32) };
-    std::thread::sleep(Duration::from_millis(50));
+    // An absolute move to a known point (a relative one-pixel move can be
+    // eaten by pointer acceleration), then back.
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+        )
+    };
+    let target = (
+        if before.0 - 40 >= vx {
+            before.0 - 40
+        } else {
+            before.0 + 40
+        },
+        before.1,
+    );
+    let to = |(x, y): (i32, i32)| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                // 0..=65535 across the whole virtual desktop.
+                dx: ((x - vx) as i64 * 65535 / (vw - 1) as i64) as i32,
+                dy: ((y - vy) as i64 * 65535 / (vh - 1) as i64) as i32,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ..Default::default()
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[to(target)], size_of::<INPUT>() as i32) };
+    std::thread::sleep(Duration::from_millis(30));
     let after = position();
-    let _ = unsafe { SendInput(&[input(-dx)], size_of::<INPUT>() as i32) };
+    let _ = unsafe { SendInput(&[to(before)], size_of::<INPUT>() as i32) };
     if sent != 1 {
         return format!("recusado ({:?})", unsafe { GetLastError() });
     }
-    match (before, after) {
-        (Some(b), Some(a)) if a != b => format!("ok, o cursor andou ({b:?} -> {a:?})"),
-        (Some(b), Some(_)) => format!("enviado, mas o cursor não andou ({b:?}): bloqueado?"),
-        _ => format!("enviado; GetCursorPos falhou ({:?})", unsafe {
+    match after {
+        Some(a) if (a.0 - target.0).abs() <= 1 && (a.1 - target.1).abs() <= 1 => {
+            format!("ok, o cursor foi para {a:?} e voltou")
+        }
+        Some(a) => format!("NÃO: pedi {target:?}, o cursor está em {a:?}"),
+        None => format!("enviado; GetCursorPos falhou ({:?})", unsafe {
             GetLastError()
         }),
     }
