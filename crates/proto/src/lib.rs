@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub mod frame;
 
 /// Bumped on any incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// TLS ALPN identifier. It carries no version: versions are compared through
 /// the preamble, so mismatched peers still connect and can report why they fail.
@@ -245,6 +245,9 @@ pub enum InputEvent {
     },
     /// Release every key and button still held (viewer lost focus).
     ReleaseAll,
+    /// Ctrl+Alt+Del: the secure attention sequence, which only the system
+    /// (the Windows service) can send; a plain key press would not do.
+    SecureAttention,
 }
 
 #[derive(Debug, thiserror::Error)]

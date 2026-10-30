@@ -92,6 +92,8 @@ impl Injector for SendInputInjector {
                 send_key(scancode, pressed);
             }
             InputEvent::ReleaseAll => self.release_all(),
+            // Sent by the service (`SendSAS`), not injected.
+            InputEvent::SecureAttention => {}
         }
     }
 

@@ -58,7 +58,12 @@ pub struct DxgiCapturer {
     frame: Option<Frame>,
     rect: Rect,
     copy_time: Duration,
+    /// When the input desktop was last checked (see `follow`).
+    followed_at: Instant,
 }
+
+/// How often a still screen checks whether the input desktop changed.
+const FOLLOW_EVERY: Duration = Duration::from_millis(500);
 
 impl DxgiCapturer {
     pub fn new(index: usize) -> Result<Self, CaptureError> {
@@ -105,7 +110,9 @@ impl DxgiCapturer {
             frame: None,
             rect: Rect::default(),
             copy_time: Duration::ZERO,
+            followed_at: Instant::now(),
         };
+        crate::desktop::follow_input_desktop();
         capturer.duplicate()?;
         Ok(capturer)
     }
@@ -276,8 +283,12 @@ impl DxgiCapturer {
 impl Capturer for DxgiCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<bool, CaptureError> {
         let Some(duplication) = self.duplication.clone() else {
-            // Duplication is refused while the secure desktop (UAC, lock screen)
-            // is shown; keep retrying until it comes back.
+            // The secure desktop (sign-in, UAC) may have come or gone: move
+            // to it where this process may (a SYSTEM agent). Elsewhere the
+            // duplication is refused while it shows; keep retrying until
+            // the user's desktop comes back.
+            crate::desktop::follow_input_desktop();
+            self.followed_at = Instant::now();
             if self.duplicate().is_err() {
                 std::thread::sleep(timeout.min(Duration::from_millis(100)));
             }
@@ -289,7 +300,16 @@ impl Capturer for DxgiCapturer {
         let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
         match unsafe { duplication.AcquireNextFrame(millis, &mut info, &mut resource) } {
             Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                // A still screen does not always hear of a desktop switch.
+                if self.followed_at.elapsed() >= FOLLOW_EVERY {
+                    self.followed_at = Instant::now();
+                    if crate::desktop::follow_input_desktop() {
+                        self.duplication = None;
+                    }
+                }
+                return Ok(false);
+            }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 // Mode change or desktop switch: recreate on the next call.
                 self.duplication = None;

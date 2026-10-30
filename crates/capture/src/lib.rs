@@ -7,6 +7,8 @@
 use std::time::Duration;
 
 #[cfg(windows)]
+mod desktop;
+#[cfg(windows)]
 mod gpu_nv12;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -80,6 +82,21 @@ pub trait Capturer {
 
     /// How long producing the last frame took (excluding the wait for a change).
     fn copy_time(&self) -> Duration;
+}
+
+/// Moves the calling thread to the desktop getting input now (Windows:
+/// the user's, or the sign-in / UAC one, where this process may), so input
+/// injected from it lands there; whether it moved. Capture does this by
+/// itself.
+pub fn follow_input_desktop() -> bool {
+    #[cfg(windows)]
+    {
+        desktop::follow_input_desktop()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Checks (and on macOS requests) the permission to capture the screen, so

@@ -240,6 +240,8 @@ impl Injector for CgEventInjector {
             }
             InputEvent::Key { scancode, pressed } => self.key(scancode, pressed),
             InputEvent::ReleaseAll => self.release_all(),
+            // Windows only, and sent by the service, not injected.
+            InputEvent::SecureAttention => {}
         }
     }
 
