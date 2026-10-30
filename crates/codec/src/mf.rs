@@ -95,7 +95,17 @@ pub struct MfEncoder {
     nv12: Vec<u8>,
     /// GPU textures the transform cannot take, read back into `nv12`.
     readback: Readback,
+    /// Encoders that failed taking textures directly: fed through memory.
+    zero_copy_failed: Vec<String>,
+    /// The last try gave the encoder textures (for `degrade`).
+    tried_gpu_input: bool,
+    /// Encoders that failed even through memory: the next ones are tried.
+    failed: Vec<String>,
 }
+
+/// How many times one image is retried on another way to encode it
+/// (without zero-copy, then another encoder) before giving up on the GPU.
+const MAX_ATTEMPTS: usize = 4;
 
 struct Session {
     width: u32,
@@ -158,7 +168,31 @@ impl MfEncoder {
             yuv: None,
             nv12: Vec::new(),
             readback: Readback::default(),
+            zero_copy_failed: Vec::new(),
+            tried_gpu_input: false,
+            failed: Vec::new(),
         })
+    }
+
+    /// After a failure with the current session, the next way to try:
+    /// the same encoder through memory, then the other encoders (opening
+    /// the session finds there is none left, with `NoHardware`).
+    fn degrade(&mut self, gpu_input: bool, error: &CodecError) {
+        // The next try opens a session the new way.
+        self.session = None;
+        if gpu_input && !self.zero_copy_failed.contains(&self.name) {
+            tracing::warn!(
+                "{}: zero-copy falhou ({error}); imagem pela memória",
+                self.name
+            );
+            self.zero_copy_failed.push(self.name.clone());
+        } else if !self.failed.contains(&self.name) {
+            tracing::warn!(
+                "{} falhou ({error}); tentando outro codificador da GPU",
+                self.name
+            );
+            self.failed.push(self.name.clone());
+        }
     }
 
     /// Replaces the session (the new one starts with a keyframe).
@@ -170,11 +204,6 @@ impl MfEncoder {
     ) -> Result<(), CodecError> {
         self.session = None;
         let session = self.open_session(width, height, device)?;
-        let name = friendly_name(&session.activate);
-        if name != self.name {
-            tracing::info!("codificador por hardware: {name}");
-            self.name = name;
-        }
         self.session = Some(session);
         self.frame_index = 0;
         Ok(())
@@ -184,26 +213,34 @@ impl MfEncoder {
     /// capture's), an encoder on the same adapter is preferred, and is given
     /// the device so it can read the capture's textures directly.
     fn open_session(
-        &self,
+        &mut self,
         width: u32,
         height: u32,
         device: Option<&ID3D11Device>,
     ) -> Result<Session, CodecError> {
-        // An encoder on the capture's adapter, or else any (fed from memory).
+        // An encoder on the capture's adapter, or else any (fed from
+        // memory); none that already failed.
+        let usable = |list: Vec<IMFActivate>| {
+            list.into_iter()
+                .find(|a| !self.failed.contains(&friendly_name(a)))
+        };
         let on_adapter = device.and_then(|device| {
             enumerate(Some(device))
                 .inspect_err(|e| tracing::debug!("encoders do adaptador da captura: {e}"))
                 .ok()
-                .and_then(|list| list.into_iter().next())
+                .and_then(usable)
         });
         let same_adapter = on_adapter.is_some();
         let activate = match on_adapter {
             Some(activate) => activate,
-            None => enumerate(None)?
-                .into_iter()
-                .next()
-                .ok_or(CodecError::NoHardware)?,
+            None => usable(enumerate(None)?).ok_or(CodecError::NoHardware)?,
         };
+        // Named before it can fail, so a failure counts against this one.
+        let name = friendly_name(&activate);
+        if name != self.name {
+            tracing::info!("codificador por hardware: {name}");
+            self.name = name;
+        }
         let transform: IMFTransform =
             unsafe { activate.ActivateObject() }.map_err(|e| hw("ActivateObject", e))?;
 
@@ -222,17 +259,25 @@ impl MfEncoder {
 
         // The device goes in before the media types.
         let manager = match device {
-            Some(device) if same_adapter => attach_device(&transform, device)
-                .inspect_err(|e| {
-                    tracing::info!("o encoder não lê texturas da GPU ({e}); imagem pela memória");
-                })
-                .ok(),
+            Some(device) if same_adapter && !self.zero_copy_failed.contains(&self.name) => {
+                attach_device(&transform, device)
+                    .inspect_err(|e| {
+                        tracing::info!(
+                            "o encoder não lê texturas da GPU ({e}); imagem pela memória"
+                        );
+                    })
+                    .ok()
+            }
             _ => None,
         };
+        // A failure from here on, with textures, may be the zero-copy's.
+        self.tried_gpu_input = manager.is_some();
         if manager.is_some() {
             tracing::info!("zero-copy: o encoder lê a imagem direto da GPU");
         } else if device.is_some() && !same_adapter {
             tracing::info!("encoder em outro adaptador que a captura; imagem pela memória");
+        } else if device.is_some() {
+            tracing::info!("imagem pela memória (o zero-copy falhou antes)");
         }
 
         // Encoder settings are best effort: drivers support different subsets.
@@ -325,13 +370,67 @@ impl MfEncoder {
 impl VideoEncoder for MfEncoder {
     fn encode(&mut self, image: &Image<'_>) -> Result<Option<Encoded>, CodecError> {
         check_frame(image)?;
-        let (width, height) = (image.width, image.height);
+        // The capture's device (not the encoder's fault if this fails).
         let device = match image.pixels {
             Pixels::D3d11(texture) => {
                 Some(unsafe { texture.GetDevice() }.map_err(|e| hw("GetDevice", e))?)
             }
             Pixels::Memory(_) => None,
         };
+        let mut first_error = None;
+        for _ in 0..MAX_ATTEMPTS {
+            self.tried_gpu_input = self.session.as_ref().is_some_and(|s| s.gpu_input);
+            match self.encode_once(image, device.as_ref()) {
+                Ok(encoded) => return Ok(encoded),
+                // No encoder left to try: the first failure says why.
+                Err(CodecError::NoHardware) if first_error.is_some() => break,
+                Err(e) => {
+                    self.degrade(self.tried_gpu_input, &e);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        Err(first_error.unwrap_or(CodecError::NoHardware))
+    }
+
+    fn pending(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.in_flight > 0)
+    }
+
+    fn drain(&mut self) -> Result<Option<Encoded>, CodecError> {
+        let Some(session) = &mut self.session else {
+            return Ok(None);
+        };
+        let result = session.drain();
+        if result.is_err() {
+            self.session = None;
+        }
+        result
+    }
+
+    fn force_keyframe(&mut self) {
+        self.force_keyframe = true;
+    }
+
+    fn name(&self) -> String {
+        format!("GPU ({})", self.name)
+    }
+
+    fn is_hardware(&self) -> bool {
+        true
+    }
+}
+
+impl MfEncoder {
+    /// One try at encoding `image` with the current way (opening it if
+    /// needed).
+    fn encode_once(
+        &mut self,
+        image: &Image<'_>,
+        device: Option<&ID3D11Device>,
+    ) -> Result<Option<Encoded>, CodecError> {
+        let (width, height) = (image.width, image.height);
+        let device = device.cloned();
         // A new size, the first texture (or a new capture device), or memory
         // images after textures: the encoder must be opened for it.
         let reopen = match &self.session {
@@ -361,6 +460,7 @@ impl VideoEncoder for MfEncoder {
 
         // Built for the session that will take it (after any reopen above).
         let gpu_input = self.session.as_ref().is_some_and(|s| s.gpu_input);
+        self.tried_gpu_input = gpu_input;
         let fps = i64::from(self.settings.max_fps.round().max(1.0) as u32);
         let duration = HNS_PER_SEC / fps;
         let time = self.frame_index * duration;
@@ -386,33 +486,6 @@ impl VideoEncoder for MfEncoder {
             self.session = None;
         }
         result
-    }
-
-    fn pending(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.in_flight > 0)
-    }
-
-    fn drain(&mut self) -> Result<Option<Encoded>, CodecError> {
-        let Some(session) = &mut self.session else {
-            return Ok(None);
-        };
-        let result = session.drain();
-        if result.is_err() {
-            self.session = None;
-        }
-        result
-    }
-
-    fn force_keyframe(&mut self) {
-        self.force_keyframe = true;
-    }
-
-    fn name(&self) -> String {
-        format!("GPU ({})", self.name)
-    }
-
-    fn is_hardware(&self) -> bool {
-        true
     }
 }
 
