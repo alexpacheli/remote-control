@@ -16,7 +16,7 @@ Where Hext Remote stands: what is done, what is being checked and what comes nex
 | F6 — Distribution | `.msi`, portable `.exe`, notarized `.dmg`, `.deb`/`.rpm`/`.AppImage`, signed automatic updates, unattended access on the Mac after login | [F6](planos/F6.md) |
 | Linux interface | The app as a technician on Linux: account, My computers, opening other computers; `.deb` and `.rpm` with the libraries they need (WebKitGTK) (0.8.0) | [ARCHITECTURE](../ARCHITECTURE.md#7-platforms) |
 | Virtual monitor | Session on a computer with no monitor (Windows driver as an installer option, macOS built in), resolution with `Ctrl+Alt+0`; a screen that stays black (a display turned off at its button) moves to the virtual one by itself; the viewer goes back to the last monitor chosen for each computer (0.8.2) | [monitor-virtual](monitor-virtual.md) |
-| Privacy screen (Windows) | `Ctrl+Alt+P` in the viewer: the person at the computer sees a black screen with a notice and their mouse and keyboard do nothing, while the technician sees and controls everything; `Ctrl+Alt+Del` there ends it | [F7](planos/F7.md#marco-1-como-funciona-e-roteiro) |
+| Privacy screen (Windows and Mac) | `Ctrl+Alt+P` in the viewer: the person at the computer sees a black screen with a notice and their mouse and keyboard do nothing, while the technician sees and controls everything; `Ctrl+Alt+Del` there ends it (on a Mac, macOS 12.3 or newer: Esc three times) | [F7](planos/F7.md#marco-1-como-funciona-e-roteiro), [Mac](planos/F7.md#marco-2-como-funciona-e-roteiro) |
 
 Names in "My computers" follow the computer's current name (0.7.1).
 
@@ -37,7 +37,8 @@ Each phase closes with a real-world checklist ([roteiros/](roteiros/), in Portug
 - [x] **Session window:** each session draws on a thread of its own. On a Mac, a minimized window comes back
       without freezing; opening another computer no longer stalls the open windows
       ([janela-travada](estudos/janela-travada.md#roteiro-de-campo)). Checked on a Mac (November 2026).
-- [ ] **Privacy screen:** the F7 milestone 1 checklist ([F7](planos/F7.md#marco-1-como-funciona-e-roteiro)).
+- [ ] **Privacy screen:** the F7 milestone 1 checklist ([F7](planos/F7.md#marco-1-como-funciona-e-roteiro)) and,
+      on a Mac, the milestone 2 one ([F7](planos/F7.md#marco-2-como-funciona-e-roteiro)).
 
 ## Open issues
 
@@ -50,8 +51,7 @@ Each phase closes with a real-world checklist ([roteiros/](roteiros/), in Portug
 
 ## Next
 
-- **F7 — Extras** ([plan](planos/F7.md), in Portuguese): privacy screen on the Mac, audio and the Linux host
-  (being accessed); Wake-on-LAN, session recording, HEVC/AV1, several technicians, mobile and web when there is demand.
+- **F7 — Extras** ([plan](planos/F7.md), in Portuguese): audio and the Linux host (being accessed); Wake-on-LAN, session recording, HEVC/AV1, several technicians, mobile and web when there is demand.
 - **Smoothness, last and with care:** compare with Parsec side by side, on the same network without Tailscale, and
   apply what the study found ([fluidez-parsec](estudos/fluidez-parsec.md)). Already in: the capture keeps step with
   the screen, and the log shows the longest gap between frames on both sides.

@@ -10,10 +10,18 @@
 //! Frames come in NV12 (BT.601, limited range): the GPU converts while it
 //! scales, so neither the CPU nor the video encoder has to, and the copy
 //! out of the frame is 1.5 bytes per pixel instead of 4.
+//!
+//! Windows of this process can be left out of every capture
+//! ([`exclude_windows`]): the privacy screen (hext-input) covers the Mac for
+//! the person there, and the technician sees what is under it. The content
+//! filter's `excludingWindows` and `SCStream::updateContentFilter` both come
+//! with ScreenCaptureKit itself (macOS 12.3), so wherever this capture runs,
+//! it can leave them out.
 
 // Objective-C / CoreVideo calls are unsafe by nature; each block below is a plain API call.
 #![allow(unsafe_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -36,7 +44,7 @@ use objc2_core_video::{
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
+    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
 use crate::{CaptureError, Capturer, Display, Frame, PixelFormat, Rect, even};
@@ -49,6 +57,100 @@ const MAX_WIDTH: u32 = 2560;
 
 fn platform(context: &str, error: &NSError) -> CaptureError {
     CaptureError::Platform(format!("{context}: {}", error.localizedDescription()))
+}
+
+/// The windows every capture leaves out, and the streams running, to change
+/// their filter when that list changes. One lock for both: a stream either
+/// opens with the new list or is running when it is applied.
+struct Exclusion {
+    windows: Vec<u32>,
+    streams: Vec<Live>,
+}
+
+static EXCLUSION: Mutex<Exclusion> = Mutex::new(Exclusion {
+    windows: Vec::new(),
+    streams: Vec::new(),
+});
+
+/// Tells the running streams apart, to forget the one that stops.
+static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+
+/// A running stream and the display it shows (its filter needs both).
+struct Live {
+    key: u64,
+    stream: Retained<SCStream>,
+    display: Retained<SCDisplay>,
+}
+
+// SAFETY: only used for `updateContentFilter`, which ScreenCaptureKit takes
+// from any thread (it answers on its own queue), and to build the filter.
+unsafe impl Send for Live {}
+
+/// Leaves these windows (`CGWindowID`s) of this process out of every
+/// capture, the running ones included; Ok once each running one confirmed.
+/// An empty list only forgets the last one (its windows are gone by then).
+pub fn exclude_windows(ids: &[u32]) -> Result<(), CaptureError> {
+    if ids.is_empty() {
+        EXCLUSION.lock().expect("lock").windows.clear();
+        return Ok(());
+    }
+    let content = shareable_content()?;
+    let windows = windows_of(&content, ids);
+    if windows.count() != ids.len() {
+        return Err(CaptureError::Platform(
+            "a janela não aparece para o ScreenCaptureKit".into(),
+        ));
+    }
+    let mut exclusion = EXCLUSION.lock().expect("lock");
+    exclusion.windows = ids.to_vec();
+    for live in &exclusion.streams {
+        let filter = unsafe {
+            SCContentFilter::initWithDisplay_excludingWindows(
+                SCContentFilter::alloc(),
+                &live.display,
+                &windows,
+            )
+        };
+        update_filter(&live.stream, &filter)?;
+    }
+    Ok(())
+}
+
+/// The windows of `content` with these IDs (the ones still there).
+fn windows_of(content: &SCShareableContent, ids: &[u32]) -> Retained<NSArray<SCWindow>> {
+    if ids.is_empty() {
+        return NSArray::new();
+    }
+    let all = unsafe { content.windows() };
+    let picked: Vec<Retained<SCWindow>> = (0..all.count())
+        .map(|i| all.objectAtIndex(i))
+        .filter(|window| ids.contains(&unsafe { window.windowID() }))
+        .collect();
+    NSArray::from_retained_slice(&picked)
+}
+
+/// Stops changing the filter of stream `key`: it is stopping.
+fn forget_stream(key: u64) {
+    EXCLUSION
+        .lock()
+        .expect("lock")
+        .streams
+        .retain(|live| live.key != key);
+}
+
+/// Gives a running stream another filter, waiting for ScreenCaptureKit.
+fn update_filter(stream: &SCStream, filter: &SCContentFilter) -> Result<(), CaptureError> {
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(move |error: *mut NSError| {
+        let result = match unsafe { error.as_ref() } {
+            Some(error) => Err(platform("updateContentFilter", error)),
+            None => Ok(()),
+        };
+        let _ = tx.send(result);
+    });
+    unsafe { stream.updateContentFilter_completionHandler(filter, Some(&handler)) };
+    rx.recv_timeout(REQUEST_TIMEOUT)
+        .map_err(|_| CaptureError::Platform("updateContentFilter: tempo esgotado".into()))?
 }
 
 /// The newest frame from the delegate, picked up by `next_frame`.
@@ -211,6 +313,8 @@ pub struct ScreenCaptureKitCapturer {
     rect: Rect,
     copy_time: Duration,
     seen: u64,
+    /// Its place among the streams [`exclude_windows`] reaches.
+    key: u64,
 }
 
 /// macOS only re-reads the permission when the process starts, so a grant
@@ -238,7 +342,11 @@ pub fn preflight() -> Result<(), CaptureError> {
 impl ScreenCaptureKitCapturer {
     /// Opens display `id` ([`Display::id`]).
     pub fn new(id: &str, max_fps: u32) -> Result<Self, CaptureError> {
-        let display = screens()?
+        if !CGPreflightScreenCaptureAccess() {
+            return Err(permission_error());
+        }
+        let content = shareable_content()?;
+        let display = screens_of(&content)
             .into_iter()
             .find(|display| display_id(display) == id)
             .ok_or_else(|| CaptureError::DisplayGone(id.into()))?;
@@ -258,11 +366,17 @@ impl ScreenCaptureKitCapturer {
 
         let shared = Arc::new(Shared::default());
         let output = StreamOutput::new(shared.clone());
+        let key = NEXT_STREAM.fetch_add(1, Ordering::Relaxed);
+        // Held until the stream is listed: an exclusion asked meanwhile
+        // waits, and then reaches this stream too.
+        let mut exclusion = EXCLUSION.lock().expect("lock");
         let stream = unsafe {
+            // (A window that closed in the meantime is simply not there.)
+            let excluded = windows_of(&content, &exclusion.windows);
             let filter = SCContentFilter::initWithDisplay_excludingWindows(
                 SCContentFilter::alloc(),
                 &display,
-                &NSArray::new(),
+                &excluded,
             );
             let config = SCStreamConfiguration::new();
             config.setWidth(width as usize);
@@ -273,23 +387,33 @@ impl ScreenCaptureKitCapturer {
             config.setShowsCursor(false);
             config.setQueueDepth(3);
             config.setMinimumFrameInterval(CMTime::new(1, max_fps.clamp(1, 240) as i32));
-            let stream = SCStream::initWithFilter_configuration_delegate(
+            SCStream::initWithFilter_configuration_delegate(
                 SCStream::alloc(),
                 &filter,
                 &config,
                 None,
-            );
-            stream
-                .addStreamOutput_type_sampleHandlerQueue_error(
-                    ProtocolObject::from_ref(&*output),
-                    SCStreamOutputType::Screen,
-                    None,
-                )
-                .map_err(|e| platform("addStreamOutput", &e))?;
-            stream
+            )
         };
+        exclusion.streams.push(Live {
+            key,
+            stream: stream.clone(),
+            display: display.clone(),
+        });
+        drop(exclusion);
+        let added = unsafe {
+            stream.addStreamOutput_type_sampleHandlerQueue_error(
+                ProtocolObject::from_ref(&*output),
+                SCStreamOutputType::Screen,
+                None,
+            )
+        };
+        if let Err(e) = added {
+            forget_stream(key);
+            return Err(platform("addStreamOutput", &e));
+        }
         if let Err(e) = start(&stream) {
             // It may still start after the timeout: never leave it running.
+            forget_stream(key);
             stop(&stream, &output);
             return Err(e);
         }
@@ -307,6 +431,7 @@ impl ScreenCaptureKitCapturer {
             rect,
             copy_time: Duration::ZERO,
             seen: 0,
+            key,
         })
     }
 }
@@ -316,11 +441,14 @@ fn screens() -> Result<Vec<Retained<SCDisplay>>, CaptureError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(permission_error());
     }
-    let content = shareable_content()?;
+    Ok(screens_of(&shareable_content()?))
+}
+
+fn screens_of(content: &SCShareableContent) -> Vec<Retained<SCDisplay>> {
     let displays = unsafe { content.displays() };
-    Ok((0..displays.count())
+    (0..displays.count())
         .map(|i| displays.objectAtIndex(i))
-        .collect())
+        .collect()
 }
 
 fn display_id(display: &SCDisplay) -> String {
@@ -385,6 +513,7 @@ impl Capturer for ScreenCaptureKitCapturer {
 
 impl Drop for ScreenCaptureKitCapturer {
     fn drop(&mut self) {
+        forget_stream(self.key);
         stop(&self.stream, &self._output);
     }
 }
@@ -406,7 +535,9 @@ fn stop(stream: &SCStream, output: &StreamOutput) {
     };
 }
 
-/// Asks ScreenCaptureKit for the displays, waiting for its answer.
+/// Asks ScreenCaptureKit for the displays and windows, waiting for its
+/// answer. Every window, also the ones not on screen yet: the privacy
+/// screen's are left out before they show.
 fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
     let (tx, rx) = mpsc::channel();
     let handler = RcBlock::new(
@@ -421,7 +552,11 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
             let _ = tx.send(result);
         },
     );
-    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            false, false, &handler,
+        )
+    };
     rx.recv_timeout(REQUEST_TIMEOUT)
         .map_err(|_| CaptureError::Platform("SCShareableContent: tempo esgotado".into()))?
 }

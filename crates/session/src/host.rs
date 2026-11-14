@@ -1406,12 +1406,16 @@ impl BlackWatch {
     }
 }
 
-/// What the privacy screen shows the person at the computer.
-const PRIVACY_TEXT: &str = "Este computador está sendo acessado pelo suporte técnico.
-
-A tela volta ao normal quando o 
-                            técnico terminar.
-Para interromper agora, aperte Ctrl+Alt+Del.";
+/// What the privacy screen shows the person at the computer, with the way
+/// out of each system (hext_input::privacy).
+#[cfg(not(target_os = "macos"))]
+const PRIVACY_TEXT: &str = "Este computador está sendo acessado pelo suporte técnico.\n\n\
+                            A tela volta ao normal quando o técnico terminar.\n\
+                            Para interromper agora, aperte Ctrl+Alt+Del.";
+#[cfg(target_os = "macos")]
+const PRIVACY_TEXT: &str = "Este computador está sendo acessado pelo suporte técnico.\n\n\
+                            A tela volta ao normal quando o técnico terminar.\n\
+                            Para interromper agora, aperte a tecla esc três vezes seguidas.";
 
 /// The privacy screen, as the capture keeps it: on while the viewer wants it
 /// and this capture runs (it goes off with the session, however it ends).
@@ -2294,6 +2298,19 @@ mod tests {
                 privacy: Privacy::None,
             }
         );
+    }
+
+    #[test]
+    fn the_privacy_notice_says_how_to_get_out() {
+        let way_out = if cfg!(target_os = "macos") {
+            "esc três vezes"
+        } else {
+            "Ctrl+Alt+Del"
+        };
+        assert!(PRIVACY_TEXT.contains(way_out));
+        // Lines break where the text says, nowhere else.
+        assert_eq!(PRIVACY_TEXT.lines().count(), 4);
+        assert!(!PRIVACY_TEXT.contains("  "));
     }
 
     #[test]

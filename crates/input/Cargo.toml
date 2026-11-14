@@ -22,8 +22,29 @@ windows = { workspace = true, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# The privacy screen: its windows (AppKit, on the main queue) and leaving
+# them out of the capture.
+dispatch2 = "0.3"
+hext-capture.workspace = true
+objc2.workspace = true
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSGraphics",
+    "NSLayoutConstraint",
+    "NSResponder",
+    "NSScreen",
+    "NSText",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
 objc2-core-foundation.workspace = true
 objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
 
 [lints]
 workspace = true

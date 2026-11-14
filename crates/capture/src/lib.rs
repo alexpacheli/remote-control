@@ -140,6 +140,14 @@ pub fn preflight() -> Result<(), CaptureError> {
     }
 }
 
+/// macOS: leaves these windows of this process (`CGWindowID`s) out of every
+/// capture, the running ones included, for the privacy screen. Ok once every
+/// running capture confirmed; an empty list only forgets the last one.
+#[cfg(target_os = "macos")]
+pub fn exclude_windows(ids: &[u32]) -> Result<(), CaptureError> {
+    macos::exclude_windows(ids)
+}
+
 /// The displays of this computer, in the order sessions number them: the
 /// main one first (the one at the origin, on every OS), then from left to
 /// right.

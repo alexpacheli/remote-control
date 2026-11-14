@@ -142,7 +142,20 @@ impl CgEventInjector {
     /// of the key itself. Nothing comes from the flags the event was created
     /// with: those can carry the system's current state (a stuck Fn, say),
     /// and posting them again would keep it stuck for good.
+    ///
+    /// Every event carries Hext's mark in `kCGEventSourceUserData`, a field
+    /// that exists for the poster's own use and goes along with the event
+    /// through every event tap; the privacy screen's tap lets marked events
+    /// through and drops the rest. Real keyboards and mice leave it at zero.
+    /// (Telling them apart by source state or process ID would depend on
+    /// how macOS fills those fields for events made with no source; this
+    /// one is only ever what Hext wrote.)
     fn post(&self, event: Option<&CGEvent>, own: CGEventFlags) {
+        CGEvent::set_integer_value_field(
+            event,
+            CGEventField::EventSourceUserData,
+            crate::privacy::HEXT_EVENT_MARK,
+        );
         CGEvent::set_flags(event, own | self.flags());
         CGEvent::post(CGEventTapLocation::HIDEventTap, event);
     }

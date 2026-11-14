@@ -9,12 +9,25 @@
 //! come from `SendInput`. `Ctrl+Alt+Del` cannot be blocked, and that is the
 //! way out: when the computer goes to another desktop (that screen, the lock
 //! screen, a UAC prompt), the privacy screen ends by itself.
+//!
+//! macOS (12.3 and later, see `privacy/macos.rs`): a black window over each
+//! display, left out of the ScreenCaptureKit capture by its content filter;
+//! an event tap drops the input that does not carry Hext's mark
+//! ([`HEXT_EVENT_MARK`]). The way out is the Esc key pressed three times in
+//! a row ([`EmergencyExit`]); locking the Mac or switching users ends it too.
+
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// The privacy screen, on until dropped (or until it ends by itself: see
 /// [`Privacy::ended`]).
 pub struct Privacy {
     #[cfg(windows)]
     inner: imp::Running,
+    #[cfg(target_os = "macos")]
+    inner: macos::Running,
 }
 
 impl Privacy {
@@ -24,7 +37,11 @@ impl Privacy {
         {
             imp::available()
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            macos::available()
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             false
         }
@@ -37,25 +54,80 @@ impl Privacy {
         {
             imp::Running::start(text).map(|inner| Self { inner })
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            macos::Running::start(text).map(|inner| Self { inner })
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = text;
             Err("a tela de privacidade não existe neste sistema".into())
         }
     }
 
-    /// It ended by itself: someone pressed `Ctrl+Alt+Del`, the computer
-    /// locked, or a UAC prompt came up.
+    /// It ended by itself. Windows: someone pressed `Ctrl+Alt+Del`, the
+    /// computer locked, or a UAC prompt came up. macOS: someone pressed Esc
+    /// three times, or the Mac locked or went to another user.
     pub fn ended(&self) -> bool {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.inner.ended()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             true
         }
     }
+}
+
+/// What the Mac's injector writes in every event it posts
+/// (`kCGEventSourceUserData`), so the privacy screen's event tap lets the
+/// technician's input through and drops the rest ("HEXTPRIV" in ASCII).
+pub const HEXT_EVENT_MARK: i64 = 0x4845_5854_5052_4956;
+
+/// Whether an event's `kCGEventSourceUserData` says Hext posted it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn from_hext(user_data: i64) -> bool {
+    user_data == HEXT_EVENT_MARK
+}
+
+/// The way out of the privacy screen on a Mac, where nothing like
+/// `Ctrl+Alt+Del` gets past an event tap: Esc pressed [`Self::PRESSES`]
+/// times, each within [`Self::GAP`] of the one before.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct EmergencyExit {
+    presses: u32,
+    last: Option<Instant>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl EmergencyExit {
+    const PRESSES: u32 = 3;
+    const GAP: Duration = Duration::from_secs(1);
+
+    /// One more Esc, `at` that moment: whether it was the last one needed.
+    fn press(&mut self, at: Instant) -> bool {
+        let in_a_row = self
+            .last
+            .is_some_and(|last| at.saturating_duration_since(last) <= Self::GAP);
+        self.presses = if in_a_row { self.presses + 1 } else { 1 };
+        self.last = Some(at);
+        if self.presses >= Self::PRESSES {
+            *self = Self::default();
+            return true;
+        }
+        false
+    }
+}
+
+/// Whether the Mac's session still lets the privacy screen stay on, from
+/// what `CGSessionCopyCurrentDictionary` says: not with the screen locked,
+/// nor with another user at the console (fast user switching). What it does
+/// not say counts as fine.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn session_allows(screen_locked: Option<bool>, on_console: Option<bool>) -> bool {
+    !screen_locked.unwrap_or(false) && on_console.unwrap_or(true)
 }
 
 #[cfg(windows)]
@@ -551,5 +623,50 @@ mod imp {
             assert!(!running.ended());
             drop(running);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_marked_events_are_from_hext() {
+        assert!(from_hext(HEXT_EVENT_MARK));
+        // Real keyboards and mice leave the field at zero.
+        assert!(!from_hext(0));
+        assert!(!from_hext(HEXT_EVENT_MARK - 1));
+    }
+
+    #[test]
+    fn three_quick_escapes_end_it() {
+        let start = Instant::now();
+        let mut exit = EmergencyExit::default();
+        assert!(!exit.press(start));
+        assert!(!exit.press(start + Duration::from_millis(300)));
+        assert!(exit.press(start + Duration::from_millis(600)));
+        // And it starts over.
+        assert!(!exit.press(start + Duration::from_millis(700)));
+    }
+
+    #[test]
+    fn slow_escapes_do_not() {
+        let start = Instant::now();
+        let mut exit = EmergencyExit::default();
+        assert!(!exit.press(start));
+        assert!(!exit.press(start + Duration::from_millis(900)));
+        // Too long after the second: this one counts as the first again.
+        assert!(!exit.press(start + Duration::from_millis(2500)));
+        assert!(!exit.press(start + Duration::from_millis(3000)));
+        assert!(exit.press(start + Duration::from_millis(3500)));
+    }
+
+    #[test]
+    fn a_locked_or_switched_mac_ends_it() {
+        assert!(session_allows(Some(false), Some(true)));
+        assert!(session_allows(None, None));
+        assert!(!session_allows(Some(true), Some(true)));
+        assert!(!session_allows(None, Some(false)));
+        assert!(!session_allows(Some(true), None));
     }
 }
