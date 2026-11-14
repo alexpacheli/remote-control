@@ -441,7 +441,8 @@ fn screens() -> Result<Vec<Retained<SCDisplay>>, CaptureError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(permission_error());
     }
-    Ok(screens_of(&shareable_content()?))
+    let content = shareable_content()?;
+    Ok(screens_of(&content))
 }
 
 fn screens_of(content: &SCShareableContent) -> Vec<Retained<SCDisplay>> {
