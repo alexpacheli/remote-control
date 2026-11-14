@@ -195,6 +195,7 @@ async fn session_answering(
             access_code: code,
             resume: None,
             asks: Default::default(),
+            audio: false,
         },
         None,
         DecoderPreference::Software,

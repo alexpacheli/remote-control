@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use anyhow::{Context, Result, bail};
+use hext_audio::Player;
 use hext_clipboard::Clipboard;
 use hext_codec::DecoderPreference;
 use hext_input::keymap::{self, CommandKey};
@@ -402,6 +403,8 @@ impl Viewers {
         ));
         runtime.spawn(share_files(&mut session, tell.clone()));
         runtime.spawn(hear_displays(&session, tell.clone()));
+        let player = Player::new();
+        runtime.spawn(hear_audio(&mut session, &player));
         if self.ui {
             runtime.spawn(hear_chat(&mut session, n));
             // (Made safe to show when the session opened.)
@@ -461,6 +464,7 @@ impl Viewers {
             chat_button: None,
             last_title: Instant::now(),
             hidden: (false, false),
+            player,
         };
         // In use once its window has the focus (it tells).
         self.sessions.insert(n, viewer);
@@ -650,6 +654,8 @@ struct Viewer {
     /// Covered or minimized (macOS), and without a size (minimized on
     /// Windows): nothing is drawn.
     hidden: (bool, bool),
+    /// The host's sound, on a thread of its own (muted with Ctrl+Alt+S).
+    player: Player,
 }
 
 /// The window is gone: so is its render thread (which may hold the last
@@ -1040,6 +1046,7 @@ impl Viewer {
             current,
             virtual_display,
             privacy,
+            audio,
         } = self.displays;
         let on_virtual = match virtual_display {
             VirtualDisplay::On {
@@ -1067,6 +1074,9 @@ impl Viewer {
         }
         if privacy == Privacy::On {
             title += " — tela do cliente escondida (Ctrl+Alt+P mostra)";
+        }
+        if audio && self.player.muted() {
+            title += " — som desligado (Ctrl+Alt+S liga)";
         }
         if let Some(snapshot) = stats.snapshot() {
             title += &format!(
@@ -1156,6 +1166,10 @@ impl Viewer {
                         .spawn(share_files(&mut session, self.tell.clone()));
                     self.runtime
                         .spawn(hear_displays(&session, self.tell.clone()));
+                    self.runtime.spawn(hear_audio(&mut session, &self.player));
+                    // Muted stays muted (the host hears it once it tells
+                    // it has sound).
+                    session.set_audio(!self.player.muted());
                     if self.chat_link {
                         self.runtime.spawn(hear_chat(&mut session, self.n));
                     }
@@ -1362,6 +1376,25 @@ impl Viewer {
                 {
                     self.local_key = Some(code);
                     session.privacy(self.displays.privacy == Privacy::Off);
+                    return;
+                }
+                // Ctrl+Alt+S: the host's sound, off and on, where it has
+                // sound to send.
+                if event.state == ElementState::Pressed
+                    && code == KeyCode::KeyS
+                    && self.ctrl_alt()
+                    && self.displays.audio
+                    && self.session.is_some()
+                {
+                    self.local_key = Some(code);
+                    let muted = !self.player.muted();
+                    self.player.set_muted(muted);
+                    if let Some(session) = &self.session {
+                        session.set_audio(!muted);
+                    }
+                    info!("som {}", if muted { "desligado" } else { "ligado" });
+                    self.last_title = Instant::now() - Duration::from_secs(1);
+                    self.update_title();
                     return;
                 }
                 // Ctrl+Alt+1..9: another display of the host. (With no such
@@ -1609,6 +1642,24 @@ fn window_event_name(event: &WindowEvent) -> &'static str {
 /// Hands decoded frames to the render thread, past the window's.
 fn show_frames(latest: Latest) -> impl FnMut(client::DecodedFrame) + Send + 'static {
     move |frame| latest.put(frame.yuv, frame.display)
+}
+
+/// Hands the session's sound to the window's player, for as long as the
+/// session lasts. Never waits: a stuck player loses packets, not time.
+fn hear_audio(
+    session: &mut ClientHandle,
+    player: &Player,
+) -> impl Future<Output = ()> + Send + 'static {
+    let audio = session.audio();
+    let to = player.sender();
+    async move {
+        let Some(mut audio) = audio else { return };
+        while let Some(packet) = audio.recv().await {
+            if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = to.try_send(packet) {
+                return;
+            }
+        }
+    }
 }
 
 /// Wakes the window at each news of the host's displays: a still screen
@@ -1913,6 +1964,8 @@ async fn try_back(back: &Back, endpoint: &Endpoint, token: ResumeToken) -> Resul
         access_code: code,
         resume: Some(token),
         asks: Default::default(),
+        // (Muted: told as soon as the host says it has sound.)
+        audio: true,
     };
     let frames = show_frames(back.latest.clone());
     let session = client::start(conn, hello, None, back.decoder, frames).await?;
@@ -2137,7 +2190,7 @@ async fn open_session(
     let on_waiting = move || waiting.send(SessionEvent::Locked);
     let asks = Login::asks(login.as_ref());
     let (conn, code, route, pin) = reach(&net, target, asks, on_waiting).await?;
-    let (hello, password) = hello_of(&net, code, login);
+    let (hello, password) = hello_of(&net, code, login, true);
     let session = client::start(conn, hello, password, decoder, show_frames(latest))
         .await
         .map_err(explain)?;
@@ -2149,7 +2202,13 @@ async fn open_session(
 /// The introduction to the host, and the password to answer it with. What
 /// the viewer asks for (to be remembered, the account) goes end to end, too:
 /// the host does not take the server's word alone.
-fn hello_of(net: &Net, code: String, login: Option<Login>) -> (Hello, Option<PasswordLogin>) {
+/// `audio`: this viewer plays the host's sound (the headless one does not).
+fn hello_of(
+    net: &Net,
+    code: String,
+    login: Option<Login>,
+    audio: bool,
+) -> (Hello, Option<PasswordLogin>) {
     let asks = login
         .as_ref()
         .map_or_else(HelloAsks::default, |login| HelloAsks {
@@ -2161,6 +2220,7 @@ fn hello_of(net: &Net, code: String, login: Option<Login>) -> (Hello, Option<Pas
         access_code: code,
         resume: None,
         asks,
+        audio,
     };
     let viewer = net.key.public_key();
     let password = login.map(|login| PasswordLogin {
@@ -2225,7 +2285,7 @@ async fn headless(
     let on_waiting = || println!("{}", crate::ui_link::HOST_LOCKED);
     let asks = Login::asks(login.as_ref());
     let (conn, code, _, pin) = reach(&net, target, asks, on_waiting).await?;
-    let (hello, password) = hello_of(&net, code, login);
+    let (hello, password) = hello_of(&net, code, login, false);
     let session = client::start(conn, hello, password, decoder(args.decoder), |_| {})
         .await
         .map_err(explain)?;

@@ -33,6 +33,7 @@ hext-codec = { path = "crates/codec" }
 hext-input = { path = "crates/input" }
 hext-render = { path = "crates/render" }
 hext-session = { path = "crates/session" }
+hext-audio = { path = "crates/audio" }
 
 anyhow = "1.0"
 arboard = { version = "3.7", default-features = false }
@@ -48,6 +49,9 @@ iroh = "1.4"
 openh264 = "0.9"
 pollster = "1.0"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Sound: Opus (libopus, built from source by CMake) and the audio devices.
+opus = "0.4"
+cpal = "0.18"
 # Forward error correction for video datagrams.
 reed-solomon-erasure = "6"
 # SQLite compiled in (no system library): the server's database.

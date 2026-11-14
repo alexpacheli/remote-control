@@ -69,6 +69,10 @@ capture (GPU) → NV12 → H.264 encode → packets + FEC → QUIC datagrams →
 - **Virtual monitor:** with no monitor attached, the host creates one for the session and removes it at the end
   (MttVDD driver on Windows, optional in the installer; `CGVirtualDisplay` on macOS). `Ctrl+Alt+0` turns it on
   and changes its resolution. Details: [docs/monitor-virtual.md](docs/monitor-virtual.md) (in Portuguese).
+- **Sound:** what the host plays (WASAPI loopback on Windows, ScreenCaptureKit on macOS 13+) goes as Opus, 48 kHz,
+  10 ms per datagram (each also carrying the previous one), beside the video's pacing and FEC, and nothing while
+  silent; the viewer keeps about 40 ms in a queue that never grows past 70 ms and plays it with `cpal`.
+  `Ctrl+Alt+S` mutes it. Details: [docs/planos/F7.md](docs/planos/F7.md) (in Portuguese).
 
 Other channels, on reliable QUIC streams: keyboard by scancode (works across layouts) and mouse (`SendInput`,
 `CGEvent`), clipboard text, files (drag to the window; they land in Downloads), chat, remote restart with

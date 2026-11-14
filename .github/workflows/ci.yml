@@ -58,12 +58,12 @@ jobs:
         with:
           target: ${{ matrix.targets }}
 
-      # The interface on Linux: WebKitGTK, to build with.
+      # The interface on Linux: WebKitGTK, to build with; the sound: ALSA.
       - name: Linux libraries
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libasound2-dev
 
       - name: Format
         if: runner.os == 'Linux'

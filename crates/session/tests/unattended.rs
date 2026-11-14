@@ -281,6 +281,7 @@ impl Host {
                 access_code: code,
                 resume,
                 asks,
+                audio: false,
             },
             login,
             DecoderPreference::Software,

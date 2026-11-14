@@ -97,7 +97,9 @@ e-mails, your own app build, update key, backups, traffic and security.
 ## Building
 
 You need [Rust](https://rustup.rs). The version is pinned in `rust-toolchain.toml` and installed by itself. On
-Windows, you also need the Visual Studio Build Tools with the "Desktop development with C++" workload.
+Windows, you also need the Visual Studio Build Tools with the "Desktop development with C++" workload. The sound
+codec (libopus) is compiled by [CMake](https://cmake.org): on the PATH (on Windows, `winget install Kitware.CMake`; the
+one inside the Build Tools also works, through the `CMAKE` variable). On Linux, also `libasound2-dev` (ALSA).
 
 ```sh
 cargo run -p hext              # the interface
@@ -129,6 +131,7 @@ Build variables, all optional:
 | `crates/codec` | H.264: graphics card (Media Foundation, VideoToolbox) or OpenH264 in software |
 | `crates/input` | Key map and mouse and keyboard injection (SendInput, CGEvent) |
 | `crates/render` | GPU rendering (wgpu), YUV → RGB in the shader |
+| `crates/audio` | Sound: capture of what the computer plays (WASAPI, ScreenCaptureKit), Opus, playback (cpal) |
 | `crates/session` | Host and viewer pipelines |
 | `crates/metrics` | Latency statistics |
 | `deploy` | Server: systemd script, Caddy, relay and Docker |

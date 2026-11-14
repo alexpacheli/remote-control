@@ -224,6 +224,7 @@ async fn session_with(permissions: Permissions) -> Running {
             access_code: code,
             resume: None,
             asks: Default::default(),
+            audio: false,
         },
         None,
         DecoderPreference::Software,

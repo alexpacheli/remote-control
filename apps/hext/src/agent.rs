@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hext_codec::EncoderSettings;
-use hext_proto::{Displays, InputEvent, VideoFrame};
+use hext_proto::{AudioPacket, Displays, InputEvent, VideoFrame};
 use hext_session::SessionError;
 use hext_session::host::{BoxFuture, Desktop, LocalDesktop, Screen, next_displays};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,8 @@ pub enum ToAgent {
     /// The privacy screen on or off (it goes off with the agent: a new one
     /// starts without it, and the viewer is told).
     Privacy(bool),
+    /// Record the computer's sound (for the viewer), or stop.
+    Audio(bool),
 }
 
 /// The session, as the agent shows it.
@@ -76,6 +78,8 @@ pub enum FromAgent {
     Displays { id: u64, displays: Displays },
     /// Someone pressed Encerrar on the indicator.
     EndSession,
+    /// 10 ms of the computer's sound, during stream `id`.
+    Audio { id: u64, packet: AudioPacket },
 }
 
 /// What to stream.
@@ -180,6 +184,10 @@ struct Session {
     started: Option<oneshot::Sender<Result<(), String>>>,
     /// Frame numbers as the viewer sees them: a new agent starts over at 0.
     seq: u64,
+    /// Where the sound goes, and whether the viewer wants it (the next
+    /// agent records it too).
+    audio: mpsc::Sender<AudioPacket>,
+    audio_on: bool,
 }
 
 impl AgentHub {
@@ -199,6 +207,9 @@ impl AgentHub {
                     stream: session.stream,
                     clipboard: session.clipboard.is_some(),
                 });
+                if session.audio_on {
+                    let _ = tx.send(ToAgent::Audio(true));
+                }
             }
             if state.indicator.is_some() {
                 let _ = tx.send(ToAgent::Indicator(state.indicator.clone()));
@@ -262,6 +273,13 @@ impl AgentHub {
                         // The next agent picks up on the same display.
                         session.stream.display = displays.current.into();
                         session.displays.send_replace(displays);
+                    }
+                }
+                Ok(Some(FromAgent::Audio { id, packet })) => {
+                    let state = self.state.lock().expect("lock");
+                    // (Full: the network is behind, and this is late already.)
+                    if let Some(session) = state.session.as_ref().filter(|s| s.id == id) {
+                        let _ = session.audio.try_send(packet);
                     }
                 }
                 Ok(Some(FromAgent::EndSession)) => {
@@ -349,6 +367,7 @@ impl Desktop for AgentDesktop {
             let (started_tx, started_rx) = oneshot::channel();
             let share = clipboard.is_some();
             let (displays_tx, displays) = watch::channel(Displays::default());
+            let (audio_tx, audio) = mpsc::channel(hext_session::host::AUDIO_QUEUE);
             {
                 let mut state = self.hub.state.lock().expect("lock");
                 let id = state.next_stream;
@@ -361,6 +380,8 @@ impl Desktop for AgentDesktop {
                     displays: displays_tx,
                     started: Some(started_tx),
                     seq: 0,
+                    audio: audio_tx,
+                    audio_on: false,
                 });
                 // Without an agent now, the next one to connect starts it.
                 if let Some((_, agent)) = &state.agent {
@@ -374,6 +395,7 @@ impl Desktop for AgentDesktop {
             let screen = AgentScreen {
                 hub: self.hub.clone(),
                 displays,
+                audio: Some(audio),
             };
             let failed = |message: String| {
                 screen.end();
@@ -396,6 +418,8 @@ impl Desktop for AgentDesktop {
 struct AgentScreen {
     hub: AgentHub,
     displays: watch::Receiver<Displays>,
+    /// Taken by `audio`.
+    audio: Option<mpsc::Receiver<AudioPacket>>,
 }
 
 impl AgentScreen {
@@ -452,6 +476,18 @@ impl Screen for AgentScreen {
         Some(self.displays.clone())
     }
 
+    fn audio(&mut self) -> Option<mpsc::Receiver<AudioPacket>> {
+        self.audio.take()
+    }
+
+    fn set_audio(&self, on: bool) {
+        // Kept for an agent that is yet to come, as the display is.
+        if let Some(session) = &mut self.hub.state.lock().expect("lock").session {
+            session.audio_on = on;
+        }
+        self.hub.send(ToAgent::Audio(on));
+    }
+
     fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
         // The agent releases held keys when it stops.
         self.end();
@@ -492,9 +528,10 @@ pub async fn serve<P: AsyncRead + AsyncWrite + Send + 'static>(pipe: P) -> std::
                 let (copied_tx, mut copied_rx) = mpsc::channel::<String>(4);
                 let copied_tx = clipboard.then_some(copied_tx);
                 let answer = match stream.desktop().open(frames_tx, copied_tx).await {
-                    Ok(opened) => {
+                    Ok(mut opened) => {
                         info!("transmitindo a tela");
                         let out = out_tx.clone();
+                        let mut audio = opened.audio();
                         let mut displays = opened.displays();
                         // What there is now is news for the service, too.
                         if let Some(displays) = &mut displays {
@@ -512,6 +549,9 @@ pub async fn serve<P: AsyncRead + AsyncWrite + Send + 'static>(pipe: P) -> std::
                                     },
                                     Some(text) = copied_rx.recv() => {
                                         FromAgent::Clipboard { id, text }
+                                    }
+                                    packet = next_audio(&mut audio) => {
+                                        FromAgent::Audio { id, packet }
                                     }
                                 };
                                 if out.send(msg).await.is_err() {
@@ -570,6 +610,11 @@ pub async fn serve<P: AsyncRead + AsyncWrite + Send + 'static>(pipe: P) -> std::
                     screen.set_privacy(on);
                 }
             }
+            ToAgent::Audio(on) => {
+                if let Some((screen, _)) = &screen {
+                    screen.set_audio(on);
+                }
+            }
             ToAgent::Stop => stop(&mut screen).await,
             ToAgent::Indicator(shown) => {
                 // (Not here: it waits for its window, and input does not.)
@@ -602,6 +647,16 @@ fn show_indicator(
 #[cfg(not(windows))]
 fn show_indicator(_shown: &Indicator, _out: mpsc::Sender<FromAgent>) -> Option<Box<()>> {
     None
+}
+
+/// The next sound packet; with no sound, this waits on.
+async fn next_audio(audio: &mut Option<mpsc::Receiver<AudioPacket>>) -> AudioPacket {
+    if let Some(audio) = audio
+        && let Some(packet) = audio.recv().await
+    {
+        return packet;
+    }
+    std::future::pending().await
 }
 
 async fn stop(screen: &mut Option<(Box<dyn Screen>, Task<()>)>) {
@@ -764,6 +819,65 @@ mod tests {
             (vec![2], 0),
             "only this stream's, from 0"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sound_goes_through_the_agent_and_stays_on_for_the_next() {
+        let hub = AgentHub::default();
+        let (service_end, agent_end) = tokio::io::duplex(1 << 20);
+        let attached = hub.clone();
+        tokio::spawn(async move { attached.attach(service_end).await });
+        let desktop = hub.desktop(test_stream());
+        let (tx, _frames) = mpsc::channel(4);
+        let opening = tokio::spawn(async move { desktop.open(tx, None).await });
+
+        let (mut reader, mut writer) = tokio::io::split(agent_end);
+        let Some(ToAgent::Start { id, .. }) = read_msg(&mut reader).await.unwrap() else {
+            panic!("expected Start");
+        };
+        let started = FromAgent::Started { id, result: Ok(()) };
+        write_msg(&mut writer, &started).await.unwrap();
+        let mut screen = opening.await.unwrap().unwrap();
+        let mut heard = screen.audio().expect("the agent has sound");
+        screen.set_audio(true);
+        assert!(matches!(
+            read_msg(&mut reader).await.unwrap(),
+            Some(ToAgent::Audio(true))
+        ));
+        let packet = |seq| AudioPacket {
+            seq,
+            data: vec![1; 8],
+            prev: Vec::new(),
+        };
+        // An older stream's sound is dropped.
+        let old = FromAgent::Audio {
+            id: id + 1,
+            packet: packet(1),
+        };
+        write_msg(&mut writer, &old).await.unwrap();
+        let current = FromAgent::Audio {
+            id,
+            packet: packet(2),
+        };
+        write_msg(&mut writer, &current).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .unwrap();
+        assert_eq!(got, Some(packet(2)));
+
+        // The next agent records it from the start, too.
+        let (service_end, agent_end) = tokio::io::duplex(1 << 20);
+        let attached = hub.clone();
+        tokio::spawn(async move { attached.attach(service_end).await });
+        let (mut reader, _writer) = tokio::io::split(agent_end);
+        assert!(matches!(
+            read_msg(&mut reader).await.unwrap(),
+            Some(ToAgent::Start { .. })
+        ));
+        assert!(matches!(
+            read_msg(&mut reader).await.unwrap(),
+            Some(ToAgent::Audio(true))
+        ));
     }
 
     #[tokio::test]

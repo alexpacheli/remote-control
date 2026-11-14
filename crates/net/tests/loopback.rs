@@ -21,6 +21,7 @@ fn hello(code: &str) -> Hello {
         access_code: code.to_owned(),
         resume: None,
         asks: Default::default(),
+        audio: false,
     }
 }
 

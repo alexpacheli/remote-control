@@ -100,7 +100,9 @@ e-mails da conta, app próprio, chave de atualização, backup, tráfego e segur
 ## Compilar
 
 Precisa do [Rust](https://rustup.rs). A versão é fixada em `rust-toolchain.toml` e instalada sozinha. No Windows,
-precisa também do Visual Studio Build Tools com a carga "Desenvolvimento para desktop com C++".
+precisa também do Visual Studio Build Tools com a carga "Desenvolvimento para desktop com C++". O codec do som
+(libopus) é compilado pelo [CMake](https://cmake.org): no PATH (no Windows, `winget install Kitware.CMake`; o que vem com
+o Build Tools também serve, pela variável `CMAKE`). No Linux, também `libasound2-dev` (ALSA).
 
 ```sh
 cargo run -p hext              # a interface
@@ -132,6 +134,7 @@ Variáveis da compilação, todas opcionais:
 | `crates/codec` | H.264: placa de vídeo (Media Foundation, VideoToolbox) ou OpenH264 em software |
 | `crates/input` | Mapa de teclas e injeção de mouse e teclado (SendInput, CGEvent) |
 | `crates/render` | Renderização na GPU (wgpu), YUV → RGB no shader |
+| `crates/audio` | Som: captura do que o computador toca (WASAPI, ScreenCaptureKit), Opus, saída (cpal) |
 | `crates/session` | Pipelines do host e do cliente |
 | `crates/metrics` | Estatísticas de latência |
 | `deploy` | Servidor: script do systemd, Caddy, relay e Docker |

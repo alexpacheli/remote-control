@@ -77,6 +77,7 @@ async fn streams_and_decodes_video() {
             access_code: "111 222 333".into(),
             resume: None,
             asks: Default::default(),
+            audio: false,
         },
         None,
         // Hardware where the machine has it (CI Macs may), else OpenH264.
@@ -123,6 +124,7 @@ async fn another_display_comes_through_at_its_own_size() {
             access_code: "111 222 333".into(),
             resume: None,
             asks: Default::default(),
+            audio: false,
         },
         None,
         DecoderPreference::Auto,
@@ -198,6 +200,7 @@ async fn host_ending_the_session_is_not_an_error() {
             access_code: CODE.into(),
             resume: None,
             asks: Default::default(),
+            audio: false,
         },
         None,
         DecoderPreference::Software,

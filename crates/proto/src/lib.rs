@@ -9,7 +9,8 @@
 //! - unreliable **QUIC datagrams** carrying [`Datagram`] messages: video
 //!   ([`VideoPacket`]s: each [`VideoFrame`] split into shards with
 //!   Reed-Solomon parity, so a lost packet neither stalls later frames nor
-//!   needs a retransmission) and ping.
+//!   needs a retransmission), sound ([`AudioPacket`]s: 10 ms of Opus each,
+//!   only while something plays) and ping.
 //!
 //! All messages are serialized with `postcard`.
 
@@ -173,6 +174,11 @@ pub struct Hello {
     /// from before ignores the bytes after the fields it knows.
     #[serde(default, deserialize_with = "absent_is_default")]
     pub asks: HelloAsks,
+    /// The viewer plays the host's sound: send it from the start. After
+    /// `asks`, last for the same reason: a viewer from before gets no sound
+    /// (it would not know [`Datagram::Audio`]).
+    #[serde(default, deserialize_with = "absent_is_default")]
+    pub audio: bool,
 }
 
 /// What a viewer that got in with the unattended password asks the host for.
@@ -269,6 +275,10 @@ pub enum Control {
     /// [`Permissions::control`]). Only to a host that offers it
     /// ([`Displays::privacy`]): an older host does not know this message.
     Privacy { on: bool },
+    /// Client → host: send the computer's sound, or stop (muted in the
+    /// viewer). It takes no permission: the sound is part of seeing the
+    /// screen. Only to a host that offers it ([`Displays::audio`]).
+    Audio { on: bool },
 }
 
 /// A message of the chat. It comes from the other computer, so what cannot be
@@ -341,6 +351,10 @@ pub struct Displays {
     /// technician works. After `virtual_display`, last for the same reason.
     #[serde(default, deserialize_with = "absent_is_default")]
     pub privacy: Privacy,
+    /// Whether the host can send its sound ([`Control::Audio`]). After
+    /// `privacy`, last for the same reason.
+    #[serde(default, deserialize_with = "absent_is_default")]
+    pub audio: bool,
 }
 
 /// The privacy screen of a host (docs/planos/F7.md): the person at the
@@ -429,6 +443,22 @@ pub enum Datagram {
         seq: u32,
         sent_micros: u64,
     },
+    /// Host → client: 10 ms of the computer's sound. Only to a viewer that
+    /// asked for it ([`Hello::audio`]): an older one does not know it.
+    Audio(AudioPacket),
+}
+
+/// 10 ms of sound: Opus, 48 kHz, stereo. Numbered one by one as they are
+/// sent; nothing is sent (and no number used) while the computer is silent.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AudioPacket {
+    pub seq: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    /// The packet before this one again (`seq - 1`), so one lost packet is
+    /// rebuilt from the next; empty after a silence.
+    #[serde(with = "serde_bytes")]
+    pub prev: Vec<u8>,
 }
 
 /// One shard of a serialized [`VideoFrame`].
@@ -547,6 +577,7 @@ mod tests {
                     remember: true,
                     account: Some([3; 32]),
                 },
+                audio: true,
             }),
             Control::RequestKeyframe,
             Control::ResendVideo {
@@ -573,11 +604,13 @@ mod tests {
                     resizable: true,
                 },
                 privacy: Privacy::On,
+                audio: true,
             }),
             Control::SelectDisplay { index: 2 },
             Control::VirtualDisplay { on: true },
             Control::NextVirtualSize,
             Control::Privacy { on: true },
+            Control::Audio { on: false },
             Control::Chat {
                 text: ChatText::new("Pode reiniciar?").unwrap(),
             },
@@ -643,6 +676,25 @@ mod tests {
         let displays: Displays = decode(&of_08).unwrap();
         assert_eq!(displays.virtual_display, VirtualDisplay::Off);
         assert_eq!(displays.privacy, Privacy::None);
+        assert!(!displays.audio);
+        // From a host with the privacy screen and no sound.
+        #[derive(Serialize, Deserialize)]
+        struct DisplaysWithPrivacy {
+            count: u8,
+            current: u8,
+            virtual_display: VirtualDisplay,
+            privacy: Privacy,
+        }
+        let with_privacy = encode(&DisplaysWithPrivacy {
+            count: 1,
+            current: 0,
+            virtual_display: VirtualDisplay::Off,
+            privacy: Privacy::Off,
+        })
+        .unwrap();
+        let displays: Displays = decode(&with_privacy).unwrap();
+        assert_eq!(displays.privacy, Privacy::Off);
+        assert!(!displays.audio);
         // To an older viewer: what it knows, the rest ignored.
         let new = encode(&Displays {
             count: 3,
@@ -654,12 +706,15 @@ mod tests {
                 resizable: false,
             },
             privacy: Privacy::On,
+            audio: true,
         })
         .unwrap();
         let seen: OldDisplays = decode(&new).unwrap();
         assert_eq!((seen.count, seen.current), (3, 2));
         let seen: DisplaysOf08 = decode(&new).unwrap();
         assert_eq!(seen.count, 3);
+        let seen: DisplaysWithPrivacy = decode(&new).unwrap();
+        assert_eq!(seen.privacy, Privacy::On);
     }
 
     #[test]
@@ -703,6 +758,17 @@ mod tests {
         // The header stays small next to the shard.
         assert!(bytes.len() <= 1100 + 32, "{} bytes", bytes.len());
         assert_eq!(decode::<Datagram>(&bytes).unwrap(), packet);
+
+        let sound = Datagram::Audio(AudioPacket {
+            seq: u32::MAX,
+            data: vec![1; 160],
+            prev: vec![2; 150],
+        });
+        let bytes = encode(&sound).unwrap();
+        assert!(bytes.len() <= 160 + 150 + 16, "{} bytes", bytes.len());
+        assert_eq!(decode::<Datagram>(&bytes).unwrap(), sound);
+        // Video stays as it was: an older viewer reads its datagrams.
+        assert_eq!(encode(&packet).unwrap()[0], 0);
     }
 
     #[test]
@@ -805,9 +871,33 @@ mod tests {
                 remember: true,
                 account: Some([2; 32]),
             },
+            audio: true,
         };
         let read: OldHello = decode(&encode(&new).unwrap()).unwrap();
         assert_eq!(read.resume, Some([1; 32]));
+        // A viewer of 0.8 (asks, no sound) gets no sound; a host of 0.8
+        // reads the asks.
+        #[derive(Serialize, Deserialize)]
+        struct HelloOf08 {
+            peer: PeerInfo,
+            access_code: String,
+            resume: Option<[u8; 32]>,
+            asks: HelloAsks,
+        }
+        let of_08 = HelloOf08 {
+            peer: old.peer.clone(),
+            access_code: old.access_code.clone(),
+            resume: None,
+            asks: HelloAsks {
+                remember: true,
+                account: None,
+            },
+        };
+        let hello: Hello = decode(&encode(&of_08).unwrap()).unwrap();
+        assert!(hello.asks.remember);
+        assert!(!hello.audio);
+        let read: HelloOf08 = decode(&encode(&new).unwrap()).unwrap();
+        assert_eq!(read.asks, new.asks);
         // Inside a control frame, too.
         let mut buf =
             frame::encode_frame(&Control::Hello(new.clone()), frame::MAX_FRAME_LEN).unwrap();

@@ -18,8 +18,9 @@ use hext_metrics::Gaps;
 use hext_net::video::{LOG_TARGET, ResendRequest, VideoSender};
 use hext_net::{Admission, Connection, ConnectionError, NetError};
 use hext_proto::{
-    ChatText, Control, Displays, ENDED_ON_HOST, Hello, InputEvent, MAX_CLIPBOARD_TEXT, PeerInfo,
-    Permissions, Privacy, RejectReason, StreamKind, VideoFrame, VirtualDisplay,
+    AudioPacket, ChatText, Control, Datagram, Displays, ENDED_ON_HOST, Hello, InputEvent,
+    MAX_CLIPBOARD_TEXT, PeerInfo, Permissions, Privacy, RejectReason, StreamKind, VideoFrame,
+    VirtualDisplay,
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -34,6 +35,12 @@ const BYE_WAIT: Duration = Duration::from_secs(1);
 const IDLE_NOTICE: Duration = Duration::from_millis(250);
 /// How often to check whether a monitor came or went.
 const DISPLAYS_CHECK: Duration = Duration::from_secs(3);
+/// Sound packets waiting for the network (10 ms each): a few, then the
+/// oldest are the ones to lose.
+pub const AUDIO_QUEUE: usize = 8;
+/// How long a sound packet may wait for room among the datagrams: later
+/// than this it would only be dropped by the viewer's queue.
+const AUDIO_SEND_WAIT: Duration = Duration::from_millis(30);
 
 pub struct HostConfig {
     pub peer: PeerInfo,
@@ -244,6 +251,13 @@ pub trait Screen: Send {
     fn displays(&self) -> Option<watch::Receiver<Displays>> {
         None
     }
+    /// Where the computer's sound comes out, encoded, while it is on
+    /// ([`Self::set_audio`]). Once; `None`: this screen has no sound.
+    fn audio(&mut self) -> Option<mpsc::Receiver<AudioPacket>> {
+        None
+    }
+    /// Records the computer's sound, or stops.
+    fn set_audio(&self, _on: bool) {}
     /// Stops streaming, releasing any key or button still held.
     fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
 }
@@ -325,6 +339,12 @@ impl Desktop for LocalDesktop {
             started?;
             tokio::spawn(check_displays(shared.clone(), settings.test_pattern));
             let (input, input_thread) = spawn_input(shared.clone())?;
+            // Off until the viewer wants it; none on the test pattern.
+            let (audio_tx, audio_rx) = mpsc::channel(AUDIO_QUEUE);
+            let audio = (!settings.test_pattern)
+                .then(|| hext_audio::Capture::new(audio_tx))
+                .flatten();
+            let audio_rx = audio.is_some().then_some(audio_rx);
             // A session goes on without it.
             let clipboard = clipboard.and_then(|changed| {
                 Clipboard::watch(move |text| {
@@ -340,6 +360,8 @@ impl Desktop for LocalDesktop {
                 input: Some(input),
                 input_thread: Some(input_thread),
                 input_failed: false,
+                audio,
+                audio_rx,
             }) as Box<dyn Screen>)
         })
     }
@@ -369,6 +391,10 @@ struct LocalScreen {
     input_thread: Option<std::thread::JoinHandle<()>>,
     /// The input thread is gone (logged once).
     input_failed: bool,
+    /// The computer's sound; `None` where it cannot be recorded.
+    audio: Option<hext_audio::Capture>,
+    /// Taken by `audio`.
+    audio_rx: Option<mpsc::Receiver<AudioPacket>>,
 }
 
 /// Also when the session is dropped without `close` (a task cancelled):
@@ -484,6 +510,16 @@ impl Screen for LocalScreen {
         Some(self.shared.displays.subscribe())
     }
 
+    fn audio(&mut self) -> Option<mpsc::Receiver<AudioPacket>> {
+        self.audio_rx.take()
+    }
+
+    fn set_audio(&self, on: bool) {
+        if let Some(audio) = &self.audio {
+            audio.set_on(on);
+        }
+    }
+
     fn close(mut self: Box<Self>) -> BoxFuture<'static, ()> {
         // Releases the keys and stops the capture (`Drop`), then waits for
         // the capture to let go of the screen and the encoder.
@@ -560,6 +596,8 @@ impl Layout {
                 None => VirtualDisplay::Off,
             },
             privacy: self.privacy,
+            // (The session says it: the sound is not the capture's.)
+            audio: false,
         }
     }
 
@@ -761,6 +799,7 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
     };
     // The viewer chose these: shown on the indicator and written in the log,
     // so nothing in them may hide or fake what is around them.
+    let wants_audio = hello.audio;
     let mut client = hello.peer;
     client.device_name = crate::shown_name(&client.device_name);
     client.app_version = crate::shown_name(&client.app_version);
@@ -831,14 +870,21 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
     // A few slots: a burst of copies loses the middle ones, which is fine.
     let (clipboard_tx, mut clipboard_rx) = mpsc::channel::<String>(4);
     let clipboard = session.permissions.clipboard.then_some(clipboard_tx);
-    let (screen, mut displays) = match config.desktop.open(frames_tx, clipboard).await {
-        Ok(screen) => {
+    let (screen, mut displays, audio) = match config.desktop.open(frames_tx, clipboard).await {
+        Ok(mut screen) => {
+            // The sound goes with the picture: no permission of its own.
+            // Only to a viewer that plays it (an older one would not know
+            // the datagrams).
+            let audio = screen.audio().filter(|_| wants_audio);
+            if audio.is_some() {
+                screen.set_audio(true);
+            }
             let mut displays = screen.displays();
             // What there is now is news for the viewer, too.
             if let Some(displays) = &mut displays {
                 displays.mark_changed();
             }
-            (Arc::new(Mutex::new(Some(screen))), displays)
+            (Arc::new(Mutex::new(Some(screen))), displays, audio)
         }
         Err(e) => {
             // What failed, for the technician to read (short: the reason
@@ -852,6 +898,11 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
             return Err(e);
         }
     };
+
+    // Sound goes out as datagrams of its own, beside the video's pacing and
+    // FEC: small, and worthless late.
+    let audio_offered = audio.is_some();
+    let audio_writer = audio.map(|audio| tokio::spawn(send_audio(conn.clone(), audio)));
 
     // Video goes out as datagrams with FEC (see `hext_net::video`).
     let video = conn.clone();
@@ -1014,6 +1065,15 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
                         }
                     }
                 }
+                // Muted in the viewer, or back. No permission: the sound is
+                // part of seeing the screen.
+                Ok(Control::Audio { on }) => {
+                    if audio_offered
+                        && let Some(screen) = screen.lock().expect("lock").as_ref()
+                    {
+                        screen.set_audio(on);
+                    }
+                }
                 Ok(Control::NextVirtualSize) => {
                     if session.permissions.control
                         && let Some(screen) = screen.lock().expect("lock").as_ref()
@@ -1055,6 +1115,7 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
                 }
             }
             shown = next_displays(&mut displays) => {
+                let shown = Displays { audio: audio_offered, ..shown };
                 // (None yet: an agent has not told.)
                 if shown.count > 0
                     && let Err(e) = control.send(&Control::Displays(shown)).await
@@ -1104,6 +1165,9 @@ pub async fn serve(conn: Connection, config: Arc<HostConfig>) -> Result<PeerInfo
     }
 
     writer.abort();
+    if let Some(audio_writer) = &audio_writer {
+        audio_writer.abort();
+    }
     // (A finished task was already awaited by the loop and must not be
     // polled again.)
     if !input.is_finished() {
@@ -2057,6 +2121,22 @@ fn task_end(
 
 type SharedScreen = Arc<Mutex<Option<Box<dyn Screen>>>>;
 
+/// Sends the computer's sound as datagrams until the capture or the
+/// connection ends. A packet that finds no room in time is dropped: the
+/// video is not pushed aside for it, nor is it worth hearing late.
+async fn send_audio(conn: Connection, mut packets: mpsc::Receiver<AudioPacket>) {
+    while let Some(packet) = packets.recv().await {
+        let Ok(bytes) = hext_proto::encode(&Datagram::Audio(packet)) else {
+            continue;
+        };
+        let sent = tokio::time::timeout(AUDIO_SEND_WAIT, conn.send_datagram_wait(bytes.into()));
+        if let Ok(Err(e)) = sent.await {
+            debug!("som: {e}");
+            return;
+        }
+    }
+}
+
 /// Injects the client's input until the stream or connection ends; without
 /// the permission to control, the input is read and dropped.
 async fn receive_input(
@@ -2292,6 +2372,7 @@ mod tests {
                     resizable: false,
                 },
                 privacy: Privacy::None,
+                audio: false,
             }
         );
     }

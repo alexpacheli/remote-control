@@ -9,8 +9,8 @@ use hext_codec::{DecoderPreference, YuvFrame};
 use hext_net::video::{Counters, Event, LOG_TARGET, MAX_WAITING, Reassembler, ResendRequest};
 use hext_net::{Connection, ConnectionError, ControlStream, FramedSend, NetError, PasswordLogin};
 use hext_proto::{
-    ChatText, Control, Datagram, Displays, ENDED_ON_HOST, FileOutcome, Hello, InputEvent, PeerInfo,
-    Permissions, StreamKind, VideoFrame, VirtualDisplay,
+    AudioPacket, ChatText, Control, Datagram, Displays, ENDED_ON_HOST, FileOutcome, Hello,
+    InputEvent, PeerInfo, Permissions, StreamKind, VideoFrame, VirtualDisplay,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -24,6 +24,10 @@ use crate::{NETWORK_GRACE, RESTART_LIFETIME, Result, ResumeToken, SessionError, 
 /// decode, and frames held back by a missing one arrive all at once, so a
 /// short queue would give up and ask for a keyframe at the worst moment.
 const DECODE_QUEUE: usize = MAX_WAITING + 2;
+
+/// Sound packets waiting for the player (10 ms each): the player keeps its
+/// own short queue, this only rides out a busy moment.
+const AUDIO_QUEUE: usize = 32;
 
 /// A decoder this many frames behind for this long is not catching up.
 const BEHIND_FRAMES: usize = 3;
@@ -123,6 +127,10 @@ pub struct ClientHandle {
     chat_out: mpsc::UnboundedSender<ChatText>,
     /// Taken by [`Self::chat`].
     chat_in: Option<mpsc::Receiver<ChatNews>>,
+    /// Taken by [`Self::audio`].
+    audio_in: Option<mpsc::Receiver<AudioPacket>>,
+    /// Whether this viewer wants the host's sound (not muted).
+    audio_on: watch::Sender<bool>,
     resume: Arc<Mutex<Resume>>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
@@ -200,6 +208,18 @@ impl ClientHandle {
     /// What the chat brings. Once; afterwards, `None`.
     pub fn chat(&mut self) -> Option<mpsc::Receiver<ChatNews>> {
         self.chat_in.take()
+    }
+
+    /// The host's sound as it arrives (it sends it to a viewer that asked,
+    /// [`Hello::audio`]). Once; afterwards, `None`.
+    pub fn audio(&mut self) -> Option<mpsc::Receiver<AudioPacket>> {
+        self.audio_in.take()
+    }
+
+    /// Asks the host to send its sound, or to stop (muted). Told to a host
+    /// that offers it ([`Displays::audio`]), as soon as it says so.
+    pub fn set_audio(&self, on: bool) {
+        self.audio_on.send_replace(on);
     }
 
     /// The host's displays, as it told last (none, until it does).
@@ -325,6 +345,7 @@ pub async fn start(
     decoder: DecoderPreference,
     on_frame: impl FnMut(DecodedFrame) + Send + 'static,
 ) -> Result<ClientHandle> {
+    let audio_asked = hello.audio;
     let (control, host, permissions) = hext_net::client_handshake(&conn, hello, password).await?;
     let input_stream = hext_net::open_uni(&conn, StreamKind::Input).await?;
 
@@ -341,6 +362,8 @@ pub async fn start(
     let (chat_out, chat_out_rx) = mpsc::unbounded_channel();
     // A few slots: a burst nobody is taking loses its last messages.
     let (chat_in_tx, chat_in) = mpsc::channel(32);
+    let (audio_in_tx, audio_in) = mpsc::channel(AUDIO_QUEUE);
+    let (audio_on, audio_on_rx) = watch::channel(audio_asked);
     let resume = Arc::new(Mutex::new(Resume::default()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -358,6 +381,11 @@ pub async fn start(
         select_rx,
         chat_out_rx,
         chat_in_tx,
+        Sound {
+            packets: audio_in_tx,
+            wanted: audio_on_rx,
+            host_sends: audio_asked,
+        },
         resume.clone(),
         shutdown_rx,
         stats.clone(),
@@ -394,6 +422,8 @@ pub async fn start(
         select_display,
         chat_out,
         chat_in: Some(chat_in),
+        audio_in: Some(audio_in),
+        audio_on,
         resume,
         shutdown: Some(shutdown_tx),
         task,
@@ -416,6 +446,7 @@ async fn run(
     mut select_display: mpsc::UnboundedReceiver<Control>,
     mut chat_out: mpsc::UnboundedReceiver<ChatText>,
     chat_in: mpsc::Sender<ChatNews>,
+    mut sound: Sound,
     resume: Arc<Mutex<Resume>>,
     mut shutdown: oneshot::Receiver<()>,
     stats: Arc<Mutex<Stats>>,
@@ -446,6 +477,7 @@ async fn run(
         frames_tx,
         loss_tx,
         resend_tx,
+        sound.packets.clone(),
         video_stats,
     ));
 
@@ -498,6 +530,14 @@ async fn run(
                     break peer_closed_is_ok(&conn, e);
                 }
             }
+            Ok(()) = sound.wanted.changed() => {
+                let shown = *displays.borrow();
+                if let Some(msg) = sound.tell(&shown)
+                    && let Err(e) = control.send(&msg).await
+                {
+                    break peer_closed_is_ok(&conn, e);
+                }
+            }
             msg = control.recv() => match msg {
                 Ok(Control::Clipboard { text }) => {
                     let _ = clipboard_in.try_send(text);
@@ -518,6 +558,12 @@ async fn run(
                 // (The numbers are the host's word: nothing past the list.)
                 Ok(Control::Displays(shown)) if shown.current < shown.count => {
                     displays.send_replace(shown);
+                    // Muted before the host said it has sound (coming back).
+                    if let Some(msg) = sound.tell(&shown)
+                        && let Err(e) = control.send(&msg).await
+                    {
+                        break peer_closed_is_ok(&conn, e);
+                    }
                 }
                 // The host ended it on purpose: nothing to come back to.
                 Ok(Control::Bye) => {
@@ -551,14 +597,38 @@ async fn run(
     result
 }
 
+/// The host's sound, on this side: where it goes, and whether the host is
+/// sending it as this viewer wants.
+struct Sound {
+    packets: mpsc::Sender<AudioPacket>,
+    /// Not muted.
+    wanted: watch::Receiver<bool>,
+    /// What the host was last asked for (first in the [`Hello`]).
+    host_sends: bool,
+}
+
+impl Sound {
+    /// What to tell the host, if it has sound and does not do as wanted.
+    fn tell(&mut self, displays: &Displays) -> Option<Control> {
+        let on = *self.wanted.borrow_and_update();
+        if !displays.audio || on == self.host_sends {
+            return None;
+        }
+        self.host_sends = on;
+        Some(Control::Audio { on })
+    }
+}
+
 /// Rebuilds frames from the host's video datagrams and queues them for the
 /// decoder; a frame lacking packets despite FEC asks the host for them, and
-/// for a keyframe if they don't come.
+/// for a keyframe if they don't come. Sound datagrams go to `audio`, as
+/// they come.
 async fn receive_video(
     conn: Connection,
     frames: mpsc::Sender<VideoFrame>,
     keyframe: mpsc::UnboundedSender<()>,
     resend: mpsc::UnboundedSender<ResendRequest>,
+    audio: mpsc::Sender<AudioPacket>,
     stats: Arc<Mutex<Stats>>,
 ) -> hext_net::Result<()> {
     let mut reassembler = Reassembler::new();
@@ -573,6 +643,11 @@ async fn receive_video(
                 Ok(Datagram::Video(packet)) => reassembler.push(packet, Instant::now()),
                 Ok(Datagram::VideoIdle { last_frame }) => {
                     reassembler.idle(last_frame, Instant::now())
+                }
+                // (Full: nobody plays it, or the player is stuck.)
+                Ok(Datagram::Audio(packet)) => {
+                    let _ = audio.try_send(packet);
+                    continue;
                 }
                 Ok(_) => continue,
                 // One malformed datagram; the connection is fine.
@@ -807,6 +882,28 @@ fn decode_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_hears_of_muting_only_when_it_has_sound_and_once() {
+        let (wanted, wanted_rx) = watch::channel(true);
+        let mut sound = Sound {
+            packets: mpsc::channel(1).0,
+            wanted: wanted_rx,
+            host_sends: true,
+        };
+        let without = Displays::default();
+        let with = Displays {
+            audio: true,
+            ..Displays::default()
+        };
+        assert_eq!(sound.tell(&with), None, "as asked in the Hello");
+        wanted.send_replace(false);
+        assert_eq!(sound.tell(&without), None, "an older host: nothing");
+        assert_eq!(sound.tell(&with), Some(Control::Audio { on: false }));
+        assert_eq!(sound.tell(&with), None, "once");
+        wanted.send_replace(true);
+        assert_eq!(sound.tell(&with), Some(Control::Audio { on: true }));
+    }
 
     #[test]
     fn a_burst_for_the_decoder_is_not_falling_behind() {

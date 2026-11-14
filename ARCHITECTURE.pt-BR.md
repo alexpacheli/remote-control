@@ -71,6 +71,10 @@ captura (GPU) → NV12 → codificação H.264 → pacotes + FEC → datagramas 
 - **Monitor virtual:** sem monitor ligado, o host cria um para a sessão e o remove no fim (driver MttVDD no
   Windows, opcional no instalador; `CGVirtualDisplay` no macOS). `Ctrl+Alt+0` liga e troca a resolução.
   Detalhes: [docs/monitor-virtual.md](docs/monitor-virtual.md).
+- **Som:** o que o host toca (WASAPI em loopback no Windows, ScreenCaptureKit no macOS 13+) vai em Opus, 48 kHz,
+  10 ms por datagrama (cada um levando também o anterior), fora do pacing e do FEC do vídeo, e nada em silêncio; o
+  visualizador guarda uns 40 ms numa fila que nunca passa de 70 ms e toca pelo `cpal`. `Ctrl+Alt+S` silencia.
+  Detalhes: [docs/planos/F7.md](docs/planos/F7.md).
 
 Os outros canais, em streams QUIC confiáveis: teclado por scancode (funciona entre layouts diferentes) e mouse
 (`SendInput`, `CGEvent`), texto da área de transferência, arquivos (arrastar para a janela; chegam em Downloads),
